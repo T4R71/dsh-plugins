@@ -1,0 +1,14 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "lib/types",
+    "tsBuildInfoFile": "./lib/types/.tsbuildinfo",
+    "types": ["node"],
+    "paths": {
+      "@t4r71/dsh-dual-axis": ["./src/index.ts"],
+      "@t4r71/dsh-dual-axis/*": ["./src/*"]
+    }
+  },
+  "include": ["src"]
+}

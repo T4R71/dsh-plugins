@@ -1,0 +1,7 @@
+# 全仓固定 LF：本机 core.autocrlf=true，不固定的话每次 checkout 都会把工作树改成 CRLF，
+# 而 profile 侧读取的 package.json / cordis.patch.yml 不能带多余的行尾差异。
+* text=auto eol=lf
+
+# 二进制/产物保持原样
+*.png binary
+*.tgz binary

@@ -1,0 +1,43 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  forbidden-artifacts:
+    name: 提交禁忌自查
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 不得提交构建产物与锁文件
+        run: |
+          if git ls-files | grep -E '(^|/)(node_modules|lib|dist)/|\.tgz$|^pnpm-lock\.yaml$'; then
+            echo "::error::仓库里出现了禁止提交的路径"
+            exit 1
+          fi
+          echo "ok"
+
+  verify:
+    name: 已验证包的构建与单测
+    runs-on: ubuntu-latest
+    needs: forbidden-artifacts
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: 安装依赖
+        run: pnpm install --ignore-scripts
+      # 只跑 docs/COMPATIBILITY.md 里标为「已核」的包。
+      # 标为「未迁移」的包面向 0.1.6-alpha.2，在本仓当前目标版本下不具备可构建性，
+      # 不要把它们加进来充数——那只会让 CI 常态性红。
+      - name: dual-axis（宿主半边）
+        run: pnpm --filter @t4r71/dsh-dual-axis build && pnpm --filter @t4r71/dsh-dual-axis test
+      - name: dual-axis-ui（客户端半边）
+        run: pnpm --filter @t4r71/dsh-dual-axis-ui build && pnpm --filter @t4r71/dsh-dual-axis-ui test

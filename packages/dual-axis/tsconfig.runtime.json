@@ -1,0 +1,21 @@
+{
+  // tsx reads this file through TSX_TSCONFIG_PATH when the package's tests run
+  // from source. Every specifier resolves through node_modules, with one
+  // exception: `@deepseek-ai/dsh-settings` publishes lib/types/schema.js but
+  // declares no `./schema` subpath in its exports map, so the bare subpath is
+  // unresolvable by Node. The alias below points at that shipped file inside
+  // the installed dependency (not at a checkout), which keeps the tests on the
+  // published artifact. Dropping it needs the upstream package to export
+  // `./schema`; see the package README.
+  "compilerOptions": {
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "types": ["node"],
+    "paths": {
+      "@deepseek-ai/dsh-settings/schema": [
+        "./node_modules/@deepseek-ai/dsh-settings/lib/types/schema.js"
+      ]
+    }
+  }
+}

@@ -1,0 +1,24 @@
+/* 状态符号：14×14 圆形图元，配色走主题语义色。 */
+.cell {
+  display: grid;
+  flex: 0 0 auto;
+  place-items: center;
+  width: 15px;
+  height: 15px;
+}
+
+.glyph_completed { color: var(--dsw-alias-state-success-primary, #22c55e); }
+.glyph_pending { color: var(--dsw-alias-label-caption, #94a3b8); }
+.glyph_blocked { color: var(--dsw-alias-state-error-primary, #ef4444); }
+/* 待补充：琥珀，和「出错」区分开 —— 这不是故障，是在等人 */
+.glyph_question { color: var(--dsw-alias-state-warn-primary, #f59e0b); }
+
+/* 进行中：业务蓝 + 转动，这就是「动态指示」 */
+.glyph_progress {
+  color: var(--dsw-alias-state-business-primary, #3b82f6);
+  animation: task-tree-progress-spin 1s linear infinite;
+}
+@keyframes task-tree-progress-spin {
+  to { transform: rotate(360deg); }
+}
+

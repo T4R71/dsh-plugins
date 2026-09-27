@@ -1,0 +1,17 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "composite": false,
+    "incremental": false,
+    "declaration": false,
+    "declarationMap": false,
+    "sourceMap": false,
+    "types": ["node"],
+    "paths": {
+      "@t4r71/dsh-dual-axis": ["./src/index.ts"],
+      "@t4r71/dsh-dual-axis/*": ["./src/*"]
+    }
+  },
+  "include": ["src", "tests"]
+}

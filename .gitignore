@@ -1,0 +1,21 @@
+# 依赖与构建产物（禁止提交）
+node_modules/
+lib/
+dist/
+*.tgz
+*.tsbuildinfo
+
+# 锁文件（本仓库不提交）
+pnpm-lock.yaml
+
+# 内部发布笔记
+RELEASE-NOTES.md
+
+# 本地与临时
+.DS_Store
+Thumbs.db
+*.log
+
+# 编辑器
+.vscode/
+.idea/

@@ -1,0 +1,18 @@
+# 任务生长树组合包层：把两行插进任何选中它的 profile。
+#
+# 组合包只贡献行，不贡献整个组合：启用时插入下面两行，停用时就地移除，
+# profile 的其余部分不受影响。两行由同一个组合包声明，所以插件页只出现一个条目。
+
+- insert:
+    # 宿主半边：taskTree 会话投影（整数组原样透传）+ task_tree_write 工具。
+    # 注意：目前没有面板读 taskTree，这一行默认在 profile 补丁层停用；
+    # 保留它只为了将来做「第二个计划视图」时不用重写宿主。
+    # 与浏览器无关，纯宿主 profile 也可以只挂这一行。
+    - id: task-tree-host
+      name: '@t4r71/dsh-task-tree-host'
+
+    # 浏览器半边：右侧边栏的大纲面板。它读的是 `planTree` 投影（上游 planning 包喂的），
+    # 不是本组合包宿主半边的 `taskTree`。
+    # 需要挂在有浏览器表面的 profile 上；纯宿主 profile 停用这一行即可。
+    - id: task-tree-ui
+      name: '@t4r71/dsh-ui-task-tree'
