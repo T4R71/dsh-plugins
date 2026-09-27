@@ -1,0 +1,443 @@
+# restate-verify (independent)
+DSH_HOME      = C:\Users\TRI\.dsh
+READ_ROOT     = C:\Users\TRI\.dsh\sessions
+N (shingle)   = 8
+MIN_REASONING = 1500
+
+## corpus inventory
+files                 = 80
+raw JSON lines        = 40585
+JSON parse failures   = 0
+total decoded chars   = 194941737
+total frames          = 16166
+failed frames         = 0
+files by slug         = {"--C-Users-TRI-Downloads-Noname~0020v1.6.6--":11,"--M-Codex-.codex--":48,"--M-ds-guard--":15,"--M-dsh--":6}
+assistant messages    = 6271
+  with >=1 reasoning block = 2481
+  with >=1 text block      = 4539
+  with both channels       = 1746
+  reasoning chars >= 1500 = 1449
+  reasoning chars >= 1500 AND text non-empty = 1107
+
+================================================================
+# FORM char-raw  (n=1449)
+================================================================
+## histogram containment |A n B|/|A|  [A=reasoning]  (n=1449)
+   0-  5%   1424
+   5- 10%     14
+  10- 15%      3
+  15- 20%      0
+  20- 25%      0
+  25- 30%      0
+  30- 35%      0
+  35- 40%      0
+  40- 45%      0
+  45- 50%      0
+  50- 55%      0
+  55- 60%      0
+  60- 65%      0
+  65- 70%      0
+  70- 75%      0
+  75- 80%      0
+  80- 85%      0
+  85- 90%      0
+  90- 95%      0
+  95-100%      8
+  zero bins (lo%): [15,20,25,30,35,40,45,50,55,60,65,70,75,80,85,90]
+
+## histogram containment |A n B|/|B|  [B=visible text]  (n=1449)
+   0-  5%    777
+   5- 10%    102
+  10- 15%     56
+  15- 20%     84
+  20- 25%     47
+  25- 30%     74
+  30- 35%     54
+  35- 40%     66
+  40- 45%     65
+  45- 50%     47
+  50- 55%     34
+  55- 60%     18
+  60- 65%      9
+  65- 70%      4
+  70- 75%      4
+  75- 80%      0
+  80- 85%      0
+  85- 90%      0
+  90- 95%      0
+  95-100%      8
+  zero bins (lo%): [75,80,85,90]
+
+## histogram Jaccard |A n B|/|A u B|  (n=1449)
+   0-  5%   1429
+   5- 10%     11
+  10- 15%      1
+  15- 20%      0
+  20- 25%      0
+  25- 30%      0
+  30- 35%      0
+  35- 40%      0
+  40- 45%      0
+  45- 50%      0
+  50- 55%      0
+  55- 60%      0
+  60- 65%      0
+  65- 70%      0
+  70- 75%      0
+  75- 80%      0
+  80- 85%      0
+  85- 90%      0
+  90- 95%      0
+  95-100%      8
+  zero bins (lo%): [15,20,25,30,35,40,45,50,55,60,65,70,75,80,85,90]
+
+## gap analysis (primary metric cR = |A n B|/|A|)
+  max cR in [0,15%]      = 12.0570%
+  min cR in [95%,100%]   = 99.9666%
+  count in (15%,95%)     = 0
+
+================================================================
+# FORM char-norm  (n=1449)
+================================================================
+## histogram containment |A n B|/|A|  [A=reasoning]  (n=1449)
+   0-  5%   1422
+   5- 10%     16
+  10- 15%      3
+  15- 20%      0
+  20- 25%      0
+  25- 30%      0
+  30- 35%      0
+  35- 40%      0
+  40- 45%      0
+  45- 50%      0
+  50- 55%      0
+  55- 60%      0
+  60- 65%      0
+  65- 70%      0
+  70- 75%      0
+  75- 80%      0
+  80- 85%      0
+  85- 90%      0
+  90- 95%      0
+  95-100%      8
+  zero bins (lo%): [15,20,25,30,35,40,45,50,55,60,65,70,75,80,85,90]
+
+## histogram containment |A n B|/|B|  [B=visible text]  (n=1449)
+   0-  5%    777
+   5- 10%     98
+  10- 15%     53
+  15- 20%     83
+  20- 25%     50
+  25- 30%     68
+  30- 35%     47
+  35- 40%     69
+  40- 45%     65
+  45- 50%     48
+  50- 55%     44
+  55- 60%     15
+  60- 65%     14
+  65- 70%      5
+  70- 75%      5
+  75- 80%      0
+  80- 85%      0
+  85- 90%      0
+  90- 95%      0
+  95-100%      8
+  zero bins (lo%): [75,80,85,90]
+
+## histogram Jaccard |A n B|/|A u B|  (n=1449)
+   0-  5%   1427
+   5- 10%     13
+  10- 15%      1
+  15- 20%      0
+  20- 25%      0
+  25- 30%      0
+  30- 35%      0
+  35- 40%      0
+  40- 45%      0
+  45- 50%      0
+  50- 55%      0
+  55- 60%      0
+  60- 65%      0
+  65- 70%      0
+  70- 75%      0
+  75- 80%      0
+  80- 85%      0
+  85- 90%      0
+  90- 95%      0
+  95-100%      8
+  zero bins (lo%): [15,20,25,30,35,40,45,50,55,60,65,70,75,80,85,90]
+
+## gap analysis (primary metric cR = |A n B|/|A|)
+  max cR in [0,15%]      = 12.3549%
+  min cR in [95%,100%]   = 100.0000%
+  count in (15%,95%)     = 0
+
+================================================================
+# FORM word-norm  (n=1449)
+================================================================
+## histogram containment |A n B|/|A|  [A=reasoning]  (n=1449)
+   0-  5%   1440
+   5- 10%      1
+  10- 15%      0
+  15- 20%      0
+  20- 25%      0
+  25- 30%      0
+  30- 35%      0
+  35- 40%      0
+  40- 45%      0
+  45- 50%      0
+  50- 55%      0
+  55- 60%      0
+  60- 65%      0
+  65- 70%      0
+  70- 75%      0
+  75- 80%      0
+  80- 85%      0
+  85- 90%      0
+  90- 95%      0
+  95-100%      8
+  zero bins (lo%): [10,15,20,25,30,35,40,45,50,55,60,65,70,75,80,85,90]
+
+## histogram containment |A n B|/|B|  [B=visible text]  (n=1449)
+   0-  5%   1414
+   5- 10%     12
+  10- 15%      6
+  15- 20%      3
+  20- 25%      2
+  25- 30%      1
+  30- 35%      0
+  35- 40%      0
+  40- 45%      1
+  45- 50%      1
+  50- 55%      0
+  55- 60%      0
+  60- 65%      1
+  65- 70%      0
+  70- 75%      0
+  75- 80%      0
+  80- 85%      0
+  85- 90%      0
+  90- 95%      0
+  95-100%      8
+  zero bins (lo%): [30,35,50,55,65,70,75,80,85,90]
+
+## histogram Jaccard |A n B|/|A u B|  (n=1449)
+   0-  5%   1441
+   5- 10%      0
+  10- 15%      0
+  15- 20%      0
+  20- 25%      0
+  25- 30%      0
+  30- 35%      0
+  35- 40%      0
+  40- 45%      0
+  45- 50%      0
+  50- 55%      0
+  55- 60%      0
+  60- 65%      0
+  65- 70%      0
+  70- 75%      0
+  75- 80%      0
+  80- 85%      0
+  85- 90%      0
+  90- 95%      0
+  95-100%      8
+  zero bins (lo%): [5,10,15,20,25,30,35,40,45,50,55,60,65,70,75,80,85,90]
+
+## gap analysis (primary metric cR = |A n B|/|A|)
+  max cR in [0,15%]      = 5.2925%
+  min cR in [95%,100%]   = 100.0000%
+  count in (15%,95%)     = 0
+
+================================================================
+# >90% SAMPLES on char-raw cR (reasoning-side containment)
+================================================================
+{"cR_pct":100,"cT_pct":100,"jac_pct":100,"reasoningChars":7155,"textChars":7155,"deltaChars":0,"reasonShingles":6348,"textShingles":6348,"inter":6348,"sessionId":"session-3ef35930-279d-4d74-9776-4200a66c58cc","slug":"--C-Users-TRI-Downloads-Noname~0020v1.6.6--","cwd":"C:\\Users\\TRI\\Downloads\\Noname v1.6.6","origin":"","delegationDepth":0,"parentSession":"","fileMtime":"2026-09-22T03:55:18.927Z","file":"C:\\Users\\TRI\\.dsh\\sessions\\--C-Users-TRI-Downloads-Noname~0020v1.6.6--\\session-3ef35930-279d-4d74-9776-4200a66c58cc\\session.v3.jsonl.zstd","selfProduced":true,"selfHits":["restate"],"msgTime":"2026-09-21T21:02:48.627Z"}
+{"cR_pct":100,"cT_pct":100,"jac_pct":100,"reasoningChars":120036,"textChars":120036,"deltaChars":0,"reasonShingles":22192,"textShingles":22192,"inter":22192,"sessionId":"b923ce6b-5c36-4b79-8a61-7c9632359e7a","slug":"--M-Codex-.codex--","cwd":"M:\\Codex\\.codex","origin":"subagent","delegationDepth":1,"parentSession":"session-07a7c41c-6710-4ae3-be3d-82dd1d180557","fileMtime":"2026-09-22T09:25:26.316Z","file":"C:\\Users\\TRI\\.dsh\\sessions\\--M-Codex-.codex--\\b923ce6b-5c36-4b79-8a61-7c9632359e7a\\session.v3.jsonl.zstd","selfProduced":true,"selfHits":["restate"],"msgTime":"2026-09-22T09:25:26.291Z"}
+{"cR_pct":100,"cT_pct":100,"jac_pct":100,"reasoningChars":115071,"textChars":115071,"deltaChars":0,"reasonShingles":5931,"textShingles":5931,"inter":5931,"sessionId":"session-d531c71b-6bf1-4888-9fc0-976c321374e5","slug":"--M-Codex-.codex--","cwd":"M:\\Codex\\.codex","origin":"","delegationDepth":0,"parentSession":"","fileMtime":"2026-09-22T16:18:20.219Z","file":"C:\\Users\\TRI\\.dsh\\sessions\\--M-Codex-.codex--\\session-d531c71b-6bf1-4888-9fc0-976c321374e5\\session.v3.jsonl.zstd","selfProduced":true,"selfHits":["restate"],"msgTime":"2026-09-22T13:42:40.137Z"}
+{"cR_pct":100,"cT_pct":100,"jac_pct":100,"reasoningChars":4369,"textChars":4369,"deltaChars":0,"reasonShingles":3473,"textShingles":3473,"inter":3473,"sessionId":"session-d50364e9-8db5-408c-9b51-943d5a3df6ad","slug":"--M-ds-guard--","cwd":"M:\\ds-guard","origin":"","delegationDepth":0,"parentSession":"","fileMtime":"2026-09-23T12:14:44.951Z","file":"C:\\Users\\TRI\\.dsh\\sessions\\--M-ds-guard--\\session-d50364e9-8db5-408c-9b51-943d5a3df6ad\\session.v3.jsonl.zstd","selfProduced":true,"selfHits":["stream-guard","restate","8-gram","PLAN-two-layer"],"msgTime":"2026-09-23T02:16:26.381Z"}
+{"cR_pct":99.9973,"cT_pct":100,"jac_pct":99.9973,"reasoningChars":119312,"textChars":119310,"deltaChars":2,"reasonShingles":74522,"textShingles":74520,"inter":74520,"sessionId":"97a12893-3cab-4b39-bd00-3fe4f5c914b3","slug":"--M-ds-guard--","cwd":"M:\\ds-guard","origin":"subagent","delegationDepth":1,"parentSession":"session-d50364e9-8db5-408c-9b51-943d5a3df6ad","fileMtime":"2026-09-23T08:13:30.011Z","file":"C:\\Users\\TRI\\.dsh\\sessions\\--M-ds-guard--\\97a12893-3cab-4b39-bd00-3fe4f5c914b3\\session.v3.jsonl.zstd","selfProduced":true,"selfHits":["stream-guard","restate"],"msgTime":"2026-09-23T08:13:29.940Z"}
+{"cR_pct":99.9971,"cT_pct":100,"jac_pct":99.9971,"reasoningChars":116081,"textChars":116079,"deltaChars":2,"reasonShingles":69992,"textShingles":69990,"inter":69990,"sessionId":"928ba8fe-84b0-4f21-ac57-08c6b94b3757","slug":"--M-ds-guard--","cwd":"M:\\ds-guard","origin":"subagent","delegationDepth":1,"parentSession":"session-d50364e9-8db5-408c-9b51-943d5a3df6ad","fileMtime":"2026-09-23T08:33:41.708Z","file":"C:\\Users\\TRI\\.dsh\\sessions\\--M-ds-guard--\\928ba8fe-84b0-4f21-ac57-08c6b94b3757\\session.v3.jsonl.zstd","selfProduced":true,"selfHits":["stream-guard","restate"],"msgTime":"2026-09-23T08:33:41.631Z"}
+{"cR_pct":99.9969,"cT_pct":100,"jac_pct":99.9969,"reasoningChars":109217,"textChars":109215,"deltaChars":2,"reasonShingles":65340,"textShingles":65338,"inter":65338,"sessionId":"ec54776e-9a3b-4651-a95a-20d0f32eb2b0","slug":"--M-ds-guard--","cwd":"M:\\ds-guard","origin":"subagent","delegationDepth":1,"parentSession":"session-d50364e9-8db5-408c-9b51-943d5a3df6ad","fileMtime":"2026-09-23T08:38:56.798Z","file":"C:\\Users\\TRI\\.dsh\\sessions\\--M-ds-guard--\\ec54776e-9a3b-4651-a95a-20d0f32eb2b0\\session.v3.jsonl.zstd","selfProduced":true,"selfHits":["stream-guard","restate"],"msgTime":"2026-09-23T08:28:06.364Z"}
+{"cR_pct":99.9666,"cT_pct":100,"jac_pct":99.9666,"reasoningChars":7886,"textChars":7884,"deltaChars":2,"reasonShingles":5989,"textShingles":5987,"inter":5987,"sessionId":"session-d50364e9-8db5-408c-9b51-943d5a3df6ad","slug":"--M-ds-guard--","cwd":"M:\\ds-guard","origin":"","delegationDepth":0,"parentSession":"","fileMtime":"2026-09-23T12:14:44.951Z","file":"C:\\Users\\TRI\\.dsh\\sessions\\--M-ds-guard--\\session-d50364e9-8db5-408c-9b51-943d5a3df6ad\\session.v3.jsonl.zstd","selfProduced":true,"selfHits":["stream-guard","restate","8-gram","PLAN-two-layer"],"msgTime":"2026-09-23T09:29:22.064Z"}
+count >90% = 8  count >=95% = 8
+count reasoning==text exactly (char) = 4
+count text channel EMPTY = 342
+
+## top 20 cR overall (char-raw)
+  cR=100.000% cT=100.000% rLen=7155 tLen=7155 sess=session-3ef35930-279d-4d74-9776-4200a66c58cc slug=--C-Users-TRI-Downloads-Noname~0020v1.6.6-- mtime=2026-09-22T03:55:18.927Z self=true
+  cR=100.000% cT=100.000% rLen=120036 tLen=120036 sess=b923ce6b-5c36-4b79-8a61-7c9632359e7a slug=--M-Codex-.codex-- mtime=2026-09-22T09:25:26.316Z self=true
+  cR=100.000% cT=100.000% rLen=115071 tLen=115071 sess=session-d531c71b-6bf1-4888-9fc0-976c321374e5 slug=--M-Codex-.codex-- mtime=2026-09-22T16:18:20.219Z self=true
+  cR=100.000% cT=100.000% rLen=4369 tLen=4369 sess=session-d50364e9-8db5-408c-9b51-943d5a3df6ad slug=--M-ds-guard-- mtime=2026-09-23T12:14:44.951Z self=true
+  cR=99.997% cT=100.000% rLen=119312 tLen=119310 sess=97a12893-3cab-4b39-bd00-3fe4f5c914b3 slug=--M-ds-guard-- mtime=2026-09-23T08:13:30.011Z self=true
+  cR=99.997% cT=100.000% rLen=116081 tLen=116079 sess=928ba8fe-84b0-4f21-ac57-08c6b94b3757 slug=--M-ds-guard-- mtime=2026-09-23T08:33:41.708Z self=true
+  cR=99.997% cT=100.000% rLen=109217 tLen=109215 sess=ec54776e-9a3b-4651-a95a-20d0f32eb2b0 slug=--M-ds-guard-- mtime=2026-09-23T08:38:56.798Z self=true
+  cR=99.967% cT=100.000% rLen=7886 tLen=7884 sess=session-d50364e9-8db5-408c-9b51-943d5a3df6ad slug=--M-ds-guard-- mtime=2026-09-23T12:14:44.951Z self=true
+  cR=12.057% cT=70.213% rLen=3565 tLen=589 sess=92156223-90ff-4280-aa2d-11d4889ec3c8 slug=--M-Codex-.codex-- mtime=2026-09-22T05:27:31.972Z self=false
+  cR=10.569% cT=28.259% rLen=19287 tLen=6161 sess=14ed7e25-cf4e-44b0-be7f-e3cd0d01cbb9 slug=--C-Users-TRI-Downloads-Noname~0020v1.6.6-- mtime=2026-09-22T04:20:55.681Z self=true
+  cR=10.090% cT=38.447% rLen=39332 tLen=8936 sess=94e325fc-994c-44c0-80ce-fb98583f90e3 slug=--M-Codex-.codex-- mtime=2026-09-22T05:06:43.974Z self=false
+  cR=9.785% cT=21.474% rLen=2963 tLen=1326 sess=session-07a7c41c-6710-4ae3-be3d-82dd1d180557 slug=--M-Codex-.codex-- mtime=2026-09-22T17:18:30.537Z self=true
+  cR=6.753% cT=19.930% rLen=10483 tLen=3070 sess=session-d50364e9-8db5-408c-9b51-943d5a3df6ad slug=--M-ds-guard-- mtime=2026-09-23T12:14:44.951Z self=true
+  cR=6.489% cT=49.194% rLen=2254 tLen=261 sess=81b59bfd-4d5e-4f55-b2eb-c14094e5a850 slug=--M-ds-guard-- mtime=2026-09-23T08:33:53.572Z self=true
+  cR=6.371% cT=57.377% rLen=2107 tLen=190 sess=534fd1ea-b305-4bc7-be14-4172b037d96a slug=--M-Codex-.codex-- mtime=2026-09-22T09:29:57.530Z self=true
+  cR=5.981% cT=63.566% rLen=1577 tLen=138 sess=3e6332d4-6f94-4aa6-a1e6-72babcf5903c slug=--M-Codex-.codex-- mtime=2026-09-22T08:12:56.206Z self=true
+  cR=5.769% cT=33.861% rLen=3622 tLen=550 sess=session-d50364e9-8db5-408c-9b51-943d5a3df6ad slug=--M-ds-guard-- mtime=2026-09-23T12:14:44.951Z self=true
+  cR=5.725% cT=10.918% rLen=3917 tLen=1879 sess=session-ac044d98-d686-44c4-b913-e965685ab451 slug=--C-Users-TRI-Downloads-Noname~0020v1.6.6-- mtime=2026-09-23T07:52:49.731Z self=true
+  cR=5.704% cT=42.667% rLen=1876 tLen=232 sess=session-d50364e9-8db5-408c-9b51-943d5a3df6ad slug=--M-ds-guard-- mtime=2026-09-23T12:14:44.951Z self=true
+  cR=5.601% cT=53.896% rLen=1748 tLen=162 sess=session-d50364e9-8db5-408c-9b51-943d5a3df6ad slug=--M-ds-guard-- mtime=2026-09-23T12:14:44.951Z self=true
+
+================================================================
+# CONTAMINATION CHECK (self-produced sessions)
+================================================================
+sessions mentioning any of ["stream-guard","restate","8-gram","PLAN-two-layer"] = 43 / 80
+  14ed7e25-cf4e-44b0-be7f-e3cd0d01cbb9 slug=--C-Users-TRI-Downloads-Noname~0020v1.6.6-- origin=subagent depth=1 cwd="C:\\Users\\TRI\\Downloads\\Noname v1.6.6" mtime=2026-09-22T04:20:55.681Z hits=["restate"] assistantMsgs=104
+  69039bb4-a68d-4102-84b4-f2052a66aa8e slug=--C-Users-TRI-Downloads-Noname~0020v1.6.6-- origin=subagent depth=1 cwd="C:\\Users\\TRI\\Downloads\\Noname v1.6.6" mtime=2026-09-22T04:19:35.726Z hits=["restate"] assistantMsgs=105
+  session-3ef35930-279d-4d74-9776-4200a66c58cc slug=--C-Users-TRI-Downloads-Noname~0020v1.6.6-- origin= depth=0 cwd="C:\\Users\\TRI\\Downloads\\Noname v1.6.6" mtime=2026-09-22T03:55:18.927Z hits=["restate"] assistantMsgs=52
+  session-7393ccd4-6b07-4ae7-a25c-ab0b54870720 slug=--C-Users-TRI-Downloads-Noname~0020v1.6.6-- origin= depth=0 cwd="C:\\Users\\TRI\\Downloads\\Noname v1.6.6" mtime=2026-09-23T05:49:14.113Z hits=["restate"] assistantMsgs=3
+  session-ac044d98-d686-44c4-b913-e965685ab451 slug=--C-Users-TRI-Downloads-Noname~0020v1.6.6-- origin= depth=0 cwd="C:\\Users\\TRI\\Downloads\\Noname v1.6.6" mtime=2026-09-23T07:52:49.731Z hits=["restate"] assistantMsgs=57
+  session-f1e7a66b-c93a-4cd7-bdec-c1a499f24bb2 slug=--C-Users-TRI-Downloads-Noname~0020v1.6.6-- origin= depth=0 cwd="C:\\Users\\TRI\\Downloads\\Noname v1.6.6" mtime=2026-09-22T04:22:53.433Z hits=["restate"] assistantMsgs=113
+  36d17f21-03f0-436a-8c15-0448fc3919c7 slug=--M-Codex-.codex-- origin=subagent depth=1 cwd="M:\\Codex\\.codex" mtime=2026-09-22T09:25:24.117Z hits=["restate"] assistantMsgs=346
+  3e6332d4-6f94-4aa6-a1e6-72babcf5903c slug=--M-Codex-.codex-- origin=subagent depth=1 cwd="M:\\Codex\\.codex" mtime=2026-09-22T08:12:56.206Z hits=["restate"] assistantMsgs=319
+  534fd1ea-b305-4bc7-be14-4172b037d96a slug=--M-Codex-.codex-- origin=subagent depth=1 cwd="M:\\Codex\\.codex" mtime=2026-09-22T09:29:57.530Z hits=["restate"] assistantMsgs=355
+  7600d424-cf73-41cd-a4af-008c13095aff slug=--M-Codex-.codex-- origin=subagent depth=1 cwd="M:\\Codex\\.codex" mtime=2026-09-22T05:59:14.746Z hits=["restate"] assistantMsgs=151
+  81e92a93-35f4-4f79-ab65-17a9138a9da5 slug=--M-Codex-.codex-- origin=subagent depth=1 cwd="M:\\Codex\\.codex" mtime=2026-09-22T12:56:12.498Z hits=["restate"] assistantMsgs=55
+  8f412457-cd6b-42dd-afcc-7e9a8da626b5 slug=--M-Codex-.codex-- origin=subagent depth=1 cwd="M:\\Codex\\.codex" mtime=2026-09-22T13:32:11.465Z hits=["restate"] assistantMsgs=116
+  a5e57ff8-8da9-4801-9aae-a0b4e980defe slug=--M-Codex-.codex-- origin=subagent depth=1 cwd="M:\\Codex\\.codex" mtime=2026-09-22T10:38:28.450Z hits=["restate"] assistantMsgs=72
+  b923ce6b-5c36-4b79-8a61-7c9632359e7a slug=--M-Codex-.codex-- origin=subagent depth=1 cwd="M:\\Codex\\.codex" mtime=2026-09-22T09:25:26.316Z hits=["restate"] assistantMsgs=323
+  d075dac8-e61d-4147-8453-1f401f2fd90b slug=--M-Codex-.codex-- origin=subagent depth=1 cwd="M:\\Codex\\.codex" mtime=2026-09-22T08:24:19.758Z hits=["restate"] assistantMsgs=212
+  d309065a-ced0-4ef3-9770-7f5b02531b9c slug=--M-Codex-.codex-- origin=subagent depth=1 cwd="M:\\Codex\\.codex" mtime=2026-09-22T08:24:14.444Z hits=["restate"] assistantMsgs=216
+  ea5d5855-caaa-47a0-9f4a-54cf0abc3c4b slug=--M-Codex-.codex-- origin=subagent depth=1 cwd="M:\\Codex\\.codex" mtime=2026-09-22T12:37:34.629Z hits=["restate"] assistantMsgs=92
+  session-07a7c41c-6710-4ae3-be3d-82dd1d180557 slug=--M-Codex-.codex-- origin= depth=0 cwd="M:\\Codex\\.codex" mtime=2026-09-22T17:18:30.537Z hits=["restate"] assistantMsgs=942
+  session-8959b9f2-8fbb-461c-a847-afacb23078b6 slug=--M-Codex-.codex-- origin= depth=0 cwd="M:\\Codex\\.codex" mtime=2026-09-22T17:06:40.409Z hits=["restate"] assistantMsgs=66
+  session-964511fa-33b5-4838-9231-702b9356c966 slug=--M-Codex-.codex-- origin= depth=0 cwd="M:\\Codex\\.codex" mtime=2026-09-22T13:17:40.478Z hits=["restate"] assistantMsgs=1
+  session-a5fbdcef-9bac-40a0-87dd-dab23791782b slug=--M-Codex-.codex-- origin= depth=0 cwd="M:\\Codex\\.codex" mtime=2026-09-22T04:40:34.238Z hits=["restate"] assistantMsgs=60
+  session-ab0dce79-871c-4165-9c3f-11d17a778983 slug=--M-Codex-.codex-- origin= depth=0 cwd="M:\\Codex\\.codex" mtime=2026-09-22T16:18:23.046Z hits=["restate"] assistantMsgs=2
+  session-d531c71b-6bf1-4888-9fc0-976c321374e5 slug=--M-Codex-.codex-- origin= depth=0 cwd="M:\\Codex\\.codex" mtime=2026-09-22T16:18:20.219Z hits=["restate"] assistantMsgs=99
+  007f380d-18af-4719-9288-f5dbf3e8fcb9 slug=--M-ds-guard-- origin=subagent depth=1 cwd="M:\\ds-guard" mtime=2026-09-22T17:23:07.676Z hits=["stream-guard","restate"] assistantMsgs=80
+  5eab548d-a670-4ae7-aec4-47a79353cc6c slug=--M-ds-guard-- origin=subagent depth=1 cwd="M:\\ds-guard" mtime=2026-09-23T12:30:48.901Z hits=["stream-guard","restate","8-gram","PLAN-two-layer"] assistantMsgs=14
+  79442572-afde-496d-aa9c-1cfe03bd483d slug=--M-ds-guard-- origin=subagent depth=1 cwd="M:\\ds-guard" mtime=2026-09-23T08:11:26.899Z hits=["stream-guard","restate"] assistantMsgs=5
+  7d59802a-9b06-4059-bf8f-3712fafa4a1a slug=--M-ds-guard-- origin=subagent depth=1 cwd="M:\\ds-guard" mtime=2026-09-23T12:30:45.205Z hits=["stream-guard","restate","8-gram"] assistantMsgs=28
+  81b59bfd-4d5e-4f55-b2eb-c14094e5a850 slug=--M-ds-guard-- origin=subagent depth=1 cwd="M:\\ds-guard" mtime=2026-09-23T08:33:53.572Z hits=["stream-guard","restate"] assistantMsgs=104
+  928ba8fe-84b0-4f21-ac57-08c6b94b3757 slug=--M-ds-guard-- origin=subagent depth=1 cwd="M:\\ds-guard" mtime=2026-09-23T08:33:41.708Z hits=["stream-guard","restate"] assistantMsgs=11
+  97a12893-3cab-4b39-bd00-3fe4f5c914b3 slug=--M-ds-guard-- origin=subagent depth=1 cwd="M:\\ds-guard" mtime=2026-09-23T08:13:30.011Z hits=["stream-guard","restate"] assistantMsgs=7
+  cacc14b5-fddc-4390-ae11-b5a3a945bb3d slug=--M-ds-guard-- origin=subagent depth=1 cwd="M:\\ds-guard" mtime=2026-09-23T09:01:32.266Z hits=["stream-guard","restate"] assistantMsgs=90
+  ec54776e-9a3b-4651-a95a-20d0f32eb2b0 slug=--M-ds-guard-- origin=subagent depth=1 cwd="M:\\ds-guard" mtime=2026-09-23T08:38:56.798Z hits=["stream-guard","restate"] assistantMsgs=15
+  ecb7e8f5-c64d-4467-ab7b-f9f70e03d84f slug=--M-ds-guard-- origin=subagent depth=1 cwd="M:\\ds-guard" mtime=2026-09-23T09:02:02.911Z hits=["stream-guard","restate"] assistantMsgs=58
+  fb625ca9-e58e-4d09-b889-db62eb8127d5 slug=--M-ds-guard-- origin=subagent depth=1 cwd="M:\\ds-guard" mtime=2026-09-22T17:21:24.457Z hits=["restate"] assistantMsgs=35
+  session-58a47cb4-b87e-4bd3-adc6-b7b8259fb1fc slug=--M-ds-guard-- origin= depth=0 cwd="M:\\ds-guard" mtime=2026-09-23T12:08:35.705Z hits=["restate"] assistantMsgs=2
+  session-91a949f4-ccd8-4573-bc60-75aa020ddd7c slug=--M-ds-guard-- origin= depth=0 cwd="M:\\ds-guard" mtime=2026-09-23T12:30:53.017Z hits=["stream-guard","restate","8-gram","PLAN-two-layer"] assistantMsgs=57
+  session-a22a3b92-8572-4b48-97b4-280aa2881d20 slug=--M-ds-guard-- origin= depth=0 cwd="M:\\ds-guard" mtime=2026-09-23T05:36:35.622Z hits=["restate"] assistantMsgs=1
+  session-d50364e9-8db5-408c-9b51-943d5a3df6ad slug=--M-ds-guard-- origin= depth=0 cwd="M:\\ds-guard" mtime=2026-09-23T12:14:44.951Z hits=["stream-guard","restate","8-gram","PLAN-two-layer"] assistantMsgs=1683
+  session-15eaee00-951f-4485-b15c-b93447f18385 slug=--M-dsh-- origin= depth=0 cwd="M:\\dsh" mtime=2026-09-21T20:04:59.465Z hits=["restate"] assistantMsgs=2
+  session-84ed561e-fdc0-45c6-8f6f-c0d17b7f108f slug=--M-dsh-- origin= depth=0 cwd="M:\\dsh" mtime=2026-09-21T20:02:17.802Z hits=["restate"] assistantMsgs=2
+  session-aee936a1-3dbe-4ba2-aa26-817f64a53773 slug=--M-dsh-- origin= depth=0 cwd="M:\\dsh" mtime=2026-09-21T20:01:35.788Z hits=["restate"] assistantMsgs=1
+  session-b9e4622d-8293-4501-9b76-918b94a7a282 slug=--M-dsh-- origin= depth=0 cwd="M:\\dsh" mtime=2026-09-22T15:03:34.606Z hits=["restate"] assistantMsgs=1
+  session-ec74163e-710f-4755-b5a6-5165d4654325 slug=--M-dsh-- origin= depth=0 cwd="M:\\dsh" mtime=2026-09-22T13:58:15.289Z hits=["restate"] assistantMsgs=1
+
+## histogram EXCLUDING self-produced sessions (char-raw cR)
+## histogram char-raw cR non-self  (n=28)
+   0-  5%     26
+   5- 10%      0
+  10- 15%      2
+  15- 20%      0
+  20- 25%      0
+  25- 30%      0
+  30- 35%      0
+  35- 40%      0
+  40- 45%      0
+  45- 50%      0
+  50- 55%      0
+  55- 60%      0
+  60- 65%      0
+  65- 70%      0
+  70- 75%      0
+  75- 80%      0
+  80- 85%      0
+  85- 90%      0
+  90- 95%      0
+  95-100%      0
+  zero bins (lo%): [5,15,20,25,30,35,40,45,50,55,60,65,70,75,80,85,90,95]
+  non-self >=95% count = 0
+
+## file anchors (sha256 first16 / mtime / size)
+  d100031b98173f88 2026-09-22T04:20:55.681Z    531575 frames=5 amsg=104 rmsg=55 self=Y C:\Users\TRI\.dsh\sessions\--C-Users-TRI-Downloads-Noname~0020v1.6.6--\14ed7e25-cf4e-44b0-be7f-e3cd0d01cbb9\session.v3.jsonl.zstd
+  f4ac9b10ff0c1956 2026-09-22T04:19:35.726Z    505628 frames=8 amsg=105 rmsg=55 self=Y C:\Users\TRI\.dsh\sessions\--C-Users-TRI-Downloads-Noname~0020v1.6.6--\69039bb4-a68d-4102-84b4-f2052a66aa8e\session.v3.jsonl.zstd
+  0d2a8429071c6ec0 2026-09-22T03:45:48.120Z    104161 frames=85 amsg=22 rmsg=3 self=n C:\Users\TRI\.dsh\sessions\--C-Users-TRI-Downloads-Noname~0020v1.6.6--\session-0b7dcd8e-1b60-43bf-ba66-5a18808fe615\session.v3.jsonl.zstd
+  299f4dbe01bd886e 2026-09-21T20:45:19.855Z     31275 frames=13 amsg=3 rmsg=0 self=n C:\Users\TRI\.dsh\sessions\--C-Users-TRI-Downloads-Noname~0020v1.6.6--\session-18a324ba-b514-44c0-b6d5-584a9a828329\session.v3.jsonl.zstd
+  e21be7c6c9873e16 2026-09-22T03:55:18.927Z    429870 frames=183 amsg=52 rmsg=17 self=Y C:\Users\TRI\.dsh\sessions\--C-Users-TRI-Downloads-Noname~0020v1.6.6--\session-3ef35930-279d-4d74-9776-4200a66c58cc\session.v3.jsonl.zstd
+  467578ebb283e8da 2026-09-23T05:49:14.113Z     66384 frames=21 amsg=3 rmsg=0 self=Y C:\Users\TRI\.dsh\sessions\--C-Users-TRI-Downloads-Noname~0020v1.6.6--\session-7393ccd4-6b07-4ae7-a25c-ab0b54870720\session.v3.jsonl.zstd
+  ff5057f2a07fb8fd 2026-09-21T20:30:30.802Z    304222 frames=203 amsg=63 rmsg=3 self=n C:\Users\TRI\.dsh\sessions\--C-Users-TRI-Downloads-Noname~0020v1.6.6--\session-7858b9d6-e46a-4d1f-86f2-747951f9541a\session.v3.jsonl.zstd
+  439894e4f8a4e218 2026-09-23T07:52:49.731Z    440582 frames=219 amsg=57 rmsg=14 self=Y C:\Users\TRI\.dsh\sessions\--C-Users-TRI-Downloads-Noname~0020v1.6.6--\session-ac044d98-d686-44c4-b913-e965685ab451\session.v3.jsonl.zstd
+  4c7308b33f117026 2026-09-22T04:23:12.080Z       336 frames=2 amsg=0 rmsg=0 self=n C:\Users\TRI\.dsh\sessions\--C-Users-TRI-Downloads-Noname~0020v1.6.6--\session-c66d89b0-e7da-4bad-87c9-e9a1549d265d\session.v3.jsonl.zstd
+  7e9460f1aca90eaa 2026-09-21T20:47:32.827Z     39515 frames=6 amsg=1 rmsg=0 self=n C:\Users\TRI\.dsh\sessions\--C-Users-TRI-Downloads-Noname~0020v1.6.6--\session-e9afd53a-1a38-4398-be49-cae1e0c60dd5\session.v3.jsonl.zstd
+  915a731f8e49a836 2026-09-22T04:22:53.433Z    839310 frames=380 amsg=113 rmsg=55 self=Y C:\Users\TRI\.dsh\sessions\--C-Users-TRI-Downloads-Noname~0020v1.6.6--\session-f1e7a66b-c93a-4cd7-bdec-c1a499f24bb2\session.v3.jsonl.zstd
+  aec06df708c6fe30 2026-09-22T05:23:50.956Z     35878 frames=22 amsg=6 rmsg=0 self=n C:\Users\TRI\.dsh\sessions\--M-Codex-.codex--\0fea8f3e-cd74-4646-bccb-62de149b89f8\session.v3.jsonl.zstd
+  409856b6ffa9cb93 2026-09-22T05:00:04.101Z     24505 frames=9 amsg=2 rmsg=0 self=n C:\Users\TRI\.dsh\sessions\--M-Codex-.codex--\14f0c535-a5b5-4be6-a652-3ed30dfbd7ef\session.v3.jsonl.zstd
+  e845e58344fc2ecd 2026-09-22T05:06:19.768Z     28340 frames=6 amsg=1 rmsg=1 self=n C:\Users\TRI\.dsh\sessions\--M-Codex-.codex--\267a29ba-ae52-4724-a950-947b870dd2a4\session.v3.jsonl.zstd
+  472e52bcd03ca623 2026-09-22T09:25:24.117Z   1745599 frames=144 amsg=346 rmsg=124 self=Y C:\Users\TRI\.dsh\sessions\--M-Codex-.codex--\36d17f21-03f0-436a-8c15-0448fc3919c7\session.v3.jsonl.zstd
+  25fb77bad25cc1b1 2026-09-22T08:12:56.206Z   2514046 frames=1113 amsg=319 rmsg=190 self=Y C:\Users\TRI\.dsh\sessions\--M-Codex-.codex--\3e6332d4-6f94-4aa6-a1e6-72babcf5903c\session.v3.jsonl.zstd
+  79d30441627c295b 2026-09-22T05:05:57.833Z     30052 frames=6 amsg=1 rmsg=0 self=n C:\Users\TRI\.dsh\sessions\--M-Codex-.codex--\43f627c8-6de4-459b-a961-c033aef61dc9\session.v3.jsonl.zstd
+  ff3765e58d8c3b90 2026-09-22T05:23:36.354Z     38424 frames=17 amsg=4 rmsg=0 self=n C:\Users\TRI\.dsh\sessions\--M-Codex-.codex--\45a64894-be8f-47a3-9c31-bc11fb0cf80b\session.v3.jsonl.zstd
+  01d2fbe896670083 2026-09-22T09:29:57.530Z   1949674 frames=190 amsg=355 rmsg=143 self=Y C:\Users\TRI\.dsh\sessions\--M-Codex-.codex--\534fd1ea-b305-4bc7-be14-4172b037d96a\session.v3.jsonl.zstd
+  49c75e022a221c7d 2026-09-22T05:59:14.746Z   1039248 frames=40 amsg=151 rmsg=74 self=Y C:\Users\TRI\.dsh\sessions\--M-Codex-.codex--\7600d424-cf73-41cd-a4af-008c13095aff\session.v3.jsonl.zstd
+  43c5429cda761ca6 2026-09-22T05:06:40.081Z     39427 frames=6 amsg=1 rmsg=0 self=n C:\Users\TRI\.dsh\sessions\--M-Codex-.codex--\78adebfb-7834-48f9-b8a5-668f36d1548f\session.v3.jsonl.zstd
+  834525ce60316fae 2026-09-22T05:06:13.899Z     23797 frames=6 amsg=1 rmsg=1 self=n C:\Users\TRI\.dsh\sessions\--M-Codex-.codex--\7996b947-d72b-460c-a01b-40001cf0691e\session.v3.jsonl.zstd
+  054a64b471d79dcd 2026-09-22T05:06:49.609Z     36086 frames=22 amsg=6 rmsg=0 self=n C:\Users\TRI\.dsh\sessions\--M-Codex-.codex--\7a22709e-130e-45d6-9c13-9aae93f28438\session.v3.jsonl.zstd
+  4ae4ff0c6c4964b0 2026-09-22T05:10:04.959Z     82572 frames=12 amsg=3 rmsg=0 self=n C:\Users\TRI\.dsh\sessions\--M-Codex-.codex--\7de9d26a-f096-44b4-90af-19685f52bf1b\session.v3.jsonl.zstd
+  8f5c721424552a6f 2026-09-22T12:56:12.498Z    289939 frames=196 amsg=55 rmsg=0 self=Y C:\Users\TRI\.dsh\sessions\--M-Codex-.codex--\81e92a93-35f4-4f79-ab65-17a9138a9da5\session.v3.jsonl.zstd
+  3e3a81437a60e5fd 2026-09-22T13:32:11.465Z    532646 frames=393 amsg=116 rmsg=11 self=Y C:\Users\TRI\.dsh\sessions\--M-Codex-.codex--\8f412457-cd6b-42dd-afcc-7e9a8da626b5\session.v3.jsonl.zstd
+  46df8082a04597a4 2026-09-22T05:27:23.453Z     89026 frames=84 amsg=25 rmsg=0 self=n C:\Users\TRI\.dsh\sessions\--M-Codex-.codex--\8f74284c-e54e-4996-98c9-4c05695ab009\session.v3.jsonl.zstd
+  b2820147609001ea 2026-09-22T04:24:41.097Z     27687 frames=9 amsg=2 rmsg=0 self=n C:\Users\TRI\.dsh\sessions\--M-Codex-.codex--\90a4f237-0a8f-43c7-80cf-2c870635a34f\session.v3.jsonl.zstd
+  f9050487597f8900 2026-09-22T05:27:31.972Z     37370 frames=6 amsg=1 rmsg=1 self=n C:\Users\TRI\.dsh\sessions\--M-Codex-.codex--\92156223-90ff-4280-aa2d-11d4889ec3c8\session.v3.jsonl.zstd
+  7b6247acf782422b 2026-09-22T05:06:43.974Z     71278 frames=6 amsg=1 rmsg=1 self=n C:\Users\TRI\.dsh\sessions\--M-Codex-.codex--\94e325fc-994c-44c0-80ce-fb98583f90e3\session.v3.jsonl.zstd
+  3c536669cd95f2a1 2026-09-22T05:05:45.833Z     26704 frames=9 amsg=2 rmsg=0 self=n C:\Users\TRI\.dsh\sessions\--M-Codex-.codex--\95d6bcc0-6b4a-4354-8ea5-d77bf191b5a2\session.v3.jsonl.zstd
+  e17b1c98f17d204d 2026-09-22T05:23:24.034Z     26468 frames=6 amsg=1 rmsg=0 self=n C:\Users\TRI\.dsh\sessions\--M-Codex-.codex--\9e61f39d-6666-41af-a136-b1b183f9558f\session.v3.jsonl.zstd
+  8110c7dff5bb6fb9 2026-09-22T10:38:28.450Z    301626 frames=263 amsg=72 rmsg=0 self=Y C:\Users\TRI\.dsh\sessions\--M-Codex-.codex--\a5e57ff8-8da9-4801-9aae-a0b4e980defe\session.v3.jsonl.zstd
+  5806457c415151a4 2026-09-22T05:23:23.408Z     29925 frames=10 amsg=2 rmsg=0 self=n C:\Users\TRI\.dsh\sessions\--M-Codex-.codex--\a6e2a51d-7b5f-4c1f-971c-0f1e7004004c\session.v3.jsonl.zstd
+  6012687abc081ab0 2026-09-22T09:25:26.316Z   1758180 frames=79 amsg=323 rmsg=119 self=Y C:\Users\TRI\.dsh\sessions\--M-Codex-.codex--\b923ce6b-5c36-4b79-8a61-7c9632359e7a\session.v3.jsonl.zstd
+  d0bf32834e4f8d66 2026-09-22T04:47:47.717Z     25110 frames=9 amsg=2 rmsg=0 self=n C:\Users\TRI\.dsh\sessions\--M-Codex-.codex--\c07f0702-6f42-485c-9002-4cf768b89723\session.v3.jsonl.zstd
+  75da7160d8c4b4f7 2026-09-22T04:52:56.096Z     29136 frames=12 amsg=3 rmsg=0 self=n C:\Users\TRI\.dsh\sessions\--M-Codex-.codex--\c4263e61-9efa-4e93-86d5-6603a4643c41\session.v3.jsonl.zstd
+  679fbad6d8157196 2026-09-22T04:49:55.681Z     24632 frames=9 amsg=2 rmsg=0 self=n C:\Users\TRI\.dsh\sessions\--M-Codex-.codex--\c7f506f8-c8b6-4d34-8229-70f4141d4931\session.v3.jsonl.zstd
+  fcabee71d3b092fd 2026-09-22T08:24:19.758Z   1307043 frames=54 amsg=212 rmsg=91 self=Y C:\Users\TRI\.dsh\sessions\--M-Codex-.codex--\d075dac8-e61d-4147-8453-1f401f2fd90b\session.v3.jsonl.zstd
+  2a6f23323cf70b1e 2026-09-22T08:24:14.444Z   1302484 frames=61 amsg=216 rmsg=91 self=Y C:\Users\TRI\.dsh\sessions\--M-Codex-.codex--\d309065a-ced0-4ef3-9770-7f5b02531b9c\session.v3.jsonl.zstd
+  c39fe2ddc0411369 2026-09-22T05:11:10.489Z    121751 frames=12 amsg=3 rmsg=2 self=n C:\Users\TRI\.dsh\sessions\--M-Codex-.codex--\e6f5a9c9-a223-4831-aa67-908228bbea6d\session.v3.jsonl.zstd
+  46d3c81b2cb62aed 2026-09-22T12:37:34.629Z    431535 frames=325 amsg=92 rmsg=11 self=Y C:\Users\TRI\.dsh\sessions\--M-Codex-.codex--\ea5d5855-caaa-47a0-9f4a-54cf0abc3c4b\session.v3.jsonl.zstd
+  7998d6528b428c94 2026-09-22T05:06:31.026Z     29144 frames=15 amsg=4 rmsg=0 self=n C:\Users\TRI\.dsh\sessions\--M-Codex-.codex--\f22d628b-b326-47ce-8c95-2532dd0ad77a\session.v3.jsonl.zstd
+  01efba63502c1d49 2026-09-22T05:06:01.013Z     30202 frames=6 amsg=1 rmsg=0 self=n C:\Users\TRI\.dsh\sessions\--M-Codex-.codex--\fb0ac82a-34db-4430-84ab-54eef5989989\session.v3.jsonl.zstd
+  dd33158e13f9c2b1 2026-09-22T17:18:30.537Z   5756592 frames=3229 amsg=942 rmsg=278 self=Y C:\Users\TRI\.dsh\sessions\--M-Codex-.codex--\session-07a7c41c-6710-4ae3-be3d-82dd1d180557\session.v3.jsonl.zstd
+  6b088020db1c365d 2026-09-21T18:34:02.207Z     23068 frames=9 amsg=2 rmsg=0 self=n C:\Users\TRI\.dsh\sessions\--M-Codex-.codex--\session-570fcf32-e6b3-4cf0-a6df-dedac553bb3a\session.v3.jsonl.zstd
+  7b4669b6704867e2 2026-09-22T04:41:33.923Z     82244 frames=31 amsg=7 rmsg=6 self=n C:\Users\TRI\.dsh\sessions\--M-Codex-.codex--\session-5aa9f21e-1f84-4358-8f36-e15b02d38ece\session.v3.jsonl.zstd
+  62a441d690748364 2026-09-22T17:06:40.409Z    483141 frames=240 amsg=66 rmsg=24 self=Y C:\Users\TRI\.dsh\sessions\--M-Codex-.codex--\session-8959b9f2-8fbb-461c-a847-afacb23078b6\session.v3.jsonl.zstd
+  e724beb6373414af 2026-09-21T20:06:17.476Z     27236 frames=12 amsg=2 rmsg=0 self=n C:\Users\TRI\.dsh\sessions\--M-Codex-.codex--\session-9533f53e-2755-410b-8d09-0a5272d0c3b5\session.v3.jsonl.zstd
+  f0c27acebc5d204c 2026-09-22T13:17:40.478Z     19200 frames=8 amsg=1 rmsg=1 self=Y C:\Users\TRI\.dsh\sessions\--M-Codex-.codex--\session-964511fa-33b5-4838-9231-702b9356c966\session.v3.jsonl.zstd
+  705e71d582d77dcd 2026-09-22T04:50:00.251Z     27770 frames=13 amsg=2 rmsg=2 self=n C:\Users\TRI\.dsh\sessions\--M-Codex-.codex--\session-97be39e5-35f6-4d52-b689-0ae0e23e2ec8\session.v3.jsonl.zstd
+  b9711a2dee092cbd 2026-09-22T04:40:34.238Z    270514 frames=204 amsg=60 rmsg=0 self=Y C:\Users\TRI\.dsh\sessions\--M-Codex-.codex--\session-a5fbdcef-9bac-40a0-87dd-dab23791782b\session.v3.jsonl.zstd
+  6065d53b3984e561 2026-09-22T16:18:23.046Z     39012 frames=15 amsg=2 rmsg=2 self=Y C:\Users\TRI\.dsh\sessions\--M-Codex-.codex--\session-ab0dce79-871c-4165-9c3f-11d17a778983\session.v3.jsonl.zstd
+  5654b44b1e8c9e62 2026-09-22T17:01:48.618Z       321 frames=2 amsg=0 rmsg=0 self=n C:\Users\TRI\.dsh\sessions\--M-Codex-.codex--\session-ad98a246-edaa-4440-8cb8-5e28b09f237b\session.v3.jsonl.zstd
+  a7db5a7959207542 2026-09-22T16:18:20.219Z    897303 frames=421 amsg=99 rmsg=67 self=Y C:\Users\TRI\.dsh\sessions\--M-Codex-.codex--\session-d531c71b-6bf1-4888-9fc0-976c321374e5\session.v3.jsonl.zstd
+  cdedd5366ad68886 2026-09-22T04:47:58.383Z    396114 frames=109 amsg=27 rmsg=26 self=n C:\Users\TRI\.dsh\sessions\--M-Codex-.codex--\session-eca8aefc-0f19-430e-9b21-2f169bca79f3\session.v3.jsonl.zstd
+  21b438966cce3038 2026-09-21T20:06:17.477Z     52925 frames=24 amsg=6 rmsg=0 self=n C:\Users\TRI\.dsh\sessions\--M-Codex-.codex--\session-f54a85e4-bcdb-4d7b-98e7-21a0860016aa\session.v3.jsonl.zstd
+  c653aae4517640f3 2026-09-21T19:09:10.919Z     16524 frames=11 amsg=1 rmsg=0 self=n C:\Users\TRI\.dsh\sessions\--M-Codex-.codex--\session-fcdebea5-8af7-4cdb-a72a-a5797558e950\session.v3.jsonl.zstd
+  c61c6e94322f7f92 2026-09-21T18:32:40.919Z     26307 frames=13 amsg=3 rmsg=0 self=n C:\Users\TRI\.dsh\sessions\--M-Codex-.codex--\session-ff67ebe9-28ba-435e-bcad-787a8216e85f\session.v3.jsonl.zstd
+  a84e46dd113565c1 2026-09-22T17:23:07.676Z    900869 frames=322 amsg=80 rmsg=68 self=Y C:\Users\TRI\.dsh\sessions\--M-ds-guard--\007f380d-18af-4719-9288-f5dbf3e8fcb9\session.v3.jsonl.zstd
+  a2911a42af27479b 2026-09-23T12:30:48.901Z    119253 frames=62 amsg=14 rmsg=13 self=Y C:\Users\TRI\.dsh\sessions\--M-ds-guard--\5eab548d-a670-4ae7-aec4-47a79353cc6c\session.v3.jsonl.zstd
+  ab43d55d4334eade 2026-09-23T08:11:26.899Z    248029 frames=26 amsg=5 rmsg=4 self=Y C:\Users\TRI\.dsh\sessions\--M-ds-guard--\79442572-afde-496d-aa9c-1cfe03bd483d\session.v3.jsonl.zstd
+  690716a7309ef76b 2026-09-23T12:30:45.205Z    323626 frames=112 amsg=28 rmsg=0 self=Y C:\Users\TRI\.dsh\sessions\--M-ds-guard--\7d59802a-9b06-4059-bf8f-3712fafa4a1a\session.v3.jsonl.zstd
+  20025a2a14c077e7 2026-09-23T08:33:53.572Z    618925 frames=336 amsg=104 rmsg=60 self=Y C:\Users\TRI\.dsh\sessions\--M-ds-guard--\81b59bfd-4d5e-4f55-b2eb-c14094e5a850\session.v3.jsonl.zstd
+  95e42f63061563d4 2026-09-23T08:33:41.708Z    350797 frames=44 amsg=11 rmsg=7 self=Y C:\Users\TRI\.dsh\sessions\--M-ds-guard--\928ba8fe-84b0-4f21-ac57-08c6b94b3757\session.v3.jsonl.zstd
+  64fb26142d218c81 2026-09-23T08:13:30.011Z    382699 frames=31 amsg=7 rmsg=5 self=Y C:\Users\TRI\.dsh\sessions\--M-ds-guard--\97a12893-3cab-4b39-bd00-3fe4f5c914b3\session.v3.jsonl.zstd
+  00b6d84a21630ddb 2026-09-23T09:01:32.266Z    574295 frames=286 amsg=90 rmsg=53 self=Y C:\Users\TRI\.dsh\sessions\--M-ds-guard--\cacc14b5-fddc-4390-ae11-b5a3a945bb3d\session.v3.jsonl.zstd
+  7f0697c711ed5934 2026-09-23T08:38:56.798Z    247109 frames=56 amsg=15 rmsg=8 self=Y C:\Users\TRI\.dsh\sessions\--M-ds-guard--\ec54776e-9a3b-4651-a95a-20d0f32eb2b0\session.v3.jsonl.zstd
+  b55d595ea26d0a81 2026-09-23T09:02:02.911Z    547808 frames=207 amsg=58 rmsg=41 self=Y C:\Users\TRI\.dsh\sessions\--M-ds-guard--\ecb7e8f5-c64d-4467-ab7b-f9f70e03d84f\session.v3.jsonl.zstd
+  93f52da9123ec0ed 2026-09-22T17:21:24.457Z    461038 frames=135 amsg=35 rmsg=20 self=Y C:\Users\TRI\.dsh\sessions\--M-ds-guard--\fb625ca9-e58e-4d09-b889-db62eb8127d5\session.v3.jsonl.zstd
+  3ce0f84e7523431e 2026-09-23T12:08:35.705Z     51012 frames=11 amsg=2 rmsg=2 self=Y C:\Users\TRI\.dsh\sessions\--M-ds-guard--\session-58a47cb4-b87e-4bd3-adc6-b7b8259fb1fc\session.v3.jsonl.zstd
+  c9b0baa3444d5bd7 2026-09-23T12:30:53.017Z    557556 frames=236 amsg=57 rmsg=0 self=Y C:\Users\TRI\.dsh\sessions\--M-ds-guard--\session-91a949f4-ccd8-4573-bc60-75aa020ddd7c\session.v3.jsonl.zstd
+  4300a70df902d3dc 2026-09-23T05:36:35.622Z     30789 frames=8 amsg=1 rmsg=1 self=Y C:\Users\TRI\.dsh\sessions\--M-ds-guard--\session-a22a3b92-8572-4b48-97b4-280aa2881d20\session.v3.jsonl.zstd
+  8ae0168a2c925ea9 2026-09-23T12:14:44.951Z  12161318 frames=5631 amsg=1683 rmsg=731 self=Y C:\Users\TRI\.dsh\sessions\--M-ds-guard--\session-d50364e9-8db5-408c-9b51-943d5a3df6ad\session.v3.jsonl.zstd
+  205fff88a628f1da 2026-09-21T20:04:59.465Z     23420 frames=9 amsg=2 rmsg=0 self=Y C:\Users\TRI\.dsh\sessions\--M-dsh--\session-15eaee00-951f-4485-b15c-b93447f18385\session.v3.jsonl.zstd
+  9cad74d901327cd0 2026-09-21T20:02:17.802Z     23770 frames=10 amsg=2 rmsg=0 self=Y C:\Users\TRI\.dsh\sessions\--M-dsh--\session-84ed561e-fdc0-45c6-8f6f-c0d17b7f108f\session.v3.jsonl.zstd
+  7d9f578e243ca84f 2026-09-21T20:47:50.533Z       310 frames=2 amsg=0 rmsg=0 self=n C:\Users\TRI\.dsh\sessions\--M-dsh--\session-8ce64fc8-ab08-4b9d-aad5-d7574a3578a3\session.v3.jsonl.zstd
+  f2eba04e48811a67 2026-09-21T20:01:35.788Z     22520 frames=6 amsg=1 rmsg=0 self=Y C:\Users\TRI\.dsh\sessions\--M-dsh--\session-aee936a1-3dbe-4ba2-aa26-817f64a53773\session.v3.jsonl.zstd
+  0a8ecca1dba1f1a7 2026-09-22T15:03:34.606Z     22319 frames=7 amsg=1 rmsg=0 self=Y C:\Users\TRI\.dsh\sessions\--M-dsh--\session-b9e4622d-8293-4501-9b76-918b94a7a282\session.v3.jsonl.zstd
+  af299794dfd64c21 2026-09-22T13:58:15.289Z     22282 frames=6 amsg=1 rmsg=0 self=Y C:\Users\TRI\.dsh\sessions\--M-dsh--\session-ec74163e-710f-4755-b5a6-5165d4654325\session.v3.jsonl.zstd

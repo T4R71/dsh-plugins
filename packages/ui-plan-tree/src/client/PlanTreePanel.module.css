@@ -1,0 +1,429 @@
+/* The pane body is a block scroller with a definite height, so the plan takes
+   that height outright: the summary row stays put and the tree below is the one
+   scroller (the file tree's shape, ui-sidebar-files FilesBody.module.css). */
+.root {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  color: var(--dsw-alias-label-primary);
+  font-size: var(--dsh-content-font-size-secondary, 13px);
+  line-height: 1.5;
+}
+
+/* One 38px summary row flush under the pane's strip, on the same rule the
+   conversation header draws. */
+.summary {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 10px;
+  align-items: center;
+  box-sizing: border-box;
+  height: 38px;
+  padding: 0 16px;
+  border-bottom: 0.5px solid var(--dsw-alias-border-l3);
+}
+
+.summaryTitle {
+  flex: none;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--dsw-alias-label-primary);
+}
+
+.summaryProgress {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  font-size: 13px;
+  color: var(--dsw-alias-label-tertiary);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.body {
+  flex: 1 1 auto;
+  min-height: 0;
+  /* The file tree's 2px scrollbar offset and stable gutter: the rows keep their
+     inset whether or not the tree overflows. */
+  margin-right: 2px;
+  padding: 8px 0 8px 8px;
+  overflow: auto;
+  scrollbar-gutter: stable;
+}
+
+.body::-webkit-scrollbar-track {
+  margin: 2px;
+}
+
+/* ── Sections ─────────────────────────────────────────────────────────────── */
+
+/* The declared plan and the Team board are two facts, so they are two blocks
+   with a rule between them rather than one merged list. The rule is the only
+   separator: no box, no card, because both halves belong to the same pane. */
+.section + .section {
+  margin-top: 4px;
+  padding-top: 8px;
+  border-top: 0.5px solid var(--dsw-alias-border-l3);
+}
+
+/* One 26px section head, quieter than the pane's own summary row above it. */
+.sectionHead {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  box-sizing: border-box;
+  height: 26px;
+  padding: 0 10px;
+}
+
+.sectionTitle {
+  flex: none;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--dsw-alias-label-secondary);
+}
+
+.sectionCount {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  font-size: 12px;
+  color: var(--dsw-alias-label-tertiary);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.level {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/* The timeline rail: one continuous guide line through the top level, so the
+   eye is led DOWN the declared order. Each top-level row draws its own segment
+   through a ::before that spans the full row height; the last row stops at its
+   glyph so the line does not dangle past the end of the plan. */
+.level[data-order='timeline'] > .item {
+  position: relative;
+}
+
+.level[data-order='timeline'] > .item::before {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 17px;
+  width: 1px;
+  background: var(--dsw-alias-border-l3);
+  content: '';
+}
+
+.level[data-order='timeline'] > .item:first-child::before {
+  top: 50%;
+}
+
+.level[data-order='timeline'] > .item:last-child::before {
+  bottom: calc(100% - 50%);
+}
+
+/* A single-step plan has neither an entry nor an exit segment to draw. */
+.level[data-order='timeline'] > .item:only-child::before {
+  display: none;
+}
+
+/* The arrowhead between two top-level rows: an explicit "read on" mark rather
+   than a bare gap. */
+.level[data-order='timeline'] > .item:not(:last-child)::after {
+  position: absolute;
+  bottom: -5px;
+  left: 13px;
+  color: var(--dsw-alias-label-caption);
+  font-size: 9px;
+  line-height: 1;
+  content: '▾';
+}
+
+/* Every nested level indents by one step. This is the ONLY indentation the
+   declared plan uses: an inline per-row padding would double it up. */
+.level .level {
+  padding-left: 18px;
+}
+
+/* The timeline rail belongs to the top level only — a nested level draws no
+   rail of its own, so the guide line stays a single spine instead of a ladder. */
+.level .level[data-order='timeline'] > .item::before,
+.level .level > .item::before {
+  display: none;
+}
+
+.item {
+  margin: 0;
+  padding: 0;
+}
+
+/* A row is a block of glyph + title + optional detail; the disclosure button
+   owns the whole row when the node has children. */
+.row {
+  display: flex;
+  gap: 6px;
+  align-items: flex-start;
+  width: 100%;
+  min-width: 0;
+  padding: 5px 10px;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  background: transparent;
+  border: 0;
+  border-radius: 10px;
+  cursor: pointer;
+}
+
+.row:hover {
+  /* A translucent wash, not the opaque hover token: nested rows stack their
+     hover fills on top of their ancestors' and an opaque fill turns a hovered
+     subtree into a pile of offset slabs. The wash also keeps the timeline rail
+     and the glyph visible through it. */
+  background: color-mix(in srgb, var(--dsw-alias-interactive-bg-hover) 55%, transparent);
+}
+
+/* A leaf's row is not a control, so it neither hovers nor shows a pointer. It
+   is rendered as a plain <div> (see PlanNodeRow), but the full-width box and
+   the transparent background are still stated here: the row must line up with
+   its sibling <button> rows, and a stray background would show as a card. */
+.leaf {
+  display: flex;
+  gap: 6px;
+  align-items: flex-start;
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  padding: 5px 10px;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  background: transparent;
+}
+
+/* The status glyph sits on the timeline rail in a glyph-sized cell, so titles
+   line up across depths and the rail passes behind the marker. The cell paints
+   the panel's own background so the rail reads as connecting markers rather
+   than crossing them. */
+.rail {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  flex: none;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  /* The glyphs share the 14px artboard; this cell centers them on the first
+     text line (line-height 1.5 × 13px ≈ 19.5px, so 2px down). */
+  margin-top: 2px;
+  background: var(--dsw-alias-bg-base);
+  border-radius: 50%;
+}
+
+.glyphPending {
+  color: var(--dsw-alias-label-caption);
+}
+
+.glyphProgress {
+  color: var(--dsw-alias-state-business-primary);
+  animation: plan-tree-progress-spin 1s linear infinite;
+}
+
+.glyphCompleted {
+  color: var(--dsw-alias-state-success-primary);
+}
+
+.glyphBlocked {
+  color: var(--dsw-alias-state-error-primary);
+}
+
+@keyframes plan-tree-progress-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* The chevron sits in a glyph-sized cell so titles line up across depths. */
+.chevron {
+  display: grid;
+  flex: none;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  margin-top: 2px;
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.text {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.title {
+  min-width: 0;
+  color: var(--dsw-alias-label-primary);
+}
+
+/* A finished step's title recedes; the glyph carries the state. */
+.item[data-status='completed'] .title {
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.detail {
+  min-width: 0;
+  font-size: 12px;
+  color: var(--dsw-alias-label-tertiary);
+}
+
+/* ── Expanded task detail ─────────────────────────────────────────────────── */
+
+/* The block under an opened row: the task's own description, what it waits on,
+   and what it may touch. Indented past the rail so it reads as belonging to the
+   row above rather than starting a new one.
+
+   The fill is a faint wash rather than the opaque `bg-layer-1` card: on the
+   sidebar's own `bg-base` the layer token reads as a bright slab, and a nested
+   row's block sat at the SAME fixed left margin as its ancestor's, so a
+   three-level plan drew three offset rectangles. The wash recedes, and the
+   `margin-left` now follows the nesting via the `.level .level` indent. */
+.detailBlock {
+  margin: 2px 10px 8px 26px;
+  padding: 8px 10px;
+  background: color-mix(in srgb, var(--dsw-alias-label-primary) 5%, transparent);
+  border-radius: 8px;
+}
+
+.level .level .detailBlock {
+  margin-left: 8px;
+}
+
+/* Who is doing this step, once it has been dispatched. Same size as `.detail`
+   but in the business ink: an assignee is live state, not a footnote. */
+.assignee {
+  min-width: 0;
+  overflow: hidden;
+  font-size: 12px;
+  color: var(--dsw-alias-state-business-primary);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.status {
+  flex: none;
+  font-size: 12px;
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.empty {
+  padding: 12px 10px;
+  color: var(--dsw-alias-label-secondary);
+  font-size: var(--dsh-content-font-size-secondary, 13px);
+  line-height: 1.6;
+}
+
+/* The plan glyph before the chip's text. */
+.titleIcon {
+  flex: none;
+}
+
+/* ── Empty board ──────────────────────────────────────────────────────────── */
+
+/* Centred in the body rather than pinned to the top: the pane has a definite
+   height and a single line of copy at the top would read as a truncated list. */
+.empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  height: 100%;
+  min-height: 160px;
+  padding: 24px 16px 40px;
+  text-align: center;
+}
+
+/* Three ghost rows on the SAME rail the real rows use, so the placeholder is
+   the panel's own language rather than a generic illustration. */
+.emptyRail {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: 100%;
+  max-width: 200px;
+  margin-bottom: 20px;
+}
+
+.emptyRow {
+  position: relative;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding-left: 3px;
+}
+
+/* The continuous guide line, dotted because nothing is declared to walk it. */
+.emptyRow::before {
+  position: absolute;
+  top: -12px;
+  bottom: -12px;
+  left: 9px;
+  width: 0;
+  border-left: 1px dashed var(--dsw-alias-border-l3);
+  content: '';
+}
+
+.emptyRow:first-child::before {
+  top: 50%;
+}
+
+.emptyRow:last-child::before {
+  bottom: 50%;
+}
+
+/* An unfilled ring in the faintest ink: the shape of a glyph, not a glyph. The
+   fill matches the SIDEBAR's own background (`bg-base`, what `.rail` uses) so
+   the dashed rail passes behind the ring instead of showing through a patch of
+   a different layer. */
+.emptyGlyph {
+  position: relative;
+  z-index: 1;
+  flex: none;
+  box-sizing: border-box;
+  width: 12px;
+  height: 12px;
+  background: var(--dsw-alias-bg-base);
+  border: 1px dashed var(--dsw-alias-border-l3);
+  border-radius: 50%;
+}
+
+/* The label bar: a placeholder for the subject that does not exist yet. Mixed
+   from the primary label ink so it tracks the theme's text colour instead of a
+   fixed surface token that may sit on the wrong side of the background. */
+.emptyBar {
+  height: 8px;
+  background: color-mix(in srgb, var(--dsw-alias-label-primary) 12%, transparent);
+  border-radius: 4px;
+}
+
+.emptyTitle {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--dsw-alias-label-secondary);
+}
+
+.emptyHint {
+  max-width: 240px;
+  margin: 6px 0 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--dsw-alias-label-tertiary);
+}

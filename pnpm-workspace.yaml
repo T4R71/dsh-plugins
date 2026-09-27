@@ -1,0 +1,16 @@
+# 本仓库根工作区。这里是 pnpm 工作区根，包目录内部不得再放 pnpm-workspace.yaml
+# （包目录里再放一份会被当成那个包自己的工作区根，截断 pnpm 从该目录往上的查找）。
+packages:
+  - 'packages/*'
+
+# 依赖安装脚本的放行决定属于工作区根，且必须逐包显式记录：
+# 未记录的包会让 pnpm 以 ERR_PNPM_IGNORED_BUILDS 退出 1。
+allowBuilds:
+  # @deepseek-ai/dsh-fs-local 在 Windows 上的 JSONL 持久化 FFI 绑定，安装脚本负责挑本平台预编译二进制。
+  koffi: true
+  # tsx 的引擎；宿主与客户端的 test 脚本都用 node --import tsx/esm。
+  esbuild: true
+  # 以下两个是被「未迁移」包的 0.1.6 依赖树带进来的传递依赖。
+  # 我们没有用它们的原生/代码生成产物，因此显式记为不跑安装脚本（而不是留成未决定）。
+  '@google/genai': false
+  protobufjs: false

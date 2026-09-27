@@ -1,0 +1,68 @@
+# The dual-axis bundle patch: one row inserting the dual-axis host half, with the
+# two axes a newly created session starts from as its composition config.
+#
+# The row id `dual-axis` is load-bearing twice over in 0.1.7:
+#   - it is the Loader entry id, and thus the settings namespace
+#     (`SettingsForms.write` looks the entry up by `options.id`);
+#   - prefixed with this package's name it forms the `plugins.row.config` slot
+#     entry key the client half registers under.
+#
+# The browser half rides this same row: in 0.1.7 a client entry's id IS its
+# package name (WebBootEntry.id, client/modules/src/client/manifest.ts:53), and
+# dsh.client is one object per package, so both client surfaces — the settings
+# row and the two composer dropdowns — live in the single bundle behind
+# exports["./client"].
+
+- insert:
+    - id: dual-axis
+      name: '@t4r71/dsh-dual-axis'
+      config:
+        read: { kind: all }
+        write: { kind: workspace }
+    # 文件系统半边刻意不在这里挂行：它要接管 `fs` 服务，而本体那一行已经注册了同一个
+    # 服务，两行同时活动会让启动直接失败（required 行不激活 = startup failed）。它同时
+    # 也救不了读轴 —— 0.1.7 的读路径不带会话，那一半永远拿不到要判的轴。要手工换掉
+    # 文件系统后端的话，得同时禁用本体的 `fs-sandbox` 行，见本包 README。
+
+    # 读轴围栏：本体 0.1.7 的读路径不带会话，读轴只能靠工具派发层执行。
+    - id: dual-axis-read-guard
+      name: '@t4r71/dsh-dual-axis/read-guard'
+
+    # 每条会话那对轴的权威存储。这是一行**独立**的 Loader entry，id 就是设置命名空间
+    # （0.1.7 里 ns == entry id），字段只有 `axes`：会话 id → 轴对。
+    #
+    # 为什么不塞进上面那行的 Config：那一行的 ns 绑着设置页的行表单，多一个未声明字段
+    # 会被投影进那张表单；而这一行的 Config 只声明 `axes` 一个 volatile 字段，
+    # 设置页不渲染它（客户端半边没有为它注册行）。
+    - id: dual-axis-sessions
+      name: '@t4r71/dsh-dual-axis/session-store'
+
+    # 纯客户端半边所在的包。它的宿主半边是空插件，这一行存在的唯一理由是
+    # 0.1.7 的客户端扫描只处理有 Loader 行的包。
+    - id: dual-axis-ui
+      name: '@t4r71/dsh-dual-axis-ui'
+
+# 本体的权限界面行：本包的两个界面面取代它，因此必须先禁掉它。
+#
+# 为什么必须禁：本包的浏览器半边注册的是本体那三个界面面本身 —— 同一个
+# `conversation.input.permission` 槽、同一条 `settings.general.item` 行
+# （id `permission`、order -20）、同一个 `/permission` 命令装饰。两条独立的独占
+# 规则因此都会在第二方 apply() 里抛错，fiber 落进 FAILED，客户端启动审计报
+# 「1 entry did not activate」：
+#   - 槽是**单占**的：ui-conversation 把 `conversation.input.permission` 声明为
+#     `{ kind: 'single', scope: 'session' }`，二次注册抛
+#     `single slot "…" already has a registration`
+#     （client/ui-slots/src/index.ts:1216-1218）。改 locale 命名空间绕不开它。
+#   - locale 命名空间按 (ns, locale) **单占**：两侧都注册 `permission.access` 与
+#     `settings.permission`，二次注册抛
+#     `locale namespace "…" already has locale "…"`
+#     （client/locale/src/client/index.ts:415-419）。
+# 这不是可接受的降级：取代关系必须由这个补丁表达，而不是由安装方记得少装一个包。
+# 用户要拿回官方界面，得卸掉本组合包（本行随它一起走），而不是把这里改回 enabled。
+#
+# 这里刻意写出 name：补丁引擎在 name 与目标行不符时打一条警告并跳过
+# （vendor/include/src/index.ts:115-118）。那条警告是安全阀 —— 本体改了那行的包名时，
+# 补丁不再生效而不是误伤同 id 的别的行。
+- id: ui-permission
+  name: '@deepseek-ai/dsh-client-ui-permission-presets'
+  disabled: true

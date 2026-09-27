@@ -1,0 +1,313 @@
+/* The read/write axis group: two hover chips sharing one capsule outline, so
+   the composer row still reads as a single permission control. */
+.axes {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  min-width: 0;
+  padding: 0 4px 0 6px;
+  /* Rounded chip chrome, matching the sibling model trigger. */
+  border-radius: 24px;
+  background: var(--dsw-alias-bg-module-platform);
+}
+
+.trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  max-width: 200px;
+  height: 28px;
+  padding: 0 4px 0 6px;
+  border: none;
+  border-radius: 20px;
+  outline: none;
+  background: transparent;
+  color: var(--dsw-alias-label-secondary);
+  font-size: 13px;
+  line-height: 20px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.trigger:hover:not(:disabled) {
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+
+.trigger:focus-visible {
+  box-shadow: 0 0 0 2px var(--dsw-alias-border-l3);
+}
+
+.trigger:disabled {
+  color: var(--dsw-alias-label-dimmed);
+  cursor: default;
+}
+
+.triggerIcon {
+  display: inline-flex;
+  flex: 0 0 auto;
+}
+
+/* The shared 16px glyphs render one step smaller on the exposed trigger;
+   the dropdown rows keep the full 16px. */
+.triggerIcon svg {
+  width: 14px;
+  height: 14px;
+}
+
+.triggerLabel {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.optionLabel {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.optionLabelText {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.badge {
+  flex: none;
+  align-self: flex-start;
+  margin-top: -1px;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 8px;
+  line-height: 10px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+}
+
+.chevron {
+  /* inline-flex, not inline: an inline seat reserves baseline descent under
+     the svg and floats the glyph off-center in the 28px trigger. */
+  display: inline-flex;
+  flex: 0 0 auto;
+  color: var(--dsw-alias-label-caption);
+  transition: transform 120ms ease;
+}
+
+/* Narrow composer: each axis collapses to icon + chevron so the row keeps
+   fitting. Both axes keep their icon, so the two triggers stay distinguishable
+   without their labels. The 460px cut is the point where the row (attach +
+   axes + model + send) starts squeezing labels; the container is the composer
+   row (InputBar .row — anonymous query because CSS modules hash
+   container-names per module). */
+@container (max-width: 460px) {
+  .triggerLabel {
+    display: none;
+  }
+}
+
+.chevronOpen {
+  transform: rotate(180deg);
+}
+
+/* The custom path editor. It is not a menu row: it is a small form that opens
+   under the axis it belongs to, so the two axes keep independent editors and a
+   half-filled one never blocks the other. */
+.seat {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+}
+
+.editor {
+  position: absolute;
+  z-index: 30;
+  bottom: calc(100% + 6px);
+  left: 0;
+  display: grid;
+  gap: 8px;
+  width: 320px;
+  padding: 12px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 12px;
+  background: var(--dsw-alias-bg-module-platform);
+  box-shadow: var(--dsw-shadow-popover, 0 8px 24px rgb(0 0 0 / 18%));
+  color: var(--dsw-alias-label-primary);
+  font-size: 12px;
+  text-align: left;
+}
+
+.editorTitle {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.editorRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.editorField {
+  display: grid;
+  gap: 3px;
+}
+
+.editorLabel {
+  min-width: 3rem;
+  color: var(--dsw-alias-label-secondary);
+}
+
+.editorSelect {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 26px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+}
+
+.editorArea {
+  width: 100%;
+  resize: vertical;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.editorHint {
+  color: var(--dsw-alias-label-tertiary);
+  line-height: 16px;
+}
+
+.editorProblem {
+  color: var(--dsw-alias-label-error, #d4380d);
+  line-height: 16px;
+}
+
+.editorActions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.editorSubmit,
+.editorCancel {
+  height: 26px;
+  padding: 0 10px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.editorSubmit {
+  background: var(--dsw-alias-interactive-bg-hover);
+  font-weight: 600;
+}
+
+.editorSubmit:disabled,
+.editorCancel:disabled {
+  color: var(--dsw-alias-label-dimmed);
+  cursor: default;
+}
+
+/* The rule-group multi-select inside the custom path editor: one checkbox row
+   per group the settings page defines, plus a row for an id this session still
+   references after its definition was removed. */
+.groupList {
+  display: grid;
+  gap: 2px;
+  max-height: 132px;
+  overflow-y: auto;
+}
+
+.groupRow {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  min-width: 0;
+  cursor: pointer;
+}
+
+.groupName {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.groupId {
+  flex: none;
+  color: var(--dsw-alias-label-tertiary);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+}
+
+.groupCoverage {
+  flex: none;
+  color: var(--dsw-alias-label-caption);
+  font-size: 11px;
+}
+
+.groupMissing {
+  flex: none;
+  color: var(--dsw-alias-label-error, #d4380d);
+  font-size: 11px;
+}
+
+/* The write trigger's corner mark: the read axis narrowed this write range. It
+   is a dot on the trigger's own edge, so the trigger keeps its width and its
+   label keeps being the picked value alone. The sentence behind it is the
+   editor's notice and the element's own accessible name. */
+.narrowingMark {
+  flex: none;
+  width: 5px;
+  height: 5px;
+  margin-right: -2px;
+  border-radius: 50%;
+  background: var(--dsw-alias-label-error, #d4380d);
+}
+
+/* The narrowing report inside the write axis's editor: the invariant, what it
+   removed, and — when no root list can carry the loss — that the axis was
+   unbounded and is now bounded. */
+.narrowing {
+  display: grid;
+  gap: 3px;
+  padding: 6px 8px;
+  border-left: 2px solid var(--dsw-alias-label-error, #d4380d);
+  border-radius: 4px;
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+
+.narrowingTitle {
+  font-weight: 600;
+}
+
+.narrowingBody {
+  color: var(--dsw-alias-label-secondary);
+  line-height: 15px;
+}
+
+.narrowingRoots {
+  color: var(--dsw-alias-label-primary);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  line-height: 16px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
