@@ -1964,12 +1964,8 @@ it('「结论要简略」那一句只进 run 链路的简报：位置在状态�
   const brief = briefOf(h.starts[1])
   assert.ok(brief.includes(concise), brief)
   assert.ok(brief.indexOf('（failed）。') < brief.indexOf(concise), '必须排在状态行那句之后')
-  // 这一句必须**整个**落在「节点状态」段里、且排在结尾那句之前。
-  // 原来的锚点（'这一行之后**再另起一行**写一句结论摘要'）在 2026-10-02 那次改动里
-  // 与状态行一起从 `withNodeBrief` 里撤掉了，锚点本身已经不在简报里 —— 用旧文案量顺序
-  // 只会量到一个 -1。判据换成两条**都在同一份简报里**的位置：节点段锚点与结尾那句。
   assert.ok(brief.indexOf('【节点状态】') < brief.indexOf(concise), '必须在节点指令段之内')
-  assert.ok(brief.indexOf(concise) < brief.indexOf('结论摘要进节点的 detail'), '必须排在结尾那句之前')
+  assert.ok(brief.indexOf(concise) < brief.indexOf('这一行之后**再另起一行**写一句结论摘要'), '必须排在结论摘要那句之前')
   // `run` 的另一条类入口：`resume` 把**已派出但没干成**的节点交回**它原来那个孩子**接着干。
   //
   // 这一条钉的是「那一句只属于 run 的**首次派发**」。resume 不走 `withNodeBrief`
