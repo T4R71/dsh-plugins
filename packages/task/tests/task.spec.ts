@@ -1202,125 +1202,167 @@ function settlementBody(summary: string, ...closing: string[]): string {
   return [summary, ...head].join('\n')
 }
 
-it('结算监听：结语末尾报「状态：完成」→ 节点 completed，detail = 状态行｜摘要', async () => {
+/**
+ * 宿主 `settlementSummary` 的六条模板，**逐字**抄自
+ * `dsh-subagent/lib/types/continuation-messages.js:57-78`。
+ *
+ * 夹具必须用**真句子**：判据只认这几条整句（`readStopReason`），手拼的「A 结算了。」
+ * 一类假摘要一律落到 `unknown` —— 那正是本次要钉的降级方向，不是可以随手糊过去的东西。
+ * @param childId - 子会话 id，会进 `subject` 那一格。
+ * @param stop - 宿主那五档结束原因，外加兜底档。
+ * @returns 宿主会写进父会话第一行的那句话。
+ */
+function hostSummary(childId: string, stop: 'completed' | 'aborted' | 'max-tokens' | 'refusal' | 'error' | 'abnormal' = 'completed'): string {
+  const subject = `Background subagent ${childId}`
+  switch (stop) {
+    case 'aborted': return `${subject} was stopped before it finished.`
+    case 'max-tokens': return `${subject} ran out of room before it finished.`
+    case 'refusal': return `${subject} declined the task.`
+    case 'error': return `${subject} failed before it finished.`
+    case 'abnormal': return `${subject} ended abnormally (wind-down) before it finished.`
+    default: return `${subject} finished and will do no further work unless you send it more.`
+  }
+}
+
+it('结算监听：结语里**没有**状态行、宿主说正常结束 → 节点 completed，detail 写明未判定对错', async () => {
   const { listeners, treeNodes } = harness({ tree: true })
   treeNodes.push({ id: 'impl', title: '实现', status: 'in_progress', assignedTo: 'child-1' })
+  // 结语里一个字的状态标记都没有 —— 正是 2026-10-02 那次事故的形状（状态行被信封吃掉）。
+  // 旧判据在这一份结算上落 failed；新判据只看宿主那句模板，于是它是对的。
   const session = fakeSession(SESSION, [fakeSettle('child-1', settlementBody(
-    'Background subagent child-1 finished and will do no further work unless you send it more.',
+    hostSummary('child-1', 'completed'),
     '活干完了。',
-    '状态：完成',
     '改动落在 src/index.ts 与 tests/task.spec.ts。',
   ))])
   await fireEvent(listeners, 'session/event', session, settledEvent('child-1'))
   assert.equal(treeNodes.length, 1, '结算只许改现有节点，不许新增')
   assert.equal(treeNodes[0]?.status, 'completed')
-  assert.equal(treeNodes[0]?.detail, '状态：完成｜改动落在 src/index.ts 与 tests/task.spec.ts。')
+  assert.equal(treeNodes[0]?.detail, '状态：正常结束（仅指最后一轮正常结束，未判定对错）')
 })
 
-it('结算监听：结语报「状态：失败」→ 节点 failed，detail = 状态行｜理由', async () => {
+it('结算监听：宿主说「被强停」→ 节点 failed，detail 只带真实原因，uuid 与整句都不进树', async () => {
   const { listeners, treeNodes } = harness({ tree: true })
-  treeNodes.push({ id: 'impl', title: '实现', status: 'in_progress', assignedTo: 'child-1' })
-  const session = fakeSession(SESSION, [fakeSettle('child-1', settlementBody(
-    'Background subagent child-1 failed before it finished.',
-    '状态：失败',
-    'tsx 起不来，跑不了用例。',
-  ))])
-  await fireEvent(listeners, 'session/event', session, settledEvent('child-1'))
-  assert.equal(treeNodes[0]?.status, 'failed')
-  assert.equal(treeNodes[0]?.detail, '状态：失败｜tsx 起不来，跑不了用例。')
-})
-
-it('结算监听：结语里没有任何状态行 → 节点 failed，detail 只留一条「未收到回报」', async () => {
-  const { listeners, treeNodes } = harness({ tree: true })
-  treeNodes.push({ id: 'impl', title: '实现', status: 'in_progress', assignedTo: 'child-1' })
-  const session = fakeSession(SESSION, [fakeSettle('child-1', settlementBody(
-    'Background subagent child-1 finished and will do no further work unless you send it more.',
-    '活干完了，您看还有别的事吗？',
-  ))])
-  await fireEvent(listeners, 'session/event', session, settledEvent('child-1'))
-  // 用户点名的规则：**没报就是失败**，绝不把「没消息」当成功放过去。
-  assert.equal(treeNodes[0]?.status, 'failed')
-  // 只说一条：旧版的「｜未收到状态回报」是把同一件事换个说法又写了一遍。
-  assert.equal(treeNodes[0]?.detail, '状态：未收到回报')
-})
-
-it('结算监听：正常结算却没报状态 → 宿主那句 finished 不触发任何标记', async () => {
-  const { listeners, treeNodes } = harness({ tree: true })
-  treeNodes.push({ id: 'impl', title: '实现', status: 'in_progress', assignedTo: 'child-1' })
-  const session = fakeSession(SESSION, [fakeSettle('child-1', settlementBody(
-    'Background subagent child-1 finished and will do no further work unless you send it more.',
-    '活干完了，您看还有别的事吗？',
-  ))])
-  await fireEvent(listeners, 'session/event', session, settledEvent('child-1', 'Background subagent child-1 finished and will do no further work unless you send it more.'))
-  assert.equal(treeNodes[0]?.status, 'failed')
-  assert.equal(treeNodes[0]?.detail, '状态：未收到回报', '正常结算只说明「没报」，不加任何标记')
-})
-
-it('结算监听：被强停只补一个短标记 —— 宿主整句与 uuid 都不进 detail', async () => {
-  const { listeners, treeNodes } = harness({ tree: true })
-  treeNodes.push({ id: 'impl', title: '实现', status: 'in_progress', assignedTo: 'child-1' })
-  // 真机那一次的形状：宿主摘要句里带 36 位 uuid 与一句样板话（2026-10-02 实测的那条节点）。
+  // 真机那一次的形状：真 uuid 既是子会话 id，也是宿主那句摘要里的 subject。
   const uuid = 'd4da863e-6584-4828-b2d4-6f4a0f1c9a11'
-  const host = 'Background subagent ' + uuid + ' was stopped before it finished.'
-  const session = fakeSession(SESSION, [fakeSettle('child-1', settlementBody(host, '我还在改。'))])
-  // 事件里那句与正文首行同源，照旧折成单行再判（宿主真给的就是一整句）。
-  await fireEvent(listeners, 'session/event', session, settledEvent('child-1', 'Background subagent ' + uuid + ' was stopped\nbefore it finished.'))
-  assert.equal(treeNodes[0]?.status, 'failed', '摘要句里写着什么都不能把它变成完成')
-  assert.equal(treeNodes[0]?.detail, '状态：未收到回报（被强停）')
+  treeNodes.push({ id: 'impl', title: '实现', status: 'in_progress', assignedTo: uuid })
+  const session = fakeSession(SESSION, [fakeSettle(uuid, settlementBody(hostSummary(uuid, 'aborted'), '我还在改。'))])
+  await fireEvent(listeners, 'session/event', session, settledEvent(uuid))
+  assert.equal(treeNodes[0]?.status, 'failed')
+  assert.equal(treeNodes[0]?.detail, '状态：失败｜被强停')
   const detail = String(treeNodes[0]?.detail)
   assert.ok(!detail.includes(uuid), 'uuid 不进 detail')
   assert.ok(!detail.includes('Background subagent'), '宿主那句样板话不进 detail')
   assert.ok(!detail.includes('\n'), 'detail 必须是纯单行')
 })
 
-it('结算监听：detail 折成一行且不超过 200 字 —— 完整结语不进树', async () => {
+it('结算监听：另外四条失败档逐档落 failed，各自记真实原因', async () => {
+  const cases: readonly (readonly [Parameters<typeof hostSummary>[1], string])[] = [
+    ['max-tokens', '状态：失败｜上下文用尽'],
+    ['refusal', '状态：失败｜拒绝执行'],
+    ['error', '状态：失败｜出错'],
+    ['abnormal', '状态：失败｜异常结束'],
+  ]
+  for (const [stop, detail] of cases) {
+    const { listeners, treeNodes } = harness({ tree: true })
+    treeNodes.push({ id: 'impl', title: '实现', status: 'in_progress', assignedTo: 'child-1' })
+    const session = fakeSession(SESSION, [fakeSettle('child-1', settlementBody(hostSummary('child-1', stop), '没干完。'))])
+    await fireEvent(listeners, 'session/event', session, settledEvent('child-1'))
+    assert.equal(treeNodes[0]?.status, 'failed', stop)
+    assert.equal(treeNodes[0]?.detail, detail, stop)
+  }
+})
+
+it('结算监听：子代理自己在结语里写的状态行**不作数** —— 判定只看宿主那句', async () => {
+  // 反向那一次：结语里写着 `状态：完成`，宿主却说它出错 ⇒ 必须落 failed。
+  // 这一条钉的正是「撤掉 /^状态：(完成|失败)$/ 这个主判据」：散文再像也不算数。
+  const { listeners, treeNodes } = harness({ tree: true })
+  treeNodes.push({ id: 'impl', title: '实现', status: 'in_progress', assignedTo: 'child-1' })
+  const session = fakeSession(SESSION, [fakeSettle('child-1', settlementBody(
+    hostSummary('child-1', 'error'),
+    '状态：完成',
+    '看起来像干完了，其实没有。',
+  ))])
+  await fireEvent(listeners, 'session/event', session, settledEvent('child-1'))
+  assert.equal(treeNodes[0]?.status, 'failed', '结语里的状态行一个字都不作数')
+  assert.equal(treeNodes[0]?.detail, '状态：失败｜出错')
+})
+
+it('结算监听：宿主改了文案（一条模板都不匹配）→ 一个状态都不置，账本也不推进', async () => {
+  const ledger = freshLedgerFile()
+  const history: FakeMessage[] = []
+  const h = harness({ tree: true, runsFile: ledger, parentAgent: { session: { id: SESSION, deriveMessages: () => history } } })
+  await startRun(h.tool, [
+    { id: 'A', prompt: '第一步' },
+    { id: 'B', prompt: '第二步', needs: ['A'] },
+  ])
+  assert.equal(h.treeNodes.find(node => node.id === 'A')?.status, 'in_progress', '派发之后 A 是 in_progress')
+  // 宿主换了个说法：模板头还在，句尾不认识了 —— 这就是「宿主改文案」那一次降级。
+  history.push(fakeSettle('child-1', settlementBody('Background subagent child-1 wrapped up somehow.', '干完了。')))
+  await fireEvent(h.listeners, 'session/event', fakeSession(SESSION, history), settledEvent('child-1'))
+  assert.equal(h.treeNodes.find(node => node.id === 'A')?.status, 'in_progress', '认不出 ≠ 失败，认不出 ≠ 完成：状态一个都不置')
+  assert.equal(h.treeNodes.find(node => node.id === 'A')?.detail, '状态：未判定｜认不出宿主的结束原因模板')
+  assert.equal(ledgerNode(ledger, 'A', 'r1')?.status, 'dispatched', '账本那一步留在 dispatched')
+  assert.equal(h.treeNodes.find(node => node.id === 'B')?.assignedTo, undefined, '下游一个孩子都不该起')
+
+  // 连模板头都没有的那一句（例如子代理自己的正文）同样一个字都不猜。
+  const second = harness({ tree: true })
+  second.treeNodes.push({ id: 'impl', title: '实现', status: 'in_progress', assignedTo: 'child-1' })
+  const session = fakeSession(SESSION, [fakeSettle('child-1', settlementBody('child-1 was stopped before it finished.', '我还在改。'))])
+  await fireEvent(second.listeners, 'session/event', session, settledEvent('child-1'))
+  assert.equal(second.treeNodes[0]?.status, 'in_progress', '没有模板头 ⇒ 一个字都不猜')
+  assert.equal(second.treeNodes[0]?.detail, '状态：未判定｜认不出宿主的结束原因模板')
+})
+
+it('结算监听：正文首行不是模板时退回 source.summary —— 两条来源都只做整句比对', async () => {
+  const { listeners, treeNodes } = harness({ tree: true })
+  treeNodes.push({ id: 'impl', title: '实现', status: 'in_progress', assignedTo: 'child-1' })
+  // 正文首行是一句谁都不认识的话（模拟宿主改了正文布局），事件里那一份仍是原句。
+  const session = fakeSession(SESSION, [fakeSettle('child-1', settlementBody('（这一行不是宿主写的那句）', '干完了。'))])
+  await fireEvent(listeners, 'session/event', session, settledEvent('child-1', hostSummary('child-1', 'completed')))
+  assert.equal(treeNodes[0]?.status, 'completed')
+  assert.equal(treeNodes[0]?.detail, '状态：正常结束（仅指最后一轮正常结束，未判定对错）')
+})
+
+it('结算监听：detail 是插件写的那一行，宿主整句与结语全文都不进树', async () => {
   const { listeners, treeNodes } = harness({ tree: true })
   treeNodes.push({ id: 'impl', title: '实现', status: 'in_progress', assignedTo: 'child-1' })
   const long = '很长的结语'.repeat(80)
-  const session = fakeSession(SESSION, [fakeSettle('child-1', settlementBody(
-    'Background subagent child-1 finished and will do no further work unless you send it more.',
-    '状态：完成',
-    long,
-  ))])
+  const session = fakeSession(SESSION, [fakeSettle('child-1', settlementBody(hostSummary('child-1', 'max-tokens'), long))])
   await fireEvent(listeners, 'session/event', session, settledEvent('child-1'))
   const detail = String(treeNodes[0]?.detail)
-  assert.equal(treeNodes[0]?.status, 'completed')
-  assert.ok(detail.startsWith('状态：完成｜'), '抬头必须原样保留')
+  assert.equal(treeNodes[0]?.status, 'failed')
+  assert.equal(detail, '状态：失败｜上下文用尽')
   assert.ok(detail.length <= 200, 'detail 上限 200 字，实际 ' + detail.length)
-  assert.ok(!detail.includes('\n'))
-  assert.ok(detail.endsWith('…'), '截断要留省略号')
+  assert.ok(!detail.includes('\n'), 'detail 必须是纯单行')
+  assert.ok(!detail.includes('Background subagent'), '宿主那句样板话不进 detail')
+  assert.ok(!detail.includes('很长的结语'), '结语全文不进 detail')
 })
 
-it('结算监听：已经 completed 的节点不被晚到的「没收到回报」改写', async () => {
+it('结算监听：已经 completed 的节点不被晚到的 failed 改写', async () => {
   const { listeners, treeNodes, treeCalls } = harness({ tree: true })
-  treeNodes.push({ id: 'impl', title: '实现', status: 'completed', detail: '状态：完成｜先前那一次', assignedTo: 'child-1' })
-  const session = fakeSession(SESSION, [fakeSettle('child-1', settlementBody(
-    'Background subagent child-1 ran out of room before it finished.',
-    '上下文用尽。',
-  ))])
+  treeNodes.push({ id: 'impl', title: '实现', status: 'completed', detail: '状态：正常结束（仅指最后一轮正常结束，未判定对错）', assignedTo: 'child-1' })
+  const session = fakeSession(SESSION, [fakeSettle('child-1', settlementBody(hostSummary('child-1', 'max-tokens'), '上下文用尽。'))])
   await fireEvent(listeners, 'session/event', session, settledEvent('child-1'))
-  assert.equal(treeNodes[0]?.status, 'completed', '既成事实不许被一条晚到的没报盖回去')
-  assert.equal(treeNodes[0]?.detail, '状态：完成｜先前那一次')
+  assert.equal(treeNodes[0]?.status, 'completed', '既成事实不许被一条晚到的 failed 盖回去')
+  assert.equal(treeNodes[0]?.detail, '状态：正常结束（仅指最后一轮正常结束，未判定对错）')
   assert.deepStrictEqual(treeCalls.filter(call => call.startsWith('step:')), [], '被挡下的那次连写都不该发生')
 })
 
-it('结算监听：正文里引用过这个格式也不作数 —— 只认最后报的那一行', async () => {
+it('结算监听：结语里抄了一句别档的宿主模板也不作数 —— 判据只看正文首行', async () => {
   const { listeners, treeNodes } = harness({ tree: true })
   treeNodes.push({ id: 'impl', title: '实现', status: 'in_progress', assignedTo: 'child-1' })
   const session = fakeSession(SESSION, [fakeSettle('child-1', settlementBody(
-    'Background subagent child-1 failed before it finished.',
-    '你要的格式是这样：',
-    '状态：完成',
-    '（上面那行只是举例）',
-    '状态：失败',
-    'tsc 过不去。',
+    hostSummary('child-1', 'completed'),
+    '看，宿主这次说的是这句：',
+    hostSummary('child-1', 'error'),
+    '（上面那行只是引用）',
   ))])
   await fireEvent(listeners, 'session/event', session, settledEvent('child-1'))
-  assert.equal(treeNodes[0]?.status, 'failed', '倒着扫：最后报的那一行才算数')
-  assert.equal(treeNodes[0]?.detail, '状态：失败｜tsc 过不去。')
+  assert.equal(treeNodes[0]?.status, 'completed', '只有正文首行算数')
+  assert.equal(treeNodes[0]?.detail, '状态：正常结束（仅指最后一轮正常结束，未判定对错）')
 })
 
-it('结算监听：结算正文读不到时一个字都不写 —— 一次历史读失败不是「没回报」', async () => {
+it('结算监听：结算正文读不到时一个字都不写 —— 一次历史读失败不是一次判定', async () => {
   const { listeners, treeNodes, treeCalls } = harness({ tree: true })
   treeNodes.push({ id: 'impl', title: '实现', status: 'in_progress', assignedTo: 'child-1' })
   // 老测试里那种只有 id 的假会话：deriveMessages 根本不存在，正文无从读起。
@@ -1333,17 +1375,13 @@ it('结算监听：结算正文读不到时一个字都不写 —— 一次历�
 it('结算监听：树里没有绑给这个孩子的节点时只记日志，不碰任何节点', async () => {
   const { listeners, treeNodes, treeCalls } = harness({ tree: true })
   treeNodes.push({ id: 'other', title: '别人的活', status: 'in_progress', assignedTo: 'child-9' })
-  const session = fakeSession(SESSION, [fakeSettle('child-1', settlementBody(
-    'Background subagent child-1 finished and will do no further work unless you send it more.',
-    '状态：完成',
-    '干完了。',
-  ))])
+  const session = fakeSession(SESSION, [fakeSettle('child-1', settlementBody(hostSummary('child-1', 'completed'), '干完了。'))])
   await fireEvent(listeners, 'session/event', session, settledEvent('child-1'))
   assert.equal(treeNodes[0]?.status, 'in_progress')
   assert.deepStrictEqual(treeCalls.filter(call => call.startsWith('step:')), [])
 })
 
-it('派发简报里的两行状态文案，就是结算监听器认的那两行（逐字一致）', async () => {
+it('派发简报：明令禁止写状态行，并说清判定来自宿主那句模板', async () => {
   let captured: Captured | undefined
   let brief = ''
   const ctx = {
@@ -1366,10 +1404,12 @@ it('派发简报里的两行状态文案，就是结算监听器认的那两行�
   await run(captured as Captured, { action: 'run', run: 'r1', nodes: [{ id: 'impl', prompt: 'go' }] }, caller)
   assert.ok(brief.includes('【节点状态】'), '锚点不许动')
   assert.ok(brief.includes('impl'), '必须点名被绑定的节点')
-  assert.ok(brief.includes('状态：完成'), '成功行必须与解析器逐字一致（全角冒号）')
-  assert.ok(brief.includes('状态：失败'), '失败行必须与解析器逐字一致（全角冒号）')
+  assert.ok(brief.includes('不要在结语里写'), '必须明令禁止状态行：' + brief)
+  assert.ok(brief.includes('由插件按**宿主的结算模板**判'), '必须说清判定从哪来：' + brief)
   // 旧文案要求子代理自己调 step 置状态 —— 实测做不到：树按会话隔离，它自己的树里没有这个节点。
   assert.ok(brief.includes('不要用 task 工具的 step 去写这个节点'), '必须明确叫停那条做不到的写法')
+  // 旧文案还要求它把摘要写进 detail —— 现在 detail 是插件写的判定结论，那一句必须消失。
+  assert.equal(brief.includes('摘要进节点的 detail'), false, 'detail 不再来自结语：' + brief)
 })
 
 
@@ -1427,8 +1467,7 @@ it('依赖门：A 结算 completed 之后，B 被自动派出（不需要任何�
   // 父 Agent 的会话历史与事件里那份是**同一个会话**：自动放行要从它里面读上游结论，
   // 读不到就不派发（fail-closed）。所以这里给的假父 Agent 必须带得出这份历史。
   const history = [fakeSettle('child-1', settlementBody(
-    'Background subagent child-1 finished and will do no further work unless you send it more.',
-    '状态：完成',
+    hostSummary('child-1', 'completed'),
     'A 干完了。',
   ))]
   const h = harness({ tree: true, runsFile: ledger, parentAgent: { session: { id: SESSION, deriveMessages: () => history } } })
@@ -1456,8 +1495,7 @@ it('自动放行不通知中枢：不起 followup、不 inject、也不往会话
   const parent = { session: { id: SESSION }, followup: () => { centre.push('followup'); return Promise.resolve() } }
   // 上游结论从**父 Agent 自己的会话历史**里读（fail-closed）：假父 Agent 得带得出它。
   const history = [fakeSettle('child-1', settlementBody(
-    'Background subagent child-1 finished and will do no further work unless you send it more.',
-    '状态：完成',
+    hostSummary('child-1', 'completed'),
     'A 干完了。',
   ))]
   const h = harness({ tree: true, runsFile: ledger, parentAgent: { ...parent, session: { id: SESSION, deriveMessages: () => history } } })
@@ -1482,8 +1520,7 @@ it('失败只停这一支：A 落 failed 后 B 保持 pending，与它平行的 
   ])
   assert.deepStrictEqual(result.dispatched, ['A', 'C'], '两个起点都要在声明时立刻派出')
   const session = fakeSession(SESSION, [fakeSettle('child-1', settlementBody(
-    'Background subagent child-1 failed before it finished.',
-    '状态：失败',
+    hostSummary('child-1', 'error'),
     'A 这一支走不通。',
   ))])
   await fireEvent(h.listeners, 'session/event', session, settledEvent('child-1'))
@@ -1516,8 +1553,7 @@ it('账本落盘：run 写进账本文件本身；换一个 harness（= 重启�
   // 只有那份设置值活着，所以 h2 若还能放行 B，就只可能来自落盘的那份账本。
   // 重启之后同样要能读到上游结论：父 Agent 的会话历史里带着那条结算通知。
   const history = [fakeSettle('child-1', settlementBody(
-    'Background subagent child-1 finished and will do no further work unless you send it more.',
-    '状态：完成',
+    hostSummary('child-1', 'completed'),
     'A 干完了。',
   ))]
   const h2 = harness({ tree: true, runsFile: ledger, parentAgent: { session: { id: SESSION, deriveMessages: () => history } } })
@@ -1706,8 +1742,8 @@ it('上游结论注入下游简报：按 needs 声明顺序给出**结算正文�
   // 尾标记刻意放在 200 字之外：它进不了树 detail，只可能来自历史全文。
   const tailA = '甲尾标记-只有全文里才有'
   const tailB = '乙尾标记-只有全文里才有'
-  history.push(fakeSettle('child-1', settlementBody('A 结算了。', '状态：完成', 'A 的结论：' + '甲'.repeat(300) + tailA)))
-  history.push(fakeSettle('child-2', settlementBody('B 结算了。', '状态：完成', 'B 的结论：' + '乙'.repeat(300) + tailB)))
+  history.push(fakeSettle('child-1', settlementBody(hostSummary('child-1', 'completed'), 'A 的结论：' + '甲'.repeat(300) + tailA)))
+  history.push(fakeSettle('child-2', settlementBody(hostSummary('child-2', 'completed'), 'B 的结论：' + '乙'.repeat(300) + tailB)))
   const session = fakeSession(SESSION, history)
   await fireEvent(h.listeners, 'session/event', session, settledEvent('child-1'))
   await fireEvent(h.listeners, 'session/event', session, settledEvent('child-2'))
@@ -1742,8 +1778,8 @@ it('上游结论单条超过 20000 字才截断，并在末尾注明原文多少
     { id: 'C', prompt: 'C 的活', needs: ['A', 'B'] },
   ])
   const tail = '超出上限的那一段'
-  const bodyA = settlementBody('A 结算了。', '状态：完成', '巨'.repeat(21000) + tail)
-  const bodyB = settlementBody('B 结算了。', '状态：完成', '小'.repeat(1000))
+  const bodyA = settlementBody(hostSummary('child-1', 'completed'), '巨'.repeat(21000) + tail)
+  const bodyB = settlementBody(hostSummary('child-2', 'completed'), '小'.repeat(1000))
   assert.ok(bodyA.length > 20000 && bodyB.length < 20000, '这一条要的正是「一条超限、一条没超」')
   history.push(fakeSettle('child-1', bodyA))
   history.push(fakeSettle('child-2', bodyB))
@@ -1773,9 +1809,9 @@ it('取不到上游结论 ⇒ 阻塞：不派发、留在 pending，detail 与�
   )
   // 「依赖已完成、但账本上没有它的 childId」——取不到上游正文的最小模型。
   patchLedgerNode(ledger, 'r2', 'P', { status: 'completed', childId: undefined })
-  history.push(fakeSettle('child-1', settlementBody('A 结算了。', '状态：完成', 'A 干完了。')))
-  history.push(fakeSettle('child-2', settlementBody('D 结算了。', '状态：完成', 'D 干完了。')))
-  history.push(fakeSettle('child-3', settlementBody('P 结算了。', '状态：完成', 'P 的结论：只此一份。')))
+  history.push(fakeSettle('child-1', settlementBody(hostSummary('child-1', 'completed'), 'A 干完了。')))
+  history.push(fakeSettle('child-2', settlementBody(hostSummary('child-2', 'completed'), 'D 干完了。')))
+  history.push(fakeSettle('child-3', settlementBody(hostSummary('child-3', 'completed'), 'P 的结论：只此一份。')))
   const session = fakeSession(SESSION, history)
   await fireEvent(h.listeners, 'session/event', session, settledEvent('child-1'))
 
@@ -1854,14 +1890,14 @@ it('账本默认路径优先 ctx.baseUrl 指向的目录（file: URL），其次
 it('task list scope=tree 带出非 completed 节点的 detail —— 「派发失败/结论缺失」在面板之外也读得到', async () => {
   const h = harness({ tree: true })
   h.treeNodes.push({ id: 'a', title: 'A', status: 'failed', detail: '派发失败：UnknownPresetError: unknown preset "no-such-preset"', assignedTo: undefined })
-  h.treeNodes.push({ id: 'b', title: 'B', status: 'completed', detail: '状态：完成｜干完了', assignedTo: undefined })
+  h.treeNodes.push({ id: 'b', title: 'B', status: 'completed', detail: '状态：正常结束（仅指最后一轮正常结束，未判定对错）', assignedTo: undefined })
   h.treeNodes.push({ id: 'c', title: 'C', status: 'pending', detail: '等待依赖：A\n下一行也要折起来', assignedTo: undefined })
   h.treeNodes.push({ id: 'd', title: 'D', status: 'in_progress', detail: '结'.repeat(500), assignedTo: undefined })
   const result = await run(h.tool, { action: 'list' }, caller)
   const tree = String(result.tree)
   assert.ok(tree.includes('- [failed] a: A'), tree)
   assert.ok(tree.includes('  detail: 派发失败：UnknownPresetError: unknown preset "no-such-preset"'), tree)
-  assert.ok(!tree.includes('状态：完成｜干完了'), 'completed 节点不带 detail 行，避免刷屏：' + tree)
+  assert.ok(!tree.includes('仅指最后一轮正常结束'), 'completed 节点不带 detail 行，避免刷屏：' + tree)
   assert.ok(tree.includes('detail: 等待依赖：A 下一行也要折起来'), 'detail 折成单行：' + tree)
   const detailLine = tree.split('\n').find(line => line.trimStart().startsWith('detail: 结')) ?? ''
   assert.ok(detailLine.trimStart().length <= 'detail: '.length + 200, 'detail 行按 200 上限截断：' + String(detailLine.length))
@@ -1887,8 +1923,8 @@ it('槽位：{{A}} 就地换成结论文本全文，同一依赖出现多次每�
     { id: 'B', prompt: 'B 的活' },
     { id: 'C', prompt: '框架开头\nA 的资料：{{A}}\n再贴一次 A：{{A}}\n框架结尾', needs: ['A', 'B'] },
   ])
-  const bodyA = settlementBody('A 结算了。', '状态：完成', 'A 的结论正文：甲。')
-  const bodyB = settlementBody('B 结算了。', '状态：完成', 'B 的结论正文：乙。')
+  const bodyA = settlementBody(hostSummary('child-1', 'completed'), 'A 的结论正文：甲。')
+  const bodyB = settlementBody(hostSummary('child-2', 'completed'), 'B 的结论正文：乙。')
   history.push(fakeSettle('child-1', bodyA))
   history.push(fakeSettle('child-2', bodyB))
   const session = fakeSession(SESSION, history)
@@ -1917,7 +1953,7 @@ it('全部依赖都被槽位吃掉 ⇒ 一个块都不追加（简报 = 框架�
     { id: 'A', prompt: 'A 的活' },
     { id: 'B', prompt: '只用槽位：{{A}}', needs: ['A'] },
   ])
-  const bodyA = settlementBody('A 结算了。', '状态：完成', 'A 的结论正文：甲。')
+  const bodyA = settlementBody(hostSummary('child-1', 'completed'), 'A 的结论正文：甲。')
   history.push(fakeSettle('child-1', bodyA))
   await fireEvent(h.listeners, 'session/event', fakeSession(SESSION, history), settledEvent('child-1'))
   const brief = briefOf(h.starts[1])
@@ -1948,7 +1984,7 @@ it('槽位的声明期校验：不属于本节点 needs / 不在本次 run 里 �
   assert.ok(brief.includes('{{ A }} 与 {{}} 都不是槽位'), '不是槽位的写法必须原样留在简报里：' + brief)
 })
 
-it('「结论要简略」那一句只进 run 链路的简报：位置在状态行那句之后、结论摘要那句之前；resume 那条路逐字不变', async () => {
+it('「结论要简略」那一句只进 run 链路的简报：位置在禁写状态行那句之后、结语那段之前；resume 那条路逐字不变', async () => {
   const ledger = freshLedgerFile()
   const history: FakeMessage[] = []
   const parent = { session: { id: SESSION, deriveMessages: () => history } }
@@ -1959,13 +1995,13 @@ it('「结论要简略」那一句只进 run 链路的简报：位置在状态�
   ])
   const concise = '结语里给下游用的**结论**尽量简略（建议 ≤500 字）：只写结论与关键证据，不要复述过程、不要贴长日志。'
   assert.ok(briefOf(h.starts[0]).includes(concise), 'run 链路的起点也要带这一句')
-  history.push(fakeSettle('child-1', settlementBody('A 结算了。', '状态：完成', 'A 干完了。')))
+  history.push(fakeSettle('child-1', settlementBody(hostSummary('child-1', 'completed'), 'A 干完了。')))
   await fireEvent(h.listeners, 'session/event', fakeSession(SESSION, history), settledEvent('child-1'))
   const brief = briefOf(h.starts[1])
   assert.ok(brief.includes(concise), brief)
-  assert.ok(brief.indexOf('（failed）。') < brief.indexOf(concise), '必须排在状态行那句之后')
+  assert.ok(brief.indexOf('写在结语里的状态一个字都不作数。') < brief.indexOf(concise), '必须排在禁写状态行那句之后')
   assert.ok(brief.indexOf('【节点状态】') < brief.indexOf(concise), '必须在节点指令段之内')
-  assert.ok(brief.indexOf(concise) < brief.indexOf('这一行之后**再另起一行**写一句结论摘要'), '必须排在结论摘要那句之前')
+  assert.ok(brief.indexOf(concise) < brief.indexOf('结语会被完整保存'), '必须排在结语那段之前')
   // `run` 的另一条类入口：`resume` 把**已派出但没干成**的节点交回**它原来那个孩子**接着干。
   //
   // 这一条钉的是「那一句只属于 run 的**首次派发**」。resume 不走 `withNodeBrief`
@@ -2047,7 +2083,7 @@ it('派发失败留下的 detail：把原因修好、重新评估并成功派发
   assert.ok(String(ledgerNode(ledger, 'P', 'r2')?.note).startsWith('派发失败：'))
   // 把那个坏 preset 从账本里去掉（= 现场把它修好了）：下一次结算就会重新评估这个 pending 节点。
   patchLedgerNode(ledger, 'r2', 'P', { preset: undefined })
-  history.push(fakeSettle('child-1', settlementBody('X 结算了。', '状态：完成', 'X 干完了。')))
+  history.push(fakeSettle('child-1', settlementBody(hostSummary('child-1', 'completed'), 'X 干完了。')))
   await fireEvent(h.listeners, 'session/event', fakeSession(SESSION, history), settledEvent('child-1'))
   const p = h.treeNodes.find(node => node.id === 'P')
   assert.equal(p?.assignedTo, 'child-2', '修好之后被派出去')
@@ -2076,8 +2112,8 @@ it('结论落账本：结算后账本节点带着结算正文；把会话历史�
     { id: 'C', prompt: 'C 的活' },
     { id: 'B', prompt: 'B 的活', needs: ['A', 'C'] },
   ], 'r1')
-  const bodyA = settlementBody('A 结算了。', '状态：完成', 'A 的结论正文：甲。')
-  const bodyC = settlementBody('C 结算了。', '状态：完成', 'C 的结论正文：丙。')
+  const bodyA = settlementBody(hostSummary('child-1', 'completed'), 'A 的结论正文：甲。')
+  const bodyC = settlementBody(hostSummary('child-2', 'completed'), 'C 的结论正文：丙。')
   history.push(fakeSettle('child-1', bodyA))
   await fireEvent(h.listeners, 'session/event', fakeSession(SESSION, history), settledEvent('child-1'))
   assert.equal(ledgerNode(ledger, 'A', 'r1')?.conclusion, bodyA, '结算正文必须落进账本，逐字一致')
@@ -2107,7 +2143,7 @@ it('结论落账本的上限：>20000 字截断并注明，且「账本里的」
   const parent = { session: { id: SESSION, deriveMessages: () => history } }
   const h = harness({ tree: true, runsFile: ledger, parentAgent: parent })
   await startRun(h.tool, [{ id: 'A', prompt: 'A 的活' }, { id: 'B', prompt: 'B 的活', needs: ['A'] }], 'r1')
-  const bodyA = settlementBody('A 结算了。', '状态：完成', '巨'.repeat(21000) + '超出上限的那一段')
+  const bodyA = settlementBody(hostSummary('child-1', 'completed'), '巨'.repeat(21000) + '超出上限的那一段')
   assert.ok(bodyA.length > 20000)
   history.push(fakeSettle('child-1', bodyA))
   await fireEvent(h.listeners, 'session/event', fakeSession(SESSION, history), settledEvent('child-1'))
@@ -2128,9 +2164,9 @@ it('兼容：账本里没有 conclusion 的旧节点，注入侧退回会话历�
   // 造一个「本次改动之前完成的节点」：completed + 有 childId，但账本里**没有** conclusion。
   patchLedgerNode(ledger, 'r1', 'A', { status: 'completed' })
   await startRun(h.tool, [{ id: 'X', prompt: 'x' }], 'r2')
-  const bodyA = settlementBody('A 结算了。', '状态：完成', 'A 的结论正文：甲。')
+  const bodyA = settlementBody(hostSummary('child-1', 'completed'), 'A 的结论正文：甲。')
   history.push(fakeSettle('child-1', bodyA))
-  history.push(fakeSettle('child-2', settlementBody('X 结算了。', '状态：完成', 'X 干完了。')))
+  history.push(fakeSettle('child-2', settlementBody(hostSummary('child-1', 'completed'), 'X 干完了。')))
   await fireEvent(h.listeners, 'session/event', fakeSession(SESSION, history), settledEvent('child-2'))
   assert.equal(ledgerNode(ledger, 'A', 'r1')?.conclusion, undefined, '这个旧节点账本里确实没有结论')
   assert.equal(h.treeNodes.find(node => node.id === 'B')?.assignedTo, 'child-3', '退回历史之后照样放行')
@@ -2260,8 +2296,8 @@ it('H4：同一个 childId 的第二条结算 ⇒ 只覆盖账本结论，status
   const parent = { session: { id: SESSION, deriveMessages: () => history } }
   const h = harness({ tree: true, runsFile: ledger, parentAgent: parent })
   await startRun(h.tool, [{ id: 'A', prompt: 'a' }, { id: 'C', prompt: 'c' }], 'r1')
-  const firstA = settlementBody('A 第一次结算。', '状态：完成', 'A 的结论：第一版。')
-  const firstC = settlementBody('C 第一次结算。', '状态：失败', 'C 的结论：第一版。')
+  const firstA = settlementBody(hostSummary('child-1', 'completed'), 'A 的结论：第一版。')
+  const firstC = settlementBody(hostSummary('child-2', 'error'), 'C 的结论：第一版。')
   history.push(fakeSettle('child-1', firstA))
   history.push(fakeSettle('child-2', firstC))
   const session = fakeSession(SESSION, history)
@@ -2274,8 +2310,8 @@ it('H4：同一个 childId 的第二条结算 ⇒ 只覆盖账本结论，status
 
   // 第二条通知（现实里来自 `send` 续跑之后那个孩子又结算了一次）：结论必须换成最新那一份 ——
   // 历史回退路径（settledNotice 倒着扫）取的就是最新那条，两条路的口径必须对齐。
-  const secondA = settlementBody('A 第二次结算。', '状态：完成', 'A 的结论：第二版。')
-  const secondC = settlementBody('C 第二次结算。', '状态：失败', 'C 的结论：第二版。')
+  const secondA = settlementBody(hostSummary('child-1', 'completed'), 'A 的结论：第二版。')
+  const secondC = settlementBody(hostSummary('child-2', 'error'), 'C 的结论：第二版。')
   history.push(fakeSettle('child-1', secondA))
   history.push(fakeSettle('child-2', secondC))
   await fireEvent(h.listeners, 'session/event', session, settledEvent('child-1'))
@@ -2302,7 +2338,7 @@ it('resume：把节点交回它原来那个孩子接着干 —— 不新派、�
   assert.equal(wake?.target, 'child-9', '唤醒的是**它原来那个**孩子')
   const wakeBlocks = wake?.content as readonly { readonly text?: string }[] | undefined
   const text = String(wakeBlocks?.[0]?.text ?? '')
-  assert.ok(text.includes('状态：完成') && text.includes('状态：失败'), '续跑文案必须重申状态行要求：' + text)
+  assert.ok(text.includes('不要在结语里写'), '续跑文案必须重申「不要写状态行」：' + text)
   assert.ok(text.includes('A 的结论正文：甲。'), '简报按同一套拼装重填了上游结论：' + text)
   assert.ok(text.includes('B 的活'), '框架原文还在')
   const stored = ledgerNode(ledger, 'B', 'r1')

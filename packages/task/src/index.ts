@@ -39,22 +39,26 @@
  * 永远等不到（轮询到 120000ms 执行期限），已整个删除，见
  * `M:\T4\out\stage2\S22-dispatch与wait修正.md`。
  *
- * ## 子代理怎么回报状态
+ * ## 节点状态从哪来
  *
  * 树按会话 id 隔离：`bind` 写的那个节点只在**父会话**的树里，子代理自己的树里没有它，
  * 所以子代理**做不到**用 `task` 的 `step` 改自己那个节点（实测报
- * `task-tree: no node with id "..." in this session's tree`）。状态因此走**回传**：
- * 派发简报（{@link withNodeBrief}）要求它在结语末尾单独一行输出 `状态：完成` / `状态：失败`，
- * 挂在 `session/event` 上的结算监听器把这一行解析出来（{@link readNodeReplay}），
- * 再落成树上的状态与 detail（{@link settlementPatch}）。
+ * `task-tree: no node with id "..." in this session's tree`）。
  *
- * 判定只有两个来源：子代理自己报的那一行，与节点已经写下的状态；宿主那句摘要句
- * （`source.summary`）只做补充说明 —— **绝不**凭它把节点判成 completed。
+ * 状态因此由**插件反推宿主那句固定的结束模板**：宿主 `createSettlementMessage` 写进父会话的
+ * **第一行**是 `settlementSummary(childId, stopReason)` 按模板拼出来的一句话，模板与
+ * `stopReason` 一一对应；反过来认，就能把「正常结束 / 被强停 / 上下文用尽 / 拒绝执行 / 出错」
+ * 分开（{@link readStopReason}）。挂在 `session/event` 上的结算监听器读那一行，
+ * 落成树上的状态与 detail（{@link settlingPatch}）。
+ *
+ * **子代理的散文一个字的权重都没有**：派发简报（{@link withNodeBrief}）明令**禁止**它在结语里
+ * 写状态行，监听器也不看它的结语。认不出模板时落 `unknown` —— **一个状态都不置**，节点保持
+ * 原状、账本不推进（下游因此不放行），只留一条日志。**不声称成功好过错报成功。**
  *
  * 2026-10-02 真机出过一次事故，值得照原样记在这里：`guard` 会把结语换成只保留尾部 K 字符的
- * 信封，子代理写在结语末尾的那一行**被信封吃掉**，父侧解析不到，于是**两个实际已经干完的
- * 子代理在树上显示成 failed**。根因是「状态靠散文声明」。撤回这次反转就是这一次的处置；
- * 换一套不靠散文的判据是下一步的事，**替换之前不许把注释写成已经换了**。
+ * 信封，子代理写在结语末尾的那一行 `状态：完成` **被信封吃掉**，父侧解析不到，于是**两个实际
+ * 已经干完的子代理在树上显示成 failed**。根因是「状态靠散文声明」——那段散文永远在和信封
+ * 截断赛跑。现在的协议把它整个拿掉：判定只看宿主那句话，看不见子代理的散文，赛跑就不存在。
  *
  * ## 明确不做
  *
@@ -278,14 +282,17 @@ const ENVELOPE_SECTIONS_LINE = '结语请以固定小节的**一级标题**开�
  *
  * 为什么是**回传**而不是让它自己调 `step`：树按会话 id 隔离，`bind` 写的那个节点落在
  * **父会话**的树里，子代理自己的树里根本没有它 —— 实测那一调用只会抛
- * `task-tree: no node with id "..." in this session's tree`。所以简报要它做的唯一一件事
- * 是**在结语末尾回传一行状态**，由 `apply` 里挂在 `session/event` 上的结算监听器解析、
- * 落到父树那个节点上。那一行的文案与监听器里的 {@link STATUS_LINE} **逐字一致**（全角冒号，
- * 两边一起改才作数）。
+ * `task-tree: no node with id "..." in this session's tree`。
  *
- * 边界（**不许越界**）：本函数只**在简报里要求**子代理自己报；`in_progress` 已经由
- * `settleDispatch` 在 bind 时写下（那是既成事实），`completed` / `failed` 只按子代理
- * **自己报的那一行**落 —— 绝不从「它结算了」这件事推断成功。
+ * 而**回传的也不再是一行状态**：2026-10-02 那次事故证明「状态靠散文声明」必输 ——
+ * 子代理写在结语末尾的 `状态：完成` 被 guard 的信封吃掉，父侧解析不到，两个已经干完的
+ * 子代理在树上显示成 failed。所以这一段做的是**相反**的一件事：**明令禁止**它写状态行。
+ * 节点状态由插件从宿主那句固定的结束模板反推（{@link readStopReason}），与子代理的散文无关；
+ * 它写在结语里的状态标记**一个字都不作数**。
+ *
+ * 边界（**不许越界**）：本函数只**说明判定从哪来**、并叫停那条做不到的 self-step；
+ * `in_progress` 已经由 `settleDispatch` 在 bind 时写下（那是既成事实），
+ * `completed` / `failed` 只按宿主那句模板落 —— 绝不从「它结算了」这件事推断成功。
  * @param prompt - 调用者给的原始简报，一个字都不改，原样排在最前。
  * @param bind - 绑定的节点 id；**省略时原样返回**，绝不编造一个节点出来。
  * @param concise - 是否追加「结论要简略」那一句（{@link CONCISE_CONCLUSION_LINE}）。
@@ -296,14 +303,16 @@ function withNodeBrief(prompt: string, bind: string | undefined, concise = false
   if (bind === undefined) return prompt
   const brief = NODE_BRIEF_ANCHOR
     + `你绑定的节点是 \`${bind}\`（in_progress 已由插件写入，不必再设）。`
-    + '干完时，在最终结语的末尾单独一行**原样**输出 `状态：完成`（插件据此把它置成 completed）；'
-    + '失败则同样单独一行输出 `状态：失败`（failed）。'
+    + '**不要在结语里写 `状态：完成` / `状态：失败` 这类状态行，也不要写任何状态标记** ——'
+    + '插件不读它：你那个节点的状态由插件按**宿主的结算模板**判'
+    + '（正常结束 / 被强停 / 上下文用尽 / 拒绝执行 / 出错），认不出时保持原状、绝不猜。'
+    + '写在结语里的状态一个字都不作数。'
     + (concise ? CONCISE_CONCLUSION_LINE : '')
-    + '这一行之后**再另起一行**写一句结论摘要，插件会把状态与摘要一起落到节点上。'
+    + '结语会被完整保存（`result` 取得到全文），所以把结论、证据与卡点写在正文里。'
     + ENVELOPE_SECTIONS_LINE
     + '不要用 task 工具的 step 去写这个节点 —— 也写不成：树按会话隔离，你自己的树里没有它，'
     + '那一次调用只会报 no node with id。'
-    + '摘要进节点的 detail（上限 200 字，超出截断），那是用户在面板上唯一看得到的内容，写清楚。'
+    + '面板上那个节点的 detail 由插件写（判定结论，上限 200 字），不是你的结语。'
   return prompt.length === 0 ? brief : prompt + '\n\n' + brief
 }
 
@@ -513,7 +522,7 @@ export interface TaskNode {
   readonly children?: readonly TaskNode[]
 }
 
-/** 节点状态机。`completed` 只由**显式调用**或子代理自己回传的状态行置位，绝不从「它结算了」这件事推断。 */
+/** 节点状态机。`completed` 只由**显式调用**或**插件按宿主结束模板的判定**置位，绝不从「它结算了」这件事推断。 */
 export type TaskNodeStatus = 'pending' | 'in_progress' | 'completed' | 'failed'
 
 /** 模型输入的扁平节点。**嵌套只来自 `parent`**，不来自把节点装进另一个节点。 */
@@ -1068,19 +1077,23 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
   }, { global: true })
 
   /**
-   * 子代理结算时，把它**在结语里回传的那一行状态**落到父树节点上。
+   * 子代理结算时，把**宿主那句固定的结束模板**反推成状态，落到父树节点上。
    *
-   * 为什么不指望子代理自己调 `step`：树按会话 id 隔离，`bind` 写的节点在**父会话**的树里，
+   * 为什么不指望子代理自己报：树按会话 id 隔离，`bind` 写的节点在**父会话**的树里，
    * 子代理自己的树里没有它 —— 实测那一调用只会抛
-   * `task-tree: no node with id "..." in this session's tree`。所以通道只有回传：
-   * 派发简报（{@link withNodeBrief}）要求它在结语末尾单独一行输出 `状态：完成` / `状态：失败`，
-   * 这里从父会话自己的历史里把那条结算消息读回来、解析、落树。
+   * `task-tree: no node with id "..." in this session's tree`。所以通道只有一条：
+   * 宿主 `createSettlementMessage` 投进父会话的那条通知，它的**第一行**就是
+   * `settlementSummary(childId, stopReason)` 按模板拼出来的句子（{@link readStopReason}）。
+   * 这里从父会话自己的历史里读回来、反推、落树。
+   *
+   * 子代理的结语**一个字的散文都不参与判定**（派发简报里明令禁止它写状态行）——
+   * 这正是 2026-10-02 那场事故的修复：散文永远在和 guard 的信封截断赛跑，
+   * 那就别让状态住在散文里。
+   *
+   * 认不出模板时（{@link settlingPatch} 的 `unknown`）**一个状态都不置**、也**不推进账本**：
+   * 节点保持原状、账本那一步仍是 `dispatched`（下游因此不放行，fail-closed），只留一条日志。
    *
    * 监听器**必须自己吞掉一切异常**：一次解析或写树失败不许把会话事件分发炸掉。
-   * 宿主**没有**任何机器可读的失败字段（`source` 里没有 stopReason，只有一行人读摘要句，
-   * 见 `createSettlementMessage`，dsh-subagent/lib/index.js:633-654），所以摘要句只做补充说明：
-   * **绝不**凭它把节点判成 completed。这一版起它只剩一个用途 —— 认出「被强停」，
-   * 补成 `（被强停）` 这一个短标记（见 {@link STOPPED_HINT}），整句摘要不再进 detail。
    */
   ctx.on('session/event', async (session, event) => {
     let childId = ''
@@ -1109,13 +1122,19 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
         ctx.logger?.warn?.('task: no node in session ' + sid + ' is bound to child ' + childId + '; nothing to settle')
         return
       }
-      const patch = settlementPatch(readNodeReplay(body), source.summary)
+      const patch = settlingPatch(readStopReason(body, source.summary))
       let applied = false
       for (const node of bound) {
-        // 已经 completed 的节点是既成事实：一条晚到的失败（或「没收到回报」）不许把它盖回去。
+        // 已经 completed 的节点是既成事实：一条晚到的失败（或「未判定」）不许把它盖回去。
         if (node.status === 'completed') continue
         applied = true
         await port.step(sid, node.id, patch)
+      }
+      // 认不出宿主那句话 ⇒ 一个状态都不置、账本一步都不推（下游因此不放行，fail-closed）。
+      // 这条日志是这种降级**唯一**的留痕：静默会让「判据哑了」与「孩子没结算」分不开。
+      if (patch.status === undefined) {
+        ctx.logger?.warn?.('task: cannot tell how child ' + childId + ' ended (no known host settlement template); its node keeps its status and no run is advanced')
+        return
       }
       // 树写完之后才是自动放行：账本按**同一次结算的结局**推进，再去看它解锁了谁。
       // 一条都没写（全部已是 completed）时按既成事实算 completed —— 一条晚到的失败
@@ -1519,8 +1538,10 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
    *     发任何 `subagent-settled` —— 中枢的回合不因为自动派发而动一下。
    *   - **绝不抛**：调用点在 `session/event` 监听器里。
    *
-   * 结局取自树写入的同一份判定（`settlementPatch`），不另算一遍：
+   * 结局取自树写入的同一份判定（{@link settlingPatch}），不另算一遍：
    * 账本里 `dispatched` 的那一条按这次结算的 status 落 `completed`/`failed`。
+   * **判不出时根本不调这里**（监听器在 `status === undefined` 那一刻就返回了）：那一步留在
+   * `dispatched`，下游因为 `needs` 不满足而天然不放行 —— 认不出既不是失败，也不是完成。
    *
    * `conclusion` 的写法有**两档**，都是为了与历史那条回退路径口径一致：
    *   - 节点正从 `dispatched` 落终态 ⇒ 连 status 带结论一起写（首次判终态）；
@@ -1608,7 +1629,7 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
       },
       replace: { type: 'boolean', description: 'plan/run：整树替换而非合并。默认 false；不在本列表里的节点会被丢弃。' },
       node: { type: 'string', description: 'step：要推进的节点 id。' },
-      status: { type: 'string', enum: ['pending', 'in_progress', 'completed', 'failed'], description: 'step：新状态。子代理结算时由插件自己算——主判据是**子代理在结语末尾自己回传的那一行状态**（报完成 → completed，报失败 → failed，见 `withNodeBrief` 写进简报的那两行）；没回传、或格式认不出，一律落 failed 并记「未收到回报」，绝不因为「孩子结算了」就判成成功。宿主那侧没有任何机器可读的失败字段（只有一行人读摘要句），所以那句摘要只剩一个用途：认出「被强停」时补一个短标记，**永不**据此把节点判成 completed。' },
+      status: { type: 'string', enum: ['pending', 'in_progress', 'completed', 'failed'], description: 'step：新状态。子代理结算时由插件自己算——判据是**宿主投进父会话那句固定的结束模板**（`settlementSummary(childId, stopReason)`，见 `readStopReason`）：认得「正常结束」→ completed，但那只说明它**最后一轮正常结束了，未判定对错**；认得「被强停／上下文用尽／拒绝执行／出错／异常结束」→ failed 并记真实原因；**认不出 → 一个状态都不置**，节点保持原状、账本也不推进。子代理在结语里写状态行**不作数**（派发简报明令禁止它写），插件不看它的散文。' },
       detail: { type: 'string', description: 'step：替换节点的 detail。' },
       question: { type: 'string', description: 'ask：问用户的问题。' },
       options: { type: 'array', items: { type: 'string' }, description: 'ask：建议答案。' },
@@ -2081,92 +2102,122 @@ function settledNotice(exec: { agent?: { session?: { deriveMessages(): readonly 
 }
 
 /**
- * 子代理回传状态用的那一行。**全角冒号**，与派发简报（{@link withNodeBrief}）里的文案逐字一致 ——
- * 改这里就得同时改那边，否则子代理报的那一行永远匹配不上。
- */
-const STATUS_LINE = /^\s*状态\s*[:：]\s*(完成|失败)\s*$/u
-
-/** 报完成时 detail 的抬头。 */
-const STATUS_DONE = '状态：完成'
-/** 报失败时 detail 的抬头。 */
-const STATUS_FAILED = '状态：失败'
-/** 没收到状态回报时 detail 的抬头 —— 这是**失败**，不是「还不知道」。 */
-const STATUS_SILENT = '状态：未收到回报'
-
-/**
- * 被强停时追加在 {@link STATUS_SILENT} 后面的短标记 —— **失败档唯一允许的补充**。
- *
- * 为什么只留这一个：detail 里每一段都必须答得出「现在什么状态 / 下一步做什么 / 出问题没有 /
- * 细节去哪拿」之一。抬头已经答了状态；再说一句同义的「没收到状态回报」是重复，
- * 照抄宿主整句摘要（真机实测那一句是
- * `Background subagent <36 位 uuid> was stopped before it finished.`，约 100 字符）
- * 则一条都答不出 —— 那一整句里真正有信号的只有「被强停」四个字。
- */
-const STOPPED_MARK = '（被强停）'
-
-/**
- * 从宿主摘要句里认「被强停」。
- *
- * **这是文本匹配，不是结构化判定。** 已核实宿主这侧没有能用的结构化字段：
- * `subagent-settled` 事件的 `source` 只有 `{ kind, form, summary, senderSessionId }`
- * （`SubagentSettledMessageSource`），`stopReason` 留在 `createSettlementMessage` 内部的
- * `terminal` 上，插件取不到；目录面（`ctx.subagents.listChildren`）的行也只有
- * `activity` 与 `mode`，同样没有停止原因。
- *
- * 于是按宿主 `settlementSummary`（`dsh-subagent/lib/types/continuation-messages.js`）里
- * aborted 那一档的文案 `... was stopped before it finished.` 做**宽松关键词**认，
- * 顺带认几个同义词；不去逐字匹配整句，宿主换个说法只会让标记消失（少一个补充），
- * **绝不会**因为认错而给出一条假结论。认的对象是自己这句 `source.summary`，不是子代理的正文。
- */
-const STOPPED_HINT = /stopped|aborted|cancell?ed|interrupted/iu
-
-/**
- * detail 的上限。上限按**整条 detail** 算，不是只截摘要 ——
- * 否则 `状态：完成｜` 那一段会把 200 撑破。
+ * detail 的上限。上限按**整条 detail** 算，不是只截摘要。
  */
 const DETAIL_MAX = 200
 
-/** 子代理自己报的那条状态。 */
-interface NodeReplay {
-  /** 报的是完成还是失败。 */
-  readonly status: 'completed' | 'failed'
-  /** 状态行之后的第一条非空行；没有就是空串。 */
-  readonly summary: string
-}
+/** 插件判出来的结束原因。`unknown` 不是「失败」，是「认不出」—— 两者的处理**必须**不同。 */
+type StopReason = 'completed' | 'stopped' | 'max-tokens' | 'refusal' | 'error' | 'abnormal' | 'unknown'
 
 /**
- * 从结算正文里读回子代理自己报的状态行。
+ * `subject` 那一格。宿主用 `Background subagent ${childId}` 拼
+ * （`continuation-messages.js:58`），**段间是普通空格 U+0020**，不是全角空格。
  *
- * **倒着扫**：子代理可能在正文里引用过这个格式（讲协议、举例），压过它最后真正报的那行就错了 ——
- * 所以取**最后**一条匹配的行，也就是最近的一条。
- * @param body - 结算正文（`settledNotice` 拼出来的那一份）。
- * @returns 状态与摘要；一行都没匹配上时为 undefined（没报）。
+ * `\S+` 是**故意**的：子会话 id 里没有空白，而贪婪的 `.+` 会一路吃进句尾，
+ * 让后面每一条模板都对不上 —— 那是把判据整个弄哑，不是放宽。
  */
-function readNodeReplay(body: string): NodeReplay | undefined {
-  const lines = body.split('\n')
-  for (let index = lines.length - 1; index >= 0; index--) {
-    const matched = STATUS_LINE.exec(lines[index] ?? '')
-    if (matched === null) continue
-    return {
-      status: matched[1] === '完成' ? 'completed' : 'failed',
-      summary: firstLineAfter(lines, index),
-    }
-  }
-  return undefined
+const SETTLED_SUBJECT_PREFIX = /^Background subagent \S+ /u
+
+/**
+ * 五条**逐字**取自宿主 `settlementSummary` 的句尾 —— 一手核实的落点是随包体发下来的
+ * `@deepseek-ai/dsh-subagent`（0.2.0-rc.2）：`lib/index.js:613-626` 与
+ * `lib/types/continuation-messages.js:57-78` 两份副本逐字相同。本检出里没有 subagent 的
+ * TypeScript 源，所以引的就是这两份**实际会跑到**的：
+ *
+ * ```ts
+ * const subject = `Background subagent ${childId}`
+ * switch (stopReason) {
+ *   case 'completed':  return `${subject} finished and will do no further work unless you send it more.`
+ *   case 'aborted':    return `${subject} was stopped before it finished.`
+ *   case 'max-tokens': return `${subject} ran out of room before it finished.`
+ *   case 'refusal':    return `${subject} declined the task.`
+ *   case 'error':      return `${subject} failed before it finished.`
+ *   default:           return `${subject} ended abnormally (${String(stopReason)}) before it finished.`
+ * }
+ * ```
+ *
+ * 只认**整句句尾**，不认关键词：宿主改文案时一条都匹配不上，于是落到 `unknown`，
+ * 而 `unknown` 不置任何状态 —— 降级的方向是「什么都不说」，**绝不**是「说它成功」。
+ * 关键词匹配会宽松得多，也更危险：子代理的结语里出现「stopped」就会命中，
+ * 而这条判据**必须**只看宿主那一句本身。
+ */
+const SETTLED_TAILS: readonly { readonly tail: string; readonly reason: StopReason }[] = [
+  { tail: 'finished and will do no further work unless you send it more.', reason: 'completed' },
+  { tail: 'was stopped before it finished.', reason: 'stopped' },
+  { tail: 'ran out of room before it finished.', reason: 'max-tokens' },
+  { tail: 'declined the task.', reason: 'refusal' },
+  { tail: 'failed before it finished.', reason: 'error' },
+]
+
+/**
+ * 兜底那一档（宿主 `default` 分支）的头与尾：中间那一格是 `String(stopReason)`，**开放的**，
+ * 所以只能认两头。
+ *
+ * 宿主新增一档时落在这里。它仍然是「宿主自己给出的一个结束原因」，与「认不出宿主这句话」
+ * 是两件事，所以它落 `failed`，不是 `unknown`。
+ */
+const SETTLED_ABNORMAL_HEAD = 'ended abnormally ('
+
+/** 见 {@link SETTLED_ABNORMAL_HEAD}。 */
+const SETTLED_ABNORMAL_TAIL = ') before it finished.'
+
+/** 每一档写进 detail 的短理由。**逐档都答得出「出问题没有」**。 */
+const SETTLING_LABEL: Readonly<Record<Exclude<StopReason, 'unknown'>, string>> = {
+  completed: '正常结束',
+  stopped: '被强停',
+  'max-tokens': '上下文用尽',
+  refusal: '拒绝执行',
+  error: '出错',
+  abnormal: '异常结束',
 }
 
 /**
- * 状态行之后的第一条非空行。**只往后看**：往前看会捡到宿主那句摘要句或子代理自己的正文。
- * @param lines - 正文各行。
- * @param index - 状态行在 `lines` 里的下标。
- * @returns 折叠成单行的摘要，或空串。
+ * 由结算通知里那一句宿主摘要反推它那个结构化的 `stopReason`。
+ *
+ * **为什么是反推、不是直读**：宿主根本不给插件这个字段。`settlementSummary(childId, stopReason)`
+ * 拿得到 `stopReason`，但 `createSettlementMessage` 只把 `boundContextSummary(summary)` 与
+ * `senderSessionId` 放进 `source`（`continuation-messages.js:85-104`），`stopReason` 留在那个
+ * `terminal` 上；`subagent-settled` 事件的 `source` 只有 `{ kind, form, summary, senderSessionId }`；
+ * 目录面（`ctx.subagents.listChildren`）也没带停止原因。插件手里只有那段**模板生成的散文**，
+ * 反推是唯一可做的事 —— 模板与取值一一对应，所以反推是确定的。
+ *
+ * 两个来源，**先正文首行、再 `source.summary`**：
+ *   - 正文首行是宿主**原样**写进去的那一句（`content[0]`，没有长度上限）；
+ *   - `source.summary` 是同一句的副本，但被 `boundContextSummary` 截到 120 字
+ *     （`dsh-llm/lib/types/message.js:10-20`），id 稍长就会把句尾切掉。
+ * 两者都只走 {@link recogniseSettlement} 的**整句比对**，所以任何一条给出答案都可信；
+ * 一条都不给就是 `unknown`。
+ *
+ * **认不出时必须落到 `unknown`**，三种情形都算：
+ *   - 宿主改了文案（模板头或任何一条句尾）；
+ *   - 摘要被截断（以 `…` 收尾，句尾已经不在，整句比对自然对不上）；
+ *   - 来了一条不是这段模板生成的句子 —— 例如子代理自己的正文。
+ * `unknown` 不置任何状态、也不放行下游 —— **不声称成功好过错报成功**。
+ * @param body - 宿主投进父会话的那条结算通知的正文（{@link settledNotice} 的产物）。
+ * @param hostSummary - 事件 `source.summary` 上的那一份**副本**；读不到时只认正文首行。
+ * @returns 认出来的结束原因。
  */
-function firstLineAfter(lines: readonly string[], index: number): string {
-  for (let cursor = index + 1; cursor < lines.length; cursor++) {
-    const candidate = singleLine(lines[cursor] ?? '')
-    if (candidate !== '') return candidate
+function readStopReason(body: string, hostSummary: string | undefined): StopReason {
+  const firstLine = singleLine(body.split('\n')[0] ?? '')
+  const fromBody = recogniseSettlement(firstLine)
+  if (fromBody !== 'unknown') return fromBody
+  return recogniseSettlement(singleLine(hostSummary ?? ''))
+}
+
+/**
+ * 一句话够不够格认成宿主那条模板。**只做整句比对**，一个字都不猜。
+ * @param summary - 已折成单行的候选句。
+ * @returns 认出来的结束原因；认不出时是 `unknown`。
+ */
+function recogniseSettlement(summary: string): StopReason {
+  if (summary === '') return 'unknown'
+  // 先认模板头。头都没了说明这不是宿主那段模板生成的句子 —— 后面的句尾再像也不作数。
+  if (!SETTLED_SUBJECT_PREFIX.test(summary)) return 'unknown'
+  for (const entry of SETTLED_TAILS) {
+    if (summary.endsWith(entry.tail)) return entry.reason
   }
-  return ''
+  if (summary.includes(SETTLED_ABNORMAL_HEAD) && summary.endsWith(SETTLED_ABNORMAL_TAIL)) return 'abnormal'
+  return 'unknown'
 }
 
 /**
@@ -2290,11 +2341,12 @@ const RESUME_DETAIL_PREFIX = '已续跑：child '
 /**
  * 续跑简报末尾追加的那一段。
  *
- * 为什么必须重申状态行：续跑的成因就是「上一轮没有给出可判定的结语状态行」（被判成
- * `状态：未收到回报`，节点落 failed）。不重申一遍，孩子很可能**再犯同一次**，
- * 于是这次续跑白跑。摘要那一句也一起重申 —— 它同样要在状态行之后单独一行。
+ * 为什么必须重申「不要写状态行」：续跑的成因就是「上一轮没干成」—— 落在树上要么是
+ * `failed`，要么是插件认不出宿主那句模板（`unknown`，节点保持原状）。孩子上一轮若照着**旧**
+ * 文案在结语末尾写了 `状态：完成`，那行字不但没用，还会把结语本身挤到 guard 的信封截断线之外。
+ * 不重申一遍，它很可能**再犯同一次**，于是这次续跑白跑。
  */
-const RESUME_NOTE = '以上是你这一步的完整简报（与首次派发那一份逐字同形）。你上一轮没有把它做完：请接着做完，并在最终结语的末尾单独一行**原样**输出 `状态：完成`（或 `状态：失败`），这一行之后**再另起一行**写一句结论摘要。'
+const RESUME_NOTE = '以上是你这一步的完整简报（与首次派发那一份逐字同形）。你上一轮没有把它做完：请接着做完。**不要在结语里写 `状态：完成` / `状态：失败` 这类状态行** —— 你那个节点的状态由插件按宿主的结算模板判，写在结语里的状态标记一个字都不作数。'
 
 /**
  * 单条上游结论的上限（字符数）。
@@ -2416,35 +2468,54 @@ function truncate(text: string, max: number): string {
 }
 
 /**
- * 摘要句里是不是写着「被强停」。
- * @param summary - 已折成单行的宿主摘要句。
- * @returns 写着被强停时为 true。
+ * 正常结束（宿主 `stopReason === 'completed'`）时写进 detail 的那一行。
+ *
+ * **它不声称成功。** `stopReason === 'completed'` 的确切含义只有一句：它最后一轮**正常结束了**。
+ * 它不等于活干对了 —— 子代理可以在正常结束的结语里写「我什么都没做成」，而这条判据**故意
+ * 不看**它的结语。所以这一档在树上落 `completed`（见 {@link settlingPatch} 的取舍说明），
+ * 但 detail 这一行必须把不确定性写出来。
  */
-function wasStopped(summary: string): boolean {
-  return STOPPED_HINT.test(summary)
-}
+const SETTLED_DONE_DETAIL = '状态：正常结束（仅指最后一轮正常结束，未判定对错）'
+
+/** 认出「被强停 / 上下文用尽 / 拒绝执行 / 出错 / 异常结束」时 detail 的抬头。 */
+const SETTLED_FAILED_HEAD = '状态：失败｜'
 
 /**
- * 算出要写进节点的 status 与 detail。
+ * 认不出结束原因时写进 detail 的那一句。
  *
- * 三档：报完成、报失败、没收到回报（没报 / 格式不对 / 被强停都算这一档）。
- * 最后一档落 **failed**，绝不因为「孩子结算了」而写成成功 —— 宿主那句摘要句
- * （`source.summary`）只做补充说明，取不到就当取不到，不是错误。
- *
- * 三档的 detail 都是「一条结论 + 至多一段短补充」：抬头说状态，补充只在真的多带一个信号时才出现
- * —— 报完成/报失败档是子代理自己报的那条摘要，没收到回报档只有 {@link STOPPED_MARK} 这一个短标记。
- * @param replay - 子代理回传的状态；没报时为 undefined。
- * @param hostSummary - 运行时写在 `source.summary` 上的那一行摘要句。
- * @returns 写树用的补丁。
+ * `unknown` **不是** failed：失败是「我知道它出问题了」，认不出是「我不知道它怎么了」。
+ * 两者在树上**必须**长得不一样，否则 2026-10-02 那场事故会原样重演。
  */
-function settlementPatch(replay: NodeReplay | undefined, hostSummary: string | undefined): { status: TaskNodeStatus; detail: string } {
-  if (replay !== undefined) {
-    const head = replay.status === 'completed' ? STATUS_DONE : STATUS_FAILED
-    return { status: replay.status, detail: truncate(replay.summary === '' ? head : head + '｜' + replay.summary, DETAIL_MAX) }
+const SETTLED_UNKNOWN_DETAIL = '状态：未判定｜认不出宿主的结束原因模板'
+
+/**
+ * 算出节点状态的**迁移**：只写「状态与 detail」这一件事，别处不重复判一遍。
+ *
+ * 判据只有一个：宿主那句摘要模板（{@link readStopReason}）。三档——
+ *
+ *   - 认得「正常结束」⇒ `completed`，detail 是 {@link SETTLED_DONE_DETAIL}（**不声称活干对了**）；
+ *   - 认得「被强停 / 上下文用尽 / 拒绝执行 / 出错 / 异常结束」⇒ `failed`，detail 带那一档的真实原因；
+ *   - 认不出 ⇒ **一个状态都不置**（`status === undefined`），只把 detail 写成
+ *     {@link SETTLED_UNKNOWN_DETAIL}，节点状态保持原状。
+ *
+ * 最后一档**不是**失败：宿主换了文案、摘要被截断、来了一条不是这段模板生成的句子，都属于
+ * 「插件不知道它到底怎么了」。把它写成 `failed` 就是拿一个凭空编的结论盖住一次未知 ——
+ * 2026-10-02 那两个已经干完却显示 failed 的子代理，走的就是这条错路。
+ *
+ * 关于「正常结束」为什么不另立一个中性档：树上 `TaskNodeStatus` 的取值面是宿主树存储
+ * （`@t4r71/dsh-plan-tree` 的 `task-tree.ts:73`）**写死**的 —— `pending|in_progress|completed|failed`，
+ * 且 `toPlanStatus`（同文件 104-106 行）只会把这四个往计划态上投影；两个解析端（宿主的
+ * `parsePlanTreesField` 与面板的 `planTreeOf`）见到不认识的取值会**丢掉整棵树**。
+ * 所以这里复用 `completed`，把「未判定对错」全部写进 detail —— UI 与存储一个字都不用改。
+ * 而 `unknown` 那档连 `completed` 都不落，直接不置位，所以它连这条风险都不沾。
+ * @param reason - {@link readStopReason} 反推出来的结束原因。
+ * @returns 要写进树的那一格状态（`undefined` = 不置位）与 detail。
+ */
+function settlingPatch(reason: StopReason): { status?: TaskNodeStatus; detail: string } {
+  if (reason === 'unknown') return { detail: SETTLED_UNKNOWN_DETAIL }
+  return {
+    status: reason === 'completed' ? 'completed' : 'failed',
+    detail: truncate(reason === 'completed' ? SETTLED_DONE_DETAIL : SETTLED_FAILED_HEAD + SETTLING_LABEL[reason], DETAIL_MAX),
   }
-  const summary = singleLine(hostSummary ?? '')
-  // 宿主整句摘要不进 detail —— 它答不出那四条里的任何一条。摘要句到这里只剩一个用途：
-  // 认出「被强停」（正常结算却没报状态 vs 被强停，是它唯一携带的独立信号）。
-  const detail = STATUS_SILENT + (wasStopped(summary) ? STOPPED_MARK : '')
-  return { status: 'failed', detail: truncate(detail, DETAIL_MAX) }
 }
+
