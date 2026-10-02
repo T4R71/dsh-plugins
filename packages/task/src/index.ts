@@ -124,6 +124,11 @@ import {
   type WorktreeRecord,
   type WorktreeStore,
 } from './worktree-state.ts'
+// 「把这个孩子关进它自己的副本」两件事（cwd + 档位）都在这一格里。它自带的文档写明
+// 为什么缺一不可，以及 2026-10-02 那一炮的实测读数。
+import { fenceChildSession, type ChildAgentRegistry } from './child-sandbox.ts'
+import { randomUUID } from 'node:crypto'
+import { existsSync } from 'node:fs'
 
 /**
  * 决策节点的 id 前缀。`ask` 写下的每一个问题都带这个前缀，
@@ -440,6 +445,17 @@ export interface ResolvedConfig {
    * 依赖对不上）时派发**当场失败**，绝不改成「那就在主检出上跑吧」。
    */
   readonly worktreeAuto?: boolean
+  /**
+   * `probe` 那一档要不要对中枢暴露。**默认关**。
+   *
+   * 它是「开一个探头子代理、看它被关在哪」的实验入口：跑一句给定的话、把子会话自己的
+   * 读数原样带回来。日常编排用不到它，所以它进 `action.enum` 也只在打开这一格时 ——
+   * 关着的时候模型连合法调用都构造不出来（参数层先一步报 must be one of）。
+   *
+   * 与 `worktreeAuto` 同一档语义：代码按 `=== true` 判，**省略即最保守的那一档**，
+   * 于是直接构造配置的单测与老调用方不会因为类型标了可选就更激进。
+   */
+  readonly probeEnabled?: boolean
 }
 
 /**
@@ -483,7 +499,7 @@ export interface PresetAgentOptionsField {
   maxTokens?: number
 }
 
-export const Config: z<{ provider: string; defaultRules?: string; presets: Dict<PresetSpecField>; runsFile?: string; worktreesFile?: string; worktreeGoal?: string; worktreeVerify?: string; worktreeMergeVerify?: string; worktreePrepare?: string; worktreeAuto?: boolean }> = z.object({
+export const Config: z<{ provider: string; defaultRules?: string; presets: Dict<PresetSpecField>; runsFile?: string; worktreesFile?: string; worktreeGoal?: string; worktreeVerify?: string; worktreeMergeVerify?: string; worktreePrepare?: string; worktreeAuto?: boolean; probeEnabled?: boolean }> = z.object({
   /** `ctx.subagents` 里的 provider 名，必填——`startContinuable` 的第一个参数就是它。 */
   provider: z.string().required(),
   /**
@@ -555,6 +571,11 @@ export const Config: z<{ provider: string; defaultRules?: string; presets: Dict<
    * 关掉它等于退回「隔离是可选的装饰」。只读调研用 `worktree: "-"` 逐次关。
    */
   worktreeAuto: z.boolean().default(true),
+  /**
+   * `probe` 那一档开不开。默认 false —— 它是实验入口，不是编排的一部分。
+   * 打开之后 `task` 的 `action.enum` 会多出 `probe` 一项（见工具参数的说明）。
+   */
+  probeEnabled: z.boolean().default(false),
 })
 
 /** 提问服务回答里的一条。 */
@@ -2055,7 +2076,12 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
       action: {
         type: 'string',
         required: true,
-        enum: ['plan', 'step', 'ask', 'commit', 'run', 'send', 'interrupt', 'list', 'result', 'worktree'],
+        // `probe` 只在 `probeEnabled` 打开时出现。理由：它是「开一个探头子代理」的实验入口，
+        // 日常编排用不到它；常驻在工具面上等于每次都替所有调用方多付一段说明的字符，
+        // 而这类「只有排障时用一次」的动作不值得那笔开销。
+        enum: config.probeEnabled === true
+          ? ['plan', 'step', 'ask', 'commit', 'run', 'send', 'interrupt', 'list', 'result', 'worktree', 'probe']
+          : ['plan', 'step', 'ask', 'commit', 'run', 'send', 'interrupt', 'list', 'result', 'worktree'],
         description: 'plan 写节点；step 推进一个节点；ask 问用户；commit 在隔离检出里按功能提交一批工作单元（line 点名哪条线、记录这次是怎么验证的）；run 声明一条依赖流水线并派出子代理——起点立刻派出，后继在前置全部完成时由插件自动派出，它不会给你发消息；run 的两个补充入口：retry=true 只重评估既有 run 的待办节点（还没派出去的那些），resume=<节点 id> 把已派出但没干成的节点交回它原来那个孩子接着干（不新派）；send 继续它；interrupt 停它；list 读树或子代理；result 读某个子代理的结果；worktree 管并行修改的隔离检出（起线 / 列出在飞的线 / 合回并统一提交 / 收线）。',
       },
       nodes: {
@@ -2115,6 +2141,11 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
       mode: { type: 'string', enum: ['list', 'merge', 'drop'], description: 'worktree：list（默认）列出在飞的线（含在哪条检出、哪个分支、有几个提交、多少未提交改动）；merge 合回并统一提交到主线；drop 收线（删掉检出与分支，只在已合回或明确放弃时做）。' },
       force: { type: 'boolean', description: 'worktree mode=drop：线还有未合回的提交或未提交的改动时仍要收线（不可挽回，明确放弃才用）。' },
       title: { type: 'string', description: 'worktree mode=merge：落进整合提交信息里的一句话。' },
+      // 下面四格只服务 `probe`，且那一档只在 probeEnabled 打开时进 enum。
+      probe_cwd: { type: 'string', description: 'probe：这个探头子代理的**工作目录＝它的隔离副本**（绝对路径）。它的工具层写轴与命令行可写范围都以这一格为界。省略则报错——没有副本就没有可验的边界。' },
+      probe_prompt: { type: 'string', description: 'probe：交给这个探头子代理的任务原文。它跑在自己的副本里，跑完即止（不续跑、不进任务树）。' },
+      probe_marker: { type: 'string', description: 'probe：跑完之后用**本进程**去 stat 的一个路径（绝对路径）。用来核对「这个孩子到底有没有在界外落下东西」——存在即围栏失效。省略则不查。' },
+      probe_wait: { type: 'boolean', description: 'probe：是否等它这一轮结束再返回。默认 true；false 时立刻返回 child_id，读数由下一次 result 取。' },
     },
     output: {
       schema: {
@@ -2137,6 +2168,7 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
           verification: { type: 'string', description: 'commit：这次提交是怎么被验证的——machine（机械验证跑过）/ judgement（判断档）/ both / none。' },
           merged: { type: 'boolean', description: 'worktree mode=merge：这条线是否已合回并统一提交到主线。' },
           worktrees: { type: 'array', items: { type: 'string' }, description: 'worktree mode=list：在飞的线，每条一行（名字 / 分支 / 检出路径 / 提交数 / 未提交改动数）。' },
+          probe: { type: 'string', description: 'probe：这一炮的原始读数（子会话 id、cwd、跑过的命令、每条结果的沙箱自报档位、标记文件在不在）。**原文照抄**，不改写成结论。' },
         },
       },
       render: (_args, value) => [{ type: 'text', text: 'task ' + String(value.status) }],
@@ -2521,6 +2553,38 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
           await tree().step(sid, nodeId, { status: 'completed', detail: ANSWER_PREFIX + decision })
           return { node: nodeId, status: 'completed', result: decision }
         }
+        case 'probe': {
+          if (config.probeEnabled !== true) {
+            throw new Error('task probe: 这一档只在 probeEnabled 打开时存在（默认关）。它是「开一个探头子代理、看它被关在哪」的实验入口，不是日常编排的一部分。')
+          }
+          if (ctx.agents === undefined) throw new Error('task probe: the `agents` service is unavailable — nothing can create a child session')
+          const wanted = (args.probe_cwd ?? '').trim()
+          if (wanted === '') {
+            throw new Error('task probe: probe_cwd 是必填的 —— 这一档的全部意义就是「子会话的工作目录＝这一格」，'
+              + '省略它等于开一个没有可验边界的探头。')
+          }
+          const parent = requireAgent(exec)
+          const childId = 'session-' + randomUUID()
+          const fenced = await fenceChildSession({
+            registry: ctx.agents as unknown as ChildAgentRegistry,
+            parent,
+            sessionId: childId,
+            cwd: wanted,
+          })
+          const kid = fenced.agent as unknown as ProbeChild
+          const prompt = (args.probe_prompt ?? '').trim()
+          if (prompt !== '') {
+            kid.followup({ role: 'user', content: [{ type: 'text', text: prompt }], source: { kind: 'user' } })
+          }
+          const waited = args.probe_wait !== false
+          if (waited) await kid.whenIdle()
+          return {
+            task_id: childId,
+            status: waited ? 'completed' : 'running',
+            result: waited ? '这个探头子代理这一轮已经结束（结语看它自己的会话）。' : '已开出、没等。',
+            probe: probeReading(fenced.sessionId, fenced.cwd, waited, kid, args.probe_marker),
+          }
+        }
         // `dispatch` **不再对中枢暴露**：`action.enum` 里没有它，模型连合法调用都构造不出来
         // （参数层先一步报 `"action" must be one of [...]`，有测试钉住）。这个分支只留一个
         // 清楚的解释，防的是「靠 SDK / 旧缓存 / 别处拼出来的调用」静默落空 —— 它**不派任何活**，
@@ -2571,6 +2635,130 @@ function sessionId(exec: { agent?: { session?: { id: string } } }): SessionId {
   if (id === undefined) throw new Error('task requires a calling session (exec.agent.session was undefined)')
   return id as SessionId
 }
+
+/**
+ * 一条 tool/result 上有没有**报错**。
+ *
+ * 两个落点都要看：宿主把失败写成 message.isError，内层错误则挂在 error 上 ——
+ * 只看一个会把另一半未失败的读数记成失败（或反过来）。
+ * @param data - 事件载荷。
+ * @returns 是否失败。
+ */
+function resultFailed(data: { readonly message?: { readonly isError?: boolean }; readonly error?: unknown }): boolean {
+  return data.message?.isError === true || data.error !== undefined
+}
+
+/**
+ * 一条 tool/result 里那份**原文**。
+ * @param data - 事件载荷。
+ * @returns 原文的 JSON 形式。
+ */
+function resultText(data: { readonly message?: { readonly content?: unknown }; readonly error?: unknown }): string {
+  return JSON.stringify(data.message?.content ?? data.error ?? '')
+}
+
+/**
+ * 一条工具结果宣称自己在哪一档跑。
+ *
+ * **2026-10-02 实测：一条 `tool/result` 里根本没有这一格。** 那个孩子的整段日志里
+ * 每条结果的 `data` 都只有 `turn/step/message`（外加写文件那条的 `meta.operation/diffs`），
+ * 沙箱档位不在里面。所以这一格在真机上通常返回 undefined —— 保留它是为了「万一哪天
+ * 宿主把它写进来」，而**绝不**拿会话头的档位替它填一个：那正是「读数被结论顶掉」的典型。
+ * 真正的档位读数是它自己日志里那条 `sandbox/mode` 事件（下面照抄的那一段）。
+ * @param data - 事件载荷。
+ * @returns 那一档；结果里没写就是 undefined。
+ */
+function reportedSandboxMode(data: unknown): string | undefined {
+  const sandbox = (data as { readonly meta?: { readonly sandbox?: { readonly mode?: unknown } } } | null)?.meta?.sandbox
+  return typeof sandbox?.mode === 'string' ? sandbox.mode : undefined
+}
+
+/**
+ * 一个探头子代理身上本格会碰的那一小片**活孩子**接口。
+ *
+ * 与 ChildAgentRegistry 同一条纪律：只声明真的会用到的几格，不 import 宿主那侧完整的
+ * Agent 形状（跨包具体类型够不到，见 ./child-sandbox 的说明）。
+ */
+interface ProbeChild {
+  /** 这个孩子自己的会话。读它自己的日志是**唯一**的读数来源。 */
+  readonly session: {
+    /** 它自己的日志偏移。 */
+    readonly seq: number
+    /**
+     * 从某个偏移起读它自己的事件。
+     * @param from - 起始偏移。
+     * @returns 事件列表。
+     */
+    snapshotEvents(from: number): readonly { readonly type: string; readonly data: unknown }[]
+  }
+  /**
+   * 交一轮给它，并唤醒驱动。
+   * @param message - 一条用户消息。
+   */
+  followup(message: unknown): void
+  /**
+   * 等它这一整轮收敛到静止。
+   * @returns 静止之后 fulfillment。
+   */
+  whenIdle(): Promise<void>
+}
+
+/**
+ * 这一炮的原始读数。**只抄事实**，不写结论 —— 「关住了没有」由调用的中枢照着
+ * 这份读数自己判，插件不替它下判断。
+ *
+ * 三条读数对应三件不同的事：
+ *   - child_cwd 是**命令行层的边界**（沙箱就是这么解析 workspace root 的）；
+ *   - tool results 里每一条都带上「这条结果自己宣称的档位」与原文首行 ——
+ *     **报错与报平安都照抄**，不筛选、不改写；
+ *   - marker_exists 是**本进程**独立去 stat 的落盘事实，任何一层的自报都改不动它。
+ * @param childId - 子会话 id。
+ * @param cwd - 子会话的工作目录。
+ * @param waited - 有没有等它跑完。
+ * @param agent - 那个孩子的 agent。
+ * @param marker - 要 stat 的标记路径（省略即不查）。
+ * @returns 一份多行文本。
+ */
+function probeReading(childId: string, cwd: string, waited: boolean, agent: ProbeChild, marker?: string): string {
+  const events = agent.session.snapshotEvents(0)
+  const calls = new Map<string, string>()
+  const rows: string[] = []
+  for (const event of events) {
+    const data = event.data as { readonly callId?: string; readonly name?: string }
+    if (event.type === 'tool/call' && typeof data.callId === 'string') {
+      calls.set(data.callId, String(data.name ?? ''))
+      continue
+    }
+    if (event.type !== 'tool/result') continue
+    const payload = event.data as {
+      readonly callId?: string
+      readonly message?: { readonly isError?: boolean; readonly content?: unknown; readonly toolCallId?: string }
+      readonly error?: unknown
+    }
+    // 调用 id 只出现在**消息**那一层（实测 `tool/result` 的 data 是 `{turn, step, message}`，
+    // 没有自己的 `callId`）—— 只认顶层那一格会把每条结果都记成 "(unknown tool)"。
+    const callId = payload.message?.toolCallId ?? payload.callId
+    const name = calls.get(String(callId)) ?? '(unknown tool)'
+    const mode = reportedSandboxMode(event.data)
+    const raw = resultText(payload).replace(/\\[rn]/g, ' ').replace(/\\"/g, '"')
+    rows.push('  ' + name + ' | isError=' + String(resultFailed(payload))
+      + (mode === undefined ? '' : ' | sandbox: ' + mode)
+      + ' :: ' + (raw.length > 300 ? raw.slice(0, 300) + '...' : raw))
+  }
+  return [
+    'child_id: ' + childId,
+    'child_cwd: ' + cwd,
+    'waited: ' + String(waited) + ' | events: ' + String(agent.session.seq),
+    'durable policy of this child (read back from its own log):',
+    ...events
+      .filter(event => event.type === 'sandbox/mode' || event.type === 'approval/policy')
+      .map(event => '  ' + event.type + ': ' + JSON.stringify(event.data)),
+    'tool results the child actually got (tool | isError | raw text, first 300 chars):',
+    ...rows.length === 0 ? ['  (none)'] : rows,
+    'marker_exists: ' + (marker === undefined ? '(no marker asked for)' : String(existsSync(marker)) + ' [' + marker + ']'),
+  ].join('\n')
+}
+
 
 /**
  * 一个 Agent 的委派深度（主代理是 0）。

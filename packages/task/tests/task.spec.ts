@@ -1841,8 +1841,8 @@ it('账本路径不是 volatile：它只用来挪文件，绝不进设置页的�
   //      读得到的 logger，账本于是**静默地记不住**。
   // 现在账本是一个文件，task 行上只留一个可选的文件位置，而且**不是** volatile。
   assert.deepStrictEqual(Object.keys(TaskRowConfig.dict ?? {}).sort(),
-    ['defaultRules', 'presets', 'provider', 'runsFile', 'worktreeAuto', 'worktreeGoal', 'worktreeMergeVerify', 'worktreePrepare', 'worktreeVerify', 'worktreesFile'],
-    'task 行就这几格：账本本体不在配置里，只有位置开关与几个默认值（隔离那一半）')
+    ['defaultRules', 'presets', 'probeEnabled', 'provider', 'runsFile', 'worktreeAuto', 'worktreeGoal', 'worktreeMergeVerify', 'worktreePrepare', 'worktreeVerify', 'worktreesFile'],
+    'task 行就这几格：账本本体不在配置里，只有位置开关与几个默认值（隔离那一半 + 探头那一档）')
   assert.notStrictEqual(TaskRowConfig.dict?.runsFile?.meta.volatile, true,
     'runsFile 绝不能是 volatile：那会让它出现在设置页的可热改字段里')
   assert.strictEqual(TASK_RUNS_FILE_NAME, 'task-runs.json', '默认文件名固定，便于排障时找得到')
