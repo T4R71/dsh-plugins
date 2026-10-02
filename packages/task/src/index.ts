@@ -39,15 +39,23 @@
  * 永远等不到（轮询到 120000ms 执行期限），已整个删除，见
  * `M:\T4\out\stage2\S22-dispatch与wait修正.md`。
  *
- * ## 子代理怎么回报状态
+ * ## 子代理的状态从哪来：派生，不是散文
  *
  * 树按会话 id 隔离：`bind` 写的那个节点只在**父会话**的树里，子代理自己的树里没有它，
  * 所以子代理**做不到**用 `task` 的 `step` 改自己那个节点（实测报
- * `task-tree: no node with id "..." in this session's tree`）。状态因此走**回传**：
- * 派发简报（{@link withNodeBrief}）要求它在结语末尾单独一行输出 `状态：完成` / `状态：失败`，
- * `apply` 里挂在 `session/event` 上的结算监听器把这一行解析出来，落到父树那个节点上。
- * 判定只有两个来源：子代理自己报的那一行，与节点已经写下的状态；宿主那句摘要句
- * （`source.summary`）只做补充说明 —— **绝不**凭它把节点判成 completed。
+ * `task-tree: no node with id "..." in this session's tree`）。
+ *
+ * 旧版让子代理在结语末尾手写一行 `状态：完成`，父侧再把这行**散文**解析回来。这条协议
+ * 2026-10-02 真机翻过车：`guard` 把结语换成只保留尾部 K 字符的信封时那一行被吃掉，
+ * 于是**两个实际已经干完的子代理在树上显示成 failed**。根因就是「状态靠散文声明」。
+ *
+ * 现在改成**从宿主回传的结束原因派生**：运行时写的摘要句（`source.summary`）由
+ * `settlementSummary` 的固定模板生成，模板与 `stopReason` 一一对应（见
+ * {@link readStopReason}），插件按模板反推出一个**类型化的中止原因**，再派生出节点状态
+ * （{@link settlementPatch}）。成败判据因此不再依赖子代理写了什么，也不依赖信封保留了哪些字符。
+ *
+ * 子代理照常写它的完整结语（`## 结论 / ## 证据 / ## 判不了`）—— 那是产出物，必须有；
+ * 它只是**不再背「写状态行」这个负担**，也不必再让那一行躲过信封的长度限制。
  *
  * ## 明确不做
  *
@@ -269,34 +277,32 @@ const ENVELOPE_SECTIONS_LINE = '结语请以固定小节的**一级标题**开�
  * 派出去的子代理活干完了，树上它自己的节点**始终停在 pending**，而用户不展开子代理
  * 的上下文，**面板是唯一的信息出口**，于是面板上什么都看不到。
  *
- * 为什么是**回传**而不是让它自己调 `step`：树按会话 id 隔离，`bind` 写的那个节点落在
+ * 为什么是**通报**而不是让它自己调 `step`：树按会话 id 隔离，`bind` 写的那个节点落在
  * **父会话**的树里，子代理自己的树里根本没有它 —— 实测那一调用只会抛
- * `task-tree: no node with id "..." in this session's tree`。所以简报要它做的唯一一件事
- * 是**在结语末尾回传一行状态**，由 `apply` 里挂在 `session/event` 上的结算监听器解析、
- * 落到父树那个节点上。那一行的文案与监听器里的 `STATUS_LINE` **逐字一致**（全角冒号，
- * 两边一起改才作数）。
+ * `task-tree: no node with id "..." in this session's tree`。
  *
- * 边界（**不许越界**）：本函数只**在简报里要求**子代理自己报；`in_progress` 已经由
- * `settleDispatch` 在 bind 时写下（那是既成事实），`completed` / `failed` 只按子代理
- * **自己报的那一行**落 —— 绝不从「它结算了」这件事推断成功。
+ * **2026-10-02 起这一段不再要求任何状态行**：节点状态由插件从宿主回传的结束原因**派生**
+ * （见 {@link settlementPatch}），所以子代理只要照常写下它的完整结语即可。旧文案要求的那一行
+ * 既是它的额外负担，又正是 2026-10-02 那场事故的引信 —— `guard` 的信封只保留结语尾部
+ * K 字符，那一行被吃掉，父侧就再也认不出结局，于是**两个已经干完的子代理在树上显示成 failed**。
+ * 把要求撤掉，协议里就再没有「必须躲过截断才作数」的东西。
  * @param prompt - 调用者给的原始简报，一个字都不改，原样排在最前。
  * @param bind - 绑定的节点 id；**省略时原样返回**，绝不编造一个节点出来。
  * @param concise - 是否追加「结论要简略」那一句（{@link CONCISE_CONCLUSION_LINE}）。
- *   只有 run 链路给 true；`dispatch` 动作不给，简报因此逐字不变。
+ *   只有 run 链路给 true。
  * @returns 追加了节点指令的简报。
  */
 function withNodeBrief(prompt: string, bind: string | undefined, concise = false): string {
   if (bind === undefined) return prompt
   const brief = NODE_BRIEF_ANCHOR
     + `你绑定的节点是 \`${bind}\`（in_progress 已由插件写入，不必再设）。`
-    + '干完时，在最终结语的末尾单独一行**原样**输出 `状态：完成`（插件据此把它置成 completed）；'
-    + '失败则同样单独一行输出 `状态：失败`（failed）。'
+    + '**不要写状态行**（旧版要求的末尾 `状态：完成` / `状态：失败` 已经取消）：'
+    + '你那一步成没成，插件按运行时回传的结束原因自己判，不用你报，你也报不准（正常结束不等于活干对了）。'
     + (concise ? CONCISE_CONCLUSION_LINE : '')
-    + '这一行之后**再另起一行**写一句结论摘要，插件会把状态与摘要一起落到节点上。'
     + ENVELOPE_SECTIONS_LINE
+    + '结论摘要进节点的 detail（上限 200 字，超出截断），那是用户在面板上唯一看得到的内容，写清楚。'
     + '不要用 task 工具的 step 去写这个节点 —— 也写不成：树按会话隔离，你自己的树里没有它，'
     + '那一次调用只会报 no node with id。'
-    + '摘要进节点的 detail（上限 200 字，超出截断），那是用户在面板上唯一看得到的内容，写清楚。'
   return prompt.length === 0 ? brief : prompt + '\n\n' + brief
 }
 
@@ -1571,13 +1577,13 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
   }
   ctx.tools.register(defineTool({
     name: 'task',
-    description: '`task` 统一编排：掌管任务树与执行它的子代理。子代理异步结算：结算通知会在你下一轮以一条 `subagent-settled` 消息出现；`result` 只读已经到达的东西，从不等待。派活一律走本工具（`dispatch`）——只有走这条通道派出的子代理才会被装上「直接问用户」的提问工具。子代理缺前提或需要用户拍板时，必须直接问用户（用提问工具），不要自己硬猜。答案要求换方向、改范围或推翻已定方案时，子代理应停手回报，由中枢另派干净上下文的代理接手。派活时用中文角色名做 label（侦察/实现/验证），树与提问卡片按它显示。',
+    description: '`task` 统一编排：掌管任务树与执行它的子代理。子代理异步结算：结算通知会在你下一轮以一条 `subagent-settled` 消息出现；`result` 只读已经到达的东西，从不等待。派活一律走 `run`：先声明 `nodes`（建树），起点立刻派出，后继由插件自动放行——**没有**「不建节点就派活」的直达通道。走这条路派出的子代理才会被装上「直接问用户」的提问工具。子代理缺前提或需要用户拍板时，必须直接问用户（用提问工具），不要自己硬猜。答案要求换方向、改范围或推翻已定方案时，子代理应停手回报，由中枢另派干净上下文的代理接手。派活时用中文角色名做 label（侦察/实现/验证），树与提问卡片按它显示。',
     parameters: {
       action: {
         type: 'string',
         required: true,
-        enum: ['plan', 'step', 'ask', 'dispatch', 'run', 'send', 'interrupt', 'list', 'result'],
-        description: 'plan 写节点；step 推进一个节点；ask 问用户；dispatch 起一个子代理（直连）；run 声明一条依赖流水线——起点立刻派出，后继在前置全部完成时由插件自动派出（不必再调 dispatch，它也不会给你发消息）；run 的两个补充入口：retry=true 只重评估既有 run 的待办节点（还没派出去的那些），resume=<节点 id> 把已派出但没干成的节点交回它原来那个孩子接着干（不新派）；send 继续它；interrupt 停它；list 读树或子代理；result 读某个子代理的结果。',
+        enum: ['plan', 'step', 'ask', 'run', 'send', 'interrupt', 'list', 'result'],
+        description: 'plan 写节点；step 推进一个节点；ask 问用户；run 声明一条依赖流水线并派出子代理——起点立刻派出，后继在前置全部完成时由插件自动派出，它不会给你发消息；run 的两个补充入口：retry=true 只重评估既有 run 的待办节点（还没派出去的那些），resume=<节点 id> 把已派出但没干成的节点交回它原来那个孩子接着干（不新派）；send 继续它；interrupt 停它；list 读树或子代理；result 读某个子代理的结果。',
       },
       nodes: {
         type: 'array',
@@ -1588,27 +1594,27 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
           additionalProperties: false,
           properties: {
             id: { type: 'string', required: true, description: '节点 id，树内唯一。' },
-            parent: { type: 'string', description: 'plan/dispatch：上级节点 id；根节点省略。' },
-            title: { type: 'string', description: 'plan/dispatch：一句话说明这活是什么。这两条通道每项都必填；run 的节点不用给（标题由插件从 prompt 首行生成）。' },
-            detail: { type: 'string', description: 'plan/dispatch：什么算干完，或卡在哪里。' },
+            parent: { type: 'string', description: 'plan/run：上级节点 id；根节点省略。' },
+            title: { type: 'string', description: 'plan/run：一句话说明这活是什么。run 的节点省略时由插件从 prompt 首行生成；plan 的节点每项必填。' },
+            detail: { type: 'string', description: 'plan/run：什么算干完，或卡在哪里。' },
             prompt: { type: 'string', description: 'run：这个节点要干的活，原样交给子代理。run 的节点只要求 id 与 prompt。' },
             needs: { type: 'array', items: { type: 'string' }, description: 'run：前置节点 id，全部 completed 之后本节点由插件自动派出。依赖只驱动后端，不写进树。' },
-            preset: { type: 'string', description: 'run：这个节点的身份名，语义同 action=dispatch 的 preset。' },
-            label: { type: 'string', description: 'run：这个节点的短标签，语义同 action=dispatch 的 label。' },
+            preset: { type: 'string', description: 'run：这个节点的身份名，决定它的 persona 与工具过滤，覆盖顶层 preset。省略则拿 lead 身份——绝不继承你的 persona；未知名字直接报错，不回落。' },
+            label: { type: 'string', description: 'run：这个节点在面板上的短标签。' },
           },
         },
-        description: 'plan/dispatch：要写的节点，扁平——嵌套只靠 parent。dispatch 时先写节点再起子代理，所以 bind 能在同一次调用里点名其中之一。run：这条流水线的节点，每项形如 { id, prompt, needs?, preset?, name?, label? }，needs 指向同一份 nodes 里的 id。',
+        description: 'plan/run：要写的节点，扁平——嵌套只靠 parent。run：这条流水线的节点，每项形如 { id, prompt, needs?, preset?, name?, label? }，needs 指向同一份 nodes 里的 id。',
       },
-      replace: { type: 'boolean', description: 'plan/dispatch：整树替换而非合并。默认 false；不在本列表里的节点会被丢弃。' },
+      replace: { type: 'boolean', description: 'plan/run：整树替换而非合并。默认 false；不在本列表里的节点会被丢弃。' },
       node: { type: 'string', description: 'step：要推进的节点 id。' },
-      status: { type: 'string', enum: ['pending', 'in_progress', 'completed', 'failed'], description: 'step：新状态。结算本身不推出 completed —— 只有显式 step 或子代理在结语里回传的那一行状态才会置位。' },
+      status: { type: 'string', enum: ['pending', 'in_progress', 'completed', 'failed'], description: 'step：新状态。子代理结算时由插件自己算——主判据是**子代理在结语末尾自己回传的那一行状态**（报完成 → completed，报失败 → failed，见 `withNodeBrief` 写进简报的那两行）；没回传、或格式认不出，一律落 failed 并记「未收到回报」，绝不因为「孩子结算了」就判成成功。宿主那侧没有任何机器可读的失败字段（只有一行人读摘要句），所以那句摘要只剩一个用途：认出「被强停」时补一个短标记，**永不**据此把节点判成 completed。' },
       detail: { type: 'string', description: 'step：替换节点的 detail。' },
       question: { type: 'string', description: 'ask：问用户的问题。' },
       options: { type: 'array', items: { type: 'string' }, description: 'ask：建议答案。' },
-      prompt: { type: 'string', description: 'dispatch/send：子代理收到的简报。' },
-      preset: { type: 'string', description: 'dispatch：身份名，决定子代理的 persona 与工具过滤。省略则拿 lead 身份——绝不继承你的 persona；未知名字直接报错，不回落。' },
-      label: { type: 'string', description: 'dispatch：短标签，显示在面板上的活名。' },
-      bind: { type: 'string', description: 'dispatch：这个子代理负责的节点 id，会被置为 in_progress。节点可来自本次调用的 nodes、更早的 plan，或一次 merge。' },
+      prompt: { type: 'string', description: 'run 的每个节点一项（该节点自己要干的活，原样交给子代理）/ send：子代理收到的简报。' },
+      preset: { type: 'string', description: 'run（顶层默认给全条流水线，节点项给该节点，节点项优先）：身份名，决定子代理的 persona 与工具过滤。省略则拿 lead 身份——绝不继承你的 persona；未知名字直接报错，不回落。' },
+      label: { type: 'string', description: 'run：短标签，显示在面板上的活名。' },
+      bind: { type: 'string', description: '已不从这条工具面接受：节点与 childId 的绑定由插件在派发时自己登记。' },
       run: { type: 'string', description: 'run：这条流水线的 run id，会话内唯一。同一个 run 的起点（needs 为空的那些）会在本次调用里并行派出。三个词的分工：声明新流水线（默认）、`retry=true` 重评估**已存在**那条 run 的待办节点、`resume=<节点 id>` 把**已派出但没干成**的节点交回它原来那个孩子接着干。后两种都要求 run 已经存在。' },
       resume: { type: 'string', description: 'run：要**续跑**的节点 id —— 把这个节点交给它原来那个孩子接着干（不新派）。要求该 run 已存在、节点在该 run 里、账本上有 childId、且状态不是 completed。上游结论取不到时不发（fail-closed，原因写进 detail 与账本）。与 retry 互斥：retry 管还没派出去的，resume 管已派出没干成的。' },
       retry: { type: 'boolean', description: 'run：只重评估既有 run 的待办节点（pending 且依赖已满足者），把被阻塞或派发失败的节点再试一次。不写树、不重声明、不重置任何已派出/已完成的状态；没有待办时返回空 dispatched，不报错。省略即老行为（声明一条新 run）。' },
@@ -1635,29 +1641,6 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
     },
     async execute(args, exec) {
       switch (args.action) {
-        case 'dispatch': {
-          const parent = exec.agent
-          if (parent === undefined) throw new Error('task dispatch requires a calling agent (exec.agent was undefined)')
-          // 层数闸门在最前面：被拒的调用连节点都不该写下去，否则树上会留下一个
-          // 永远等不到孩子的节点。
-          // （`dispatchTo` 里还会再守一道 —— 自动放行没有模型在旁边看，静默越层更危险。）
-          assertCanDelegate(parent)
-          // 归一：dispatch 自己也写节点，于是「建节点 + 派活 + 绑定」一次调用完成。
-          // 顺序是硬约束：bind 要求节点已存在（plan-tree 的 bind 在
-          // findPlanNode === undefined 时抛 unknownNode），所以 nodes 必须先落。
-          // nodes 省略时这一步整个跳过，dispatch 的老行为一字不变。
-          if (args.nodes !== undefined && args.nodes.length > 0) {
-            assertTitledNodes('dispatch', args.nodes as readonly { readonly id: string; readonly title?: string }[])
-            await tree().write(sessionId(exec), args.nodes as readonly FlatNode[], args.replace === true)
-          }
-          // 派发本体与自动放行**共用同一个函数**：这里只负责它自己那一半（层数闸门、写节点）。
-          return await dispatchTo(parent, {
-            prompt: args.prompt ?? '',
-            ...args.preset === undefined ? {} : { preset: args.preset },
-            ...args.label === undefined ? {} : { label: args.label },
-            ...args.bind === undefined ? {} : { bind: args.bind },
-          }, exec.signal)
-        }
         case 'run': {
           const parent = requireAgent(exec)
           if (args.run === undefined || args.run === '') throw new Error('task run requires `run` (the id of this run)')
@@ -1883,6 +1866,20 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
           await tree().step(sid, nodeId, { status: 'completed', detail: ANSWER_PREFIX + decision })
           return { node: nodeId, status: 'completed', result: decision }
         }
+        // `dispatch` **不再对中枢暴露**：`action.enum` 里没有它，模型连合法调用都构造不出来
+        // （参数层先一步报 `"action" must be one of [...]`，有测试钉住）。这个分支只留一个
+        // 清楚的解释，防的是「靠 SDK / 旧缓存 / 别处拼出来的调用」静默落空 —— 它**不派任何活**，
+        // 绝不退化成一条没人知道的旧路。实现层的派发路径原样保留，`run` 走的就是它。
+        //
+        // 为什么撤掉：`dispatch` 的 `bind` 是可选的，于是它是一条「不必先建节点就能派活」的
+        // 直达通道。中枢一直在用它，计划树因此可以被搞空。`run` 必须声明 `nodes`，派发即建树，
+        // 树在结构上就不可能为空。用户裁决：「dispatch 这个工具，正常应该直接不暴露给你的」。
+        case 'dispatch' as string:
+          throw new Error(
+            'task: action "dispatch" 已不对中枢暴露（enum 里没有它），也不会派活 ——'
+            + '派活请改用 action "run"：它必须声明 `nodes`，声明即建树，起点立刻派出，'
+            + '后继在前置全部完成时由插件自动派出；续跑既有节点用 resume，重评估待办用 retry。',
+          )
         default:
           throw new Error(`task: unknown action "${String(args.action)}"`)
       }

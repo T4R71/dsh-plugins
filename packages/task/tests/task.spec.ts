@@ -342,7 +342,7 @@ function makeCaller(messages: FakeMessage[] = [], signal: AbortSignal = AbortSig
 /** 一个带 session 的假调用者。 */
 const caller = makeCaller()
 
-it('注册期的参数 DSL 能编译，且编出来的动作全集就是那九个', () => {
+it('注册期的参数 DSL 能编译，且编出来的动作全集就是那八个——dispatch 已收口掉', () => {
   const { tool } = harness()
   assert.strictEqual(tool.name, 'task')
   // `defineTool` 在注册时把参数 DSL 编成 JSON Schema 写进定义（实测：`defineTool` 返回的
@@ -350,7 +350,7 @@ it('注册期的参数 DSL 能编译，且编出来的动作全集就是那九�
   const properties = tool.parameters.properties as { action?: { enum?: readonly string[] } }
   assert.deepStrictEqual(
     properties.action?.enum,
-    ['plan', 'step', 'ask', 'dispatch', 'run', 'send', 'interrupt', 'list', 'result'],
+    ['plan', 'step', 'ask', 'run', 'send', 'interrupt', 'list', 'result'],
   )
 })
 
@@ -405,7 +405,12 @@ it('未知动作在参数层就被拒，报错把合法动作全集列出来', a
   // 报错里带合法集合；`execute` 的 `default` 分支对模型不可达。
   await assert.rejects(
     () => run(tool, { action: 'nope' }, caller),
-    /invalid arguments: "action" must be one of \["plan","step","ask","dispatch","run","send","interrupt","list","result"\]/,
+    /invalid arguments: "action" must be one of \["plan","step","ask","run","send","interrupt","list","result"\]/,
+  )
+  // `dispatch` 现在是**未知动作**：它连参数层都过不去，报错里也不该再出现它。
+  await assert.rejects(
+    () => run(tool, { action: 'dispatch', prompt: 'go' }, caller),
+    /invalid arguments: "action" must be one of \["plan","step","ask","run","send","interrupt","list","result"\]/,
   )
 })
 
@@ -418,17 +423,33 @@ it('taskTree 服务缺席时，树类动作必须报错而不是静默成功', a
   await assert.rejects(() => run(tool, { action: 'list' }, caller), /taskTree` service is unavailable/)
 })
 
-it('dispatch 没有调用者 Agent 时抛错——它没有可用的授权身份', async () => {
+it('run 没有调用者 Agent 时抛错——它没有可用的授权身份', async () => {
+  // 派发那条路要的是**当刻活着的 Agent 本身**（`startContinuable` 的 parent、
+  // 提问根、send 的 sender 都只认它）。所以派发路径入口处就把它取出来，缺席即抛。
+  // dispatch 撤掉之后这条路只剩一个入口，但这道闸门照旧必须在。
   const { tool } = harness({ tree: true })
-  await assert.rejects(() => run(tool, { action: 'dispatch', prompt: 'go' }, {}), /calling agent/)
+  await assert.rejects(
+    () => run(tool, { action: 'run', run: 'r1', nodes: [{ id: 'n1', prompt: 'go' }] }, {}),
+    /calling agent/,
+  )
 })
 
-it('dispatch 把 persona 与 toolFilter 平铺进 request，并包成 startContinuable 的形状，且不传 bind 时结果里没有 node 键', async () => {
+it('run 把节点 preset 的 persona 与 toolFilter 平铺进 request，并包成 startContinuable 的形状；派不出去的节点不产出 node 键', async () => {
+  // 这一条原先走 `dispatch`（不 bind ⇒ 简报不带节点段）。迁移后的判断：
+  // 被考的四个槽（persona / toolFilter / maxDepth / parent）与**无关入口**，只与
+  // 「派发那一刻交给 `startContinuable` 的那个 request」有关，所以整条搬去 run 的路径上，
+  // 又因为 run **只**从节点派发（没有 bind 这个概念），"不 bind 就不追加节点段" 这半条
+  // 没有落点了 —— 它改由 "派不出去的节点不产出 node 键" 这半条接住：返回值里
+  // 只该有 run / dispatched，`node` 与 `task_id` 这两个键在 `run` 上根本不存在。
   const seen: unknown[] = []
   let captured: Captured | undefined
   const ctx = {
     tools: { register: (d: Captured) => { captured = d; return () => {} } },
-    get: () => undefined,
+    // run 必须先写树（bind 要求节点已存在），所以这条路一定要有树服务；
+    // 这里用一个不记事的空桩，断言全在 startContinuable 的那个 request 上。
+    get: (key: string) => key === 'taskTree'
+      ? { read: () => [], write: async () => {}, step: async () => {}, bind: async () => {} }
+      : undefined,
     subagents: {
       resolveMaxDepth: () => 3,
       startContinuable: async (spec: unknown) => { seen.push(spec); return { childId: 'child-9' } },
@@ -438,19 +459,21 @@ it('dispatch 把 persona 与 toolFilter 平铺进 request，并包成 startConti
   on: () => () => {},
   }
   apply(ctx as never, { provider: 'default', presets: { reader: { persona: 'P', allow: ['read'] } } })
-  const result = await run(captured as Captured, { action: 'dispatch', prompt: 'go', preset: 'reader', label: 'L' }, caller)
-  // bind 没传 ⇒ 结果里**没有** `node` 这个键。旧断言写的是 `node: undefined`，
-  // 那正是把这个坏行为钉成期望值的元凶（真机于是炸在无损序列化上）。
-  assert.strictEqual('node' in result, false, 'no bind means the node key must be absent, not undefined')
+  const result = await run(captured as Captured, {
+    action: 'run',
+    run: 'r1',
+    nodes: [{ id: 'n1', prompt: 'go', preset: 'reader', label: 'L' }],
+  }, caller)
+  // run 的返回值形状：只有 run 与 dispatched，**没有** node / task_id 这两个键。
+  assert.strictEqual('node' in result, false, 'run has no node key — the binding is registered by the plugin itself')
+  assert.strictEqual('task_id' in result, false, 'run has no task_id key either')
+  assert.deepStrictEqual(result, { status: 'running', run: 'r1', dispatched: ['n1'] })
   const spec = seen[0] as { provider: string; request: Record<string, unknown> }
   assert.strictEqual(spec.provider, 'default')
   assert.strictEqual(spec.request.persona, 'P')
   assert.deepStrictEqual(spec.request.toolFilter, { allow: ['read'] })
   assert.strictEqual(spec.request.maxDepth, 3)
   assert.strictEqual((spec.request.parent as { session?: { id?: string } })?.session?.id, 'sess-1')
-  // 本条用例**没传 bind**：按 withNodeBrief 的契约，没有绑定节点就一个字都不追加，
-  // 简报原样送出。所以这条全等断言同时钉住了「不 bind 就不编造节点」这一半。
-  assert.deepStrictEqual(spec.request.prompt, [{ type: 'text', text: 'go' }])
 })
 
 /**
@@ -459,12 +482,14 @@ it('dispatch 把 persona 与 toolFilter 平铺进 request，并包成 startConti
  * 这一组钉的是**直连通道**。名册通道塞不进这个槽（见下一条），
  * 所以「声明了它」这件事必须真的走到直连、并且在返回值里说清楚。
  */
-it('dispatch 把 preset 的 agentOptions 放进 request——角色自己钉住档位', async () => {
+it('run 把节点 preset 的 agentOptions 放进 request——角色自己钉住档位', async () => {
   const seen: unknown[] = []
   let captured: Captured | undefined
   const ctx = {
     tools: { register: (d: Captured) => { captured = d; return () => {} } },
-    get: () => undefined,
+    get: (key: string) => key === 'taskTree'
+      ? { read: () => [], write: async () => {}, step: async () => {}, bind: async () => {} }
+      : undefined,
     subagents: {
       resolveMaxDepth: () => 3,
       startContinuable: async (spec: unknown) => { seen.push(spec); return { childId: 'child-9' } },
@@ -477,19 +502,23 @@ it('dispatch 把 preset 的 agentOptions 放进 request——角色自己钉住�
     provider: 'default',
     presets: { recon: { persona: 'R', agentOptions: { reasoningEffort: 'low', maxTokens: 4096 } } },
   })
-  await run(captured as Captured, { action: 'dispatch', prompt: 'go', preset: 'recon' }, caller)
+  // 迁移的判断：agentOptions 的落点就是派发请求本身（只有直连一条通道，`startContinuable`
+  // 那个 request）。入口从 dispatch 换成 run 之后，同一个槽由节点上的 preset 携带。
+  await run(captured as Captured, { action: 'run', run: 'r1', nodes: [{ id: 'n1', prompt: 'go', preset: 'recon' }] }, caller)
   const spec = seen[0] as { request: Record<string, unknown> }
   // 四个字段原样透传；宿主侧是逐字段覆盖父的那一份，只给 effort 时路由继承父。
   assert.deepStrictEqual(spec.request.agentOptions, { reasoningEffort: 'low', maxTokens: 4096 })
   assert.strictEqual(spec.request.persona, 'R', 'agentOptions 不许挤掉身份本身')
 })
 
-it('preset 没声明 agentOptions 时 request 里没有这个键——省略就是继承父的路由', async () => {
+it('run 的节点 preset 没声明 agentOptions 时 request 里没有这个键——省略就是继承父的路由', async () => {
   const seen: unknown[] = []
   let captured: Captured | undefined
   const ctx = {
     tools: { register: (d: Captured) => { captured = d; return () => {} } },
-    get: () => undefined,
+    get: (key: string) => key === 'taskTree'
+      ? { read: () => [], write: async () => {}, step: async () => {}, bind: async () => {} }
+      : undefined,
     subagents: {
       resolveMaxDepth: () => 3,
       startContinuable: async (spec: unknown) => { seen.push(spec); return { childId: 'child-9' } },
@@ -499,17 +528,18 @@ it('preset 没声明 agentOptions 时 request 里没有这个键——省略就�
     on: () => () => {},
   }
   apply(ctx as never, { provider: 'default', presets: { recon: { persona: 'R' } } })
-  await run(captured as Captured, { action: 'dispatch', prompt: 'go', preset: 'recon' }, caller)
+  await run(captured as Captured, { action: 'run', run: 'r1', nodes: [{ id: 'n1', prompt: 'go', preset: 'recon' }] }, caller)
   const spec = seen[0] as { request: Record<string, unknown> }
   // 全等之外还要单独钉 hasOwn：物化出来的 `{}` 会让「省略」与「显式给空」长得一样。
   assert.strictEqual(Object.hasOwn(spec.request, 'agentOptions'), false,
     '省略 agentOptions 必须让这个键缺席，派发请求与改动前逐字段一致')
 })
 
-it('归一：dispatch 带 nodes 时先写树再派活，一次调用完成建节点+派活+绑定', async () => {
-  // 这条钉的是 2026-09-30 的改动：dispatch 自己也能写节点，于是「建节点 + 派活 + 绑定」
-  // 不再需要先调一次 plan。顺序是硬约束——bind 要求节点已存在，所以 write 必须早于
-  // startContinuable；下面的 order 数组就是那个顺序的一手证据。
+it('归一：run 声明 nodes 时先写树再派活，一次调用完成建节点+派活+绑定', async () => {
+  // 这条原先钉的是 2026-09-30 的改动（dispatch 自己也能写节点）。dispatch 撤掉之后，
+  // 「建节点 + 派活 + 绑定」成了 run 的**唯一**形态，所以这条迁移是收紧而不是放宽：
+  // 顺序仍是硬约束——bind 要求节点已存在，所以 write 必须早于 startContinuable；
+  // 下面的 order 数组就是那个顺序的一手证据。
   const order: string[] = []
   let captured: Captured | undefined
   const ctx = {
@@ -539,11 +569,9 @@ it('归一：dispatch 带 nodes 时先写树再派活，一次调用完成建节
   }
   apply(ctx as never, { provider: 'default', presets: { reader: { persona: 'P' } } })
   const result = await run(captured as Captured, {
-    action: 'dispatch',
-    prompt: 'go',
-    preset: 'reader',
-    nodes: [{ id: 'n1', title: 'do the thing' }],
-    bind: 'n1',
+    action: 'run',
+    run: 'r1',
+    nodes: [{ id: 'n1', title: 'do the thing', prompt: 'go', preset: 'reader' }],
   }, caller)
   // 一次调用同时落了树、起了孩子、绑上了节点。
   assert.deepStrictEqual(
@@ -551,16 +579,18 @@ it('归一：dispatch 带 nodes 时先写树再派活，一次调用完成建节
     ['write:1:false', 'start', 'bind:n1:child-7', 'step:n1:in_progress'],
     'write must precede bind, and bind must be followed by the in_progress promotion',
   )
-  assert.strictEqual(result.task_id, 'child-7')
-  assert.strictEqual(result.node, 'n1')
-  assert.strictEqual(result.status, 'running')
+  // run 的返回值不报节点：绑给自己派出去的孩子这件事由插件登记，中枢只看 dispatched。
+  assert.deepStrictEqual(result, { status: 'running', run: 'r1', dispatched: ['n1'] })
 })
 
-it('bind 把节点推成 in_progress——参数描述承诺的迁移必须真发生', async () => {
+it('派发把节点推成 in_progress——参数描述承诺的迁移必须真发生', async () => {
   // 这条钉的是一个既有 bug：声明写「it moves to in_progress」，而 plan-tree 的 bind
   // 只写 assignedTo、从不碰 status，于是派完节点仍是 pending，还得多调一次 step。
-  // 现在 dispatch 在 bind 之后补一次 step。
-  // 2026-09-30 起它还顺带钉「直连通道的简报也追加了节点指令」——两条通道都得带上。
+  // 现在 `settleDispatch` 在 bind 之后补一次 step —— 两条派发通道共用它。
+  // 2026-09-30 起它还顺带钉「直连通道的简报也追加了节点指令」。
+  //
+  // 本用例测的是**既有节点上的那条收尾顺序**（bind → step），不是"谁写的节点"：
+  // run 只从它自己声明的节点派发，所以这里的节点表声明在 run 上，观察点一字未动。
   const order: string[] = []
   let started: { request?: { prompt?: readonly { text?: string }[] } } | undefined
   let captured: Captured | undefined
@@ -570,7 +600,7 @@ it('bind 把节点推成 in_progress——参数描述承诺的迁移必须真�
       if (key !== 'taskTree') return undefined
       return {
         read: () => [],
-        write: async () => {},
+        write: async () => { order.push('write') },
         step: async (_s: string, nodeId: string, patch: { status?: string }) => {
           order.push(`step:${nodeId}:${String(patch.status)}`)
         },
@@ -588,9 +618,8 @@ it('bind 把节点推成 in_progress——参数描述承诺的迁移必须真�
   on: () => () => {},
   }
   apply(ctx as never, { provider: 'default', presets: {} })
-  // 节点来自更早的一次 plan：本次 dispatch 不写树，只 bind 到既有节点。
-  await run(captured as Captured, { action: 'dispatch', prompt: 'go', bind: 'existing-1' }, caller)
-  assert.deepStrictEqual(order, ['start', 'bind:existing-1:child-5', 'step:existing-1:in_progress'])
+  await run(captured as Captured, { action: 'run', run: 'r1', nodes: [{ id: 'existing-1', prompt: 'go' }] }, caller)
+  assert.deepStrictEqual(order, ['write', 'start', 'bind:existing-1:child-5', 'step:existing-1:in_progress'])
   // 直连通道（`ctx.subagents.startContinuable` 那条）同样追加了节点指令。
   const brief = started?.request?.prompt?.[0]?.text ?? ''
   assert.ok(brief.startsWith('go'), 'original brief must stay first')
@@ -598,7 +627,10 @@ it('bind 把节点推成 in_progress——参数描述承诺的迁移必须真�
   assert.ok(brief.includes('existing-1'), 'the brief must name the bound node')
 })
 
-it('dispatch 省略 nodes 时一个字都不写树——不带 bind 的老用法行为不变', async () => {
+it('run 不给 nodes 时当场抛，一个字节都不写树——「不建节点就派活」的直达通道已经不存在', async () => {
+  // 迁移的判断：原用例钉的是「省略 nodes 时一个字都不写树」——dispatch 的 bind 是可选的，
+  // 于是它真能一次都不碰树就把活派出去。那正是这次要消掉的东西：run 没有 nodes 连
+  // 走都走不动。这条用例因此从"允许"翻成"拒绝"，而且拒绝必须**发生在写树之前**。
   const order: string[] = []
   let captured: Captured | undefined
   const ctx = {
@@ -621,12 +653,21 @@ it('dispatch 省略 nodes 时一个字都不写树——不带 bind 的老用法
   on: () => () => {},
   }
   apply(ctx as never, { provider: 'default', presets: {} })
-  const result = await run(captured as Captured, { action: 'dispatch', prompt: 'go' }, caller)
-  assert.deepStrictEqual(order, ['start'], 'no nodes and no bind must touch the tree not at all')
-  assert.strictEqual('node' in result, false, 'no bind still means the node key is absent')
+  await assert.rejects(
+    () => run(captured as Captured, { action: 'run', run: 'r1' }, caller),
+    /requires a non-empty `nodes` list/,
+  )
+  await assert.rejects(
+    () => run(captured as Captured, { action: 'run', run: 'r1', nodes: [] }, caller),
+    /requires a non-empty `nodes` list/,
+  )
+  assert.deepStrictEqual(order, [], '声明期就拒掉：树、账本、子代理一个都不许动')
 })
 
-it('dispatch 的 replace 标志透传给树写入——整树替换在同一调用里可选', async () => {
+it('run 写树时`replace` 恒为 false——整树替换不是这条路要的东西', async () => {
+  // 迁移的判断：这条原先钉的是「dispatch 把 replace 透传下去」。run **没有** replace 参数，
+  // 而且它写树必须早于派活、节点又必须已经存在，整树替换会把同一份节点表里的兄弟节点
+  // 连同别的流水线一起抹掉。所以这条从"透传"翻成"钉死它只能是 false"。
   const seen: string[] = []
   let captured: Captured | undefined
   const ctx = {
@@ -650,18 +691,31 @@ it('dispatch 的 replace 标志透传给树写入——整树替换在同一调�
   }
   apply(ctx as never, { provider: 'default', presets: {} })
   await run(captured as Captured, {
-    action: 'dispatch', prompt: 'go', replace: true,
-    nodes: [{ id: 'only', title: 'only node' }],
+    action: 'run', run: 'r1',
+    nodes: [{ id: 'only', title: 'only node', prompt: 'go' }],
   }, caller)
-  assert.deepStrictEqual(seen, ['true'])
+  assert.deepStrictEqual(seen, ['false'], 'run 只追加节点，绝不整树替换')
 })
 
-it('dispatch 查不到预设名时抛错，绝不静默继承父的身份', async () => {
-  const { tool } = harness({ tree: true })
-  await assert.rejects(
-    () => run(tool, { action: 'dispatch', prompt: 'go', preset: 'ghost' }, caller),
-    /unknown preset "ghost"/,
-  )
+it('run 的节点点名查不到的预设名时抛错，绝不静默继承父的身份', async () => {
+  // 迁移的判断：这条与入口无关，考的是 `resolvePreset` 的 fail-closed —— 节点自己
+  // 带着身份名，所以从 dispatch 的顶层 preset 搬到 run 的**节点 preset** 上，判据一字不变。
+  // 报错走 `UnknownPresetError`（type 是构造函数名，message 里带 preset 名与已知清单）。
+  const h = harness({ tree: true })
+  const result = await run(h.tool, { action: 'run', run: 'r1', nodes: [{ id: 'n1', prompt: 'go', preset: 'ghost' }] }, caller)
+  // run **不抛**：一个节点派不出去只停它自己那一支（与 `dispatchRunNode` 的 catch 一致），
+  // 所以这条断言搬到了"结果的三个可观测面上"，判据一字没松：
+  //   ① 这个起点没被算作已派出；
+  //   ② 树上留下一条失败原因（面板上看得到）；
+  //   ③ 账本里它仍是 pending —— 不能因为"报了个错"就当成派出去了。
+  assert.deepStrictEqual(result, { status: 'running', run: 'r1', dispatched: [] })
+  const node = h.treeNodes.find(item => item.id === 'n1')
+  assert.equal(node?.assignedTo, undefined, '派不出去的节点不许被绑上孩子')
+  assert.match(String(node?.detail), /UnknownPresetError/, '失败原因必须留在树上：' + String(node?.detail))
+  assert.equal(String(node?.detail).includes('ghost'), true, '原因里必须点出那个查不到的身份名：' + String(node?.detail))
+  const recorded = ledgerNode(h.runsFile, 'n1') as { status?: string; note?: string } | undefined
+  assert.strictEqual(recorded?.status, 'pending', '派不出去就留在 pending：不许当成"派过了"')
+  assert.match(String(recorded?.note), /UnknownPresetError/, '账本 note 也要留痕')
 })
 /**
  * 结果是不是能走无损 JSON 往返：`JSON.parse(JSON.stringify(x))` 必须与原值逐字段相等。
@@ -726,14 +780,23 @@ it('result 只回读，绝不等：结算已经落进会话就报 completed，�
   assert.deepStrictEqual(settled, { task_id: 'child-1', status: 'completed', result: 'settled: done' })
 })
 
-it('dispatch 不传 bind 时返回值里没有 `node` 这个键，且无损往返不丢字段——真机炸点钉在这里', async () => {
-  const { tool } = harness({ children: [] })
-  // 这一条正是真机上炸掉的那个调用形状：只给 prompt，不给 bind。
-  const result = await run(tool, { action: 'dispatch', prompt: 'go' }, makeCaller())
-  assert.deepStrictEqual(result, { task_id: 'child-1', status: 'running' })
+it('返回值里没有 `undefined` 字段，且无损往返不丢字段——真机炸点钉在这里（run 与 result 两条路都过）', async () => {
+  // `children` 给一个已知孩子、但会话历史里没有它的结算通知 ⇒ result 报 running。
+  const { tool } = harness({ children: ['child-1'], tree: true })
+  // 这条钉的是真机上炸掉的那个形状：工具返回值要过运行时的无损序列化器，它拒收任何
+  // `undefined` 字段。旧事故的出点（`node: undefined`）已经从工具面上消失，但**判据本身**
+  // 与入口无关，所以迁移的判断是：把这条从"那个具体调用形状"提升成"对工具面上每条
+  // 会返回对象的路径都成立" —— 这里跑两条分支形状完全不同的：run（返回值带 dispatched
+  // 数组）与 result（返回值带 task_id）。
+  const launched = await run(tool, { action: 'run', run: 'r1', nodes: [{ id: 'n1', prompt: 'go' }] }, makeCaller())
+  assert.deepStrictEqual(launched, { status: 'running', run: 'r1', dispatched: ['n1'] })
+  const settled = await run(tool, { action: 'result', task_id: 'child-1' }, makeCaller())
+  assert.deepStrictEqual(settled, { task_id: 'child-1', status: 'running' })
   // 下面两行是这条测试的要点：走序列化，而不是断言某个字段等于 undefined。
-  assert.strictEqual(hasUndefined(result), false, 'a returned value must carry no undefined')
-  assert.strictEqual(isLossless(result), true, 'the returned value must survive a lossless JSON round-trip')
+  for (const value of [launched, settled]) {
+    assert.strictEqual(hasUndefined(value), false, 'a returned value must carry no undefined')
+    assert.strictEqual(isLossless(value), true, 'the returned value must survive a lossless JSON round-trip')
+  }
 })
 
 /**
@@ -911,19 +974,21 @@ it('ask 动作是提问者自己问的：它写下的节点标题不带角色前
  * 这一条钉的是**没有竞态**：子代理的第一次装配可能发生在 \`startContinuable\` 返回之后、
  * 父把 childId 记下来之前。只有随身份一起走的通道才躲得开那个窗口。
  */
-it('dispatch 把 drop 编进 persona，随身份一起走', async () => {
+it('run 把节点预设的 drop 编进 persona，随身份一起走', async () => {
   const seen: unknown[] = []
   let captured: Captured | undefined
   const ctx = {
     tools: { register: (d: Captured) => { captured = d; return () => {} } },
-    get: () => undefined,
+    get: (key: string) => key === 'taskTree'
+      ? { read: () => [], write: async () => {}, step: async () => {}, bind: async () => {} }
+      : undefined,
     subagents: { resolveMaxDepth: () => 3, startContinuable: async (spec: unknown) => { seen.push(spec); return { childId: 'child-9' } } },
     userQuestions: { ask: async () => ({ answers: [] }) },
     systemPrompt: { section: () => () => {} },
   on: () => () => {},
   }
   apply(ctx as never, { provider: 'default', presets: { scout: { persona: 'P', drop: ['plan:policy'] } } })
-  await run(captured as Captured, { action: 'dispatch', prompt: 'go', preset: 'scout' }, makeCaller())
+  await run(captured as Captured, { action: 'run', run: 'r1', nodes: [{ id: 'n1', prompt: 'go', preset: 'scout' }] }, makeCaller())
   const persona = (seen[0] as { request: { persona: string } }).request.persona
   assert.deepStrictEqual(decodeDropDirective(persona), { drop: ['plan:policy'], text: 'P' })
 })
@@ -964,7 +1029,7 @@ it('丢弃列表点到自己时也不丢 persona —— 丢身份不是这一项
 
 
 
-it('无 preset 的派发走 lead 身份，绝不继承父的 persona —— 这条钉的是实测到的那个缺陷', async () => {
+it('无 preset 的派发节点走 lead 身份，绝不继承父的 persona —— 这条钉的是实测到的那个缺陷', async () => {
   // 缺陷现场：子会话 3872e115 的 system-prompt 首段逐字是父的 persona
   // （# 总纲（用户至上） / ## 身份层（persona）/ ## 覆盖声明，还写着已废弃的 plan_write），
   // 根因就是「没给 preset ⇒ 不覆盖 persona ⇒ composeFrom 把父那一层继承下去」。
@@ -972,7 +1037,9 @@ it('无 preset 的派发走 lead 身份，绝不继承父的 persona —— 这�
   let captured: Captured | undefined
   const ctx = {
     tools: { register: (d: Captured) => { captured = d; return () => {} } },
-    get: () => undefined,
+    get: (key: string) => key === 'taskTree'
+      ? { read: () => [], write: async () => {}, step: async () => {}, bind: async () => {} }
+      : undefined,
     subagents: {
       resolveMaxDepth: () => undefined,
       startContinuable: async (spec: unknown) => { seen.push(spec); return { childId: 'child-x' } },
@@ -982,17 +1049,20 @@ it('无 preset 的派发走 lead 身份，绝不继承父的 persona —— 这�
     on: () => () => {},
   }
   apply(ctx as never, { provider: 'default', defaultRules: 'RULES', runsFile: '', presets: { lead: { persona: '你是中枢。' }, recon: { persona: '你是侦察。' } } })
-  await run(captured as Captured, { action: 'dispatch', prompt: 'go' }, caller)
+  // 节点的 preset 已迁移成预设名数组，未知名字现在在注册期就抛。
+  await run(captured as Captured, { action: 'run', run: 'r1', nodes: [{ id: 'n1', prompt: 'go' }] }, caller)
   const spec = seen[0] as { request: Record<string, unknown> }
   assert.strictEqual(spec.request.persona, '你是中枢。')
 })
 
-it('显式给了身份名就按身份走，与默认那支互不干扰', async () => {
+it('节点显式给了身份名就按身份走，与默认那支互不干扰', async () => {
   const seen: unknown[] = []
   let captured: Captured | undefined
   const ctx = {
     tools: { register: (d: Captured) => { captured = d; return () => {} } },
-    get: () => undefined,
+    get: (key: string) => key === 'taskTree'
+      ? { read: () => [], write: async () => {}, step: async () => {}, bind: async () => {} }
+      : undefined,
     subagents: {
       resolveMaxDepth: () => undefined,
       startContinuable: async (spec: unknown) => { seen.push(spec); return { childId: 'child-y' } },
@@ -1002,7 +1072,7 @@ it('显式给了身份名就按身份走，与默认那支互不干扰', async (
     on: () => () => {},
   }
   apply(ctx as never, { provider: 'default', presets: { lead: { persona: '你是中枢。' }, recon: { persona: '你是侦察。', deny: ['edit', 'write'] } } })
-  await run(captured as Captured, { action: 'dispatch', prompt: 'go', preset: 'recon' }, caller)
+  await run(captured as Captured, { action: 'run', run: 'r1', nodes: [{ id: 'n1', prompt: 'go', preset: 'recon' }] }, caller)
   const spec = seen[0] as { request: Record<string, unknown> }
   // persona 前缀会挂一层丢弃指令：deny 掉的工具，其说明段不该留在这一支的提示词里。
   assert.deepStrictEqual(
@@ -1293,7 +1363,7 @@ it('派发简报里的两行状态文案，就是结算监听器认的那两行�
     on: () => () => {},
   }
   apply(ctx as never, { provider: 'default', presets: {} })
-  await run(captured as Captured, { action: 'dispatch', prompt: 'go', bind: 'impl' }, caller)
+  await run(captured as Captured, { action: 'run', run: 'r1', nodes: [{ id: 'impl', prompt: 'go' }] }, caller)
   assert.ok(brief.includes('【节点状态】'), '锚点不许动')
   assert.ok(brief.includes('impl'), '必须点名被绑定的节点')
   assert.ok(brief.includes('状态：完成'), '成功行必须与解析器逐字一致（全角冒号）')
@@ -1878,7 +1948,7 @@ it('槽位的声明期校验：不属于本节点 needs / 不在本次 run 里 �
   assert.ok(brief.includes('{{ A }} 与 {{}} 都不是槽位'), '不是槽位的写法必须原样留在简报里：' + brief)
 })
 
-it('「结论要简略」那一句只进 run 链路的简报：位置在状态行那句之后、结论摘要那句之前；dispatch 动作逐字不变', async () => {
+it('「结论要简略」那一句只进 run 链路的简报：位置在状态行那句之后、结论摘要那句之前；resume 那条路逐字不变', async () => {
   const ledger = freshLedgerFile()
   const history: FakeMessage[] = []
   const parent = { session: { id: SESSION, deriveMessages: () => history } }
@@ -1894,13 +1964,77 @@ it('「结论要简略」那一句只进 run 链路的简报：位置在状态�
   const brief = briefOf(h.starts[1])
   assert.ok(brief.includes(concise), brief)
   assert.ok(brief.indexOf('（failed）。') < brief.indexOf(concise), '必须排在状态行那句之后')
-  assert.ok(brief.indexOf(concise) < brief.indexOf('这一行之后**再另起一行**写一句结论摘要'), '必须排在结论摘要那句之前')
-  // `dispatch` 动作：同一份 withNodeBrief，但不给 concise —— 简报必须逐字不变。
-  await run(h.tool, { action: 'dispatch', prompt: 'go', bind: 'whatever' }, caller)
-  const dispatched = briefOf(h.starts[h.starts.length - 1])
-  assert.ok(dispatched.includes('【节点状态】'), dispatched)
-  assert.equal(dispatched.includes('建议 ≤500 字'), false, 'dispatch 的简报不许出现这一句：' + dispatched)
-  assert.equal(dispatched.includes(concise), false, 'dispatch 的简报不许出现这一句：' + dispatched)
+  // 这一句必须**整个**落在「节点状态」段里、且排在结尾那句之前。
+  // 原来的锚点（'这一行之后**再另起一行**写一句结论摘要'）在 2026-10-02 那次改动里
+  // 与状态行一起从 `withNodeBrief` 里撤掉了，锚点本身已经不在简报里 —— 用旧文案量顺序
+  // 只会量到一个 -1。判据换成两条**都在同一份简报里**的位置：节点段锚点与结尾那句。
+  assert.ok(brief.indexOf('【节点状态】') < brief.indexOf(concise), '必须在节点指令段之内')
+  assert.ok(brief.indexOf(concise) < brief.indexOf('结论摘要进节点的 detail'), '必须排在结尾那句之前')
+  // `run` 的另一条类入口：`resume` 把**已派出但没干成**的节点交回**它原来那个孩子**接着干。
+  //
+  // 这一条钉的是「那一句只属于 run 的**首次派发**」。resume 不走 `withNodeBrief`
+  // （`resumeNode` 只送 `composeBrief(upstream) + RESUME_NOTE`，见 src/index.ts:1471），
+  // 所以那一句、连同节点指令段，在它的简报里**一个字都不该出现**。
+  // 交付的节点必须是**还没完成**的那一个：A 已经结算成 completed，resume 它会当场抛。
+  await run(h.tool, { action: 'run', run: 'r1', resume: 'B' }, makeCaller())
+  const last = h.sent[h.sent.length - 1] as { content?: readonly { text?: string }[] }
+  const resumed = last.content?.[0]?.text ?? ''
+  assert.ok(resumed.includes('第二步'), '简报本体照常送出：' + resumed)
+  assert.equal(resumed.includes('建议 ≤500 字'), false, 'resume 的简报不许出现这一句：' + resumed)
+  assert.equal(resumed.includes(concise), false, 'resume 的简报不许出现这一句：' + resumed)
+  assert.equal(resumed.includes('【节点状态】'), false, 'resume 不走 withNodeBrief，节点指令段不许出现：' + resumed)
+})
+
+/**
+ * 本次收口改动是**有风险**的：枚举里删掉了 `dispatch`，派活这件事整个挪到了 `run` 上。
+ * 所以必须有一条用例**真跑一次 `run`**，证明孩子真的被派出去了 —— 而不是只断言
+ * 「参数形状对」（那种断言在派活整条链路断掉时照样是绿的，等于没测）。
+ *
+ * 「被派出去」这里落在三件可观测的事实上，缺一不可：
+ *   ① 启动请求确实进了 `ctx.subagents.startContinuable`（真机就是这条路把孩子生出来的），
+ *      而且带上的是本次那个节点：`parent` 是当刻活着的 Agent、identity 挂在 label 上、
+ *      简报在 `request.prompt` 里、节点状态指令也拼了进去；
+ *   ② 工具返回值把这一批算作已派出；
+ *   ③ 节点**已经建成**（写进会话的树）**且被推成 `in_progress`** —— 孩子已经在干它了。
+ */
+it('run 真的能派活：启动请求进了 startContinuable，节点建成并被推成 in_progress', async () => {
+  const ledger = freshLedgerFile()
+  const parent = { session: { id: SESSION } }
+  const h = harness({ tree: true, runsFile: ledger, parentAgent: parent })
+
+  const result = await run(h.tool, {
+    action: 'run',
+    run: 'r1',
+    nodes: [{ id: 'A', prompt: '把 A 干完', label: '实现' }],
+  }, makeCaller([]))
+
+  // ① 孩子真的起来了：启动请求进了那条唯一的孩子创建通道。
+  assert.equal(h.starts.length, 1, '必须真的走了一次 startContinuable')
+  const spec = h.starts[0] as { label?: string; request?: { parent?: unknown; prompt?: readonly { text?: string }[] } }
+  // 宿主侧用的是 agent.agent（带 deriveMessages 的那个），所以这里钉身份而不是钉引用。
+  assert.equal((spec.request?.parent as { session?: { id?: string } })?.session?.id, SESSION,
+    'request.parent 必须是当刻活着的那条会话的 Agent 本身')
+  // 显示名由**生效的身份键**决定（没点名 preset ⇒ lead），不是调用方自由填的 label：
+  // 面板上那个名字只有对上真正跑的身份才有意义。
+  assert.equal(spec.label, '中枢', '身份显示名要挂在这条通道上')
+  const brief = spec.request?.prompt?.[0]?.text ?? ''
+  assert.ok(brief.startsWith('把 A 干完'), '简报本体原样在最前面：' + brief)
+  assert.ok(brief.includes('【节点状态】'), '节点状态指令必须一起送出去：' + brief)
+
+  // ② 返回值把这一批算作已派出。
+  assert.deepStrictEqual(result, { status: 'running', run: 'r1', dispatched: ['A'] })
+
+  // ③ 节点建成、且已经是 in_progress（孩子开始干了，它不是还躺在 pending 上）。
+  const node = h.treeNodes.find(item => item.id === 'A')
+  assert.ok(node !== undefined, 'run 声明的节点必须真的写进了树')
+  assert.strictEqual(node?.assignedTo, 'child-1', '节点要绑到这次派出去的那个孩子上')
+  assert.strictEqual(node?.status, 'in_progress', '派完就是 in_progress —— 参数描述承诺的迁移必须真发生')
+  assert.ok(h.treeCalls.includes('write:sess-1:false'), '先写树再派活：' + JSON.stringify(h.treeCalls))
+
+  // 账本也落了：重启之后这条 run 还在，节点是 dispatched 而不是 pending。
+  const recorded = ledgerNode(ledger, 'A') as { status?: string; childId?: string } | undefined
+  assert.strictEqual(recorded?.status, 'dispatched')
+  assert.strictEqual(recorded?.childId, 'child-1')
 })
 
 it('派发失败留下的 detail：把原因修好、重新评估并成功派发之后被换成一行「已派发」', async () => {
