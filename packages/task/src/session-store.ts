@@ -101,6 +101,15 @@ export interface RunRecord {
   readonly createdAt: number
   /** 这条 run 的节点。 */
   readonly nodes: readonly RunNodeRecord[]
+  /**
+   * 这条 run 住在哪条**隔离线**上（worktree 账本里的线名）。
+   *
+   * 为什么记在这里而不是只记在 worktree 账本里：起线的那个动作（`run`）与
+   * 用线的那个动作（自动放行派后继）之间隔着很多轮，run 必须自带这个键 ——
+   * 否则后继节点会在主检出上开工，而那是这条线唯一要防的事。
+   * 省略 = 这条 run 没有隔离（老行为一字不变）。
+   */
+  readonly worktree?: string
 }
 
 /** 整份账本：会话 id → 这条会话声明的 run 列表。与树一样按会话分区。 */
@@ -253,7 +262,9 @@ function parseRunRecord(value: unknown): RunRecord | undefined {
     nodes.push(node)
   }
   const createdAt = typeof value.createdAt === 'number' && Number.isFinite(value.createdAt) ? value.createdAt : 0
-  return { id: value.id, createdAt, nodes }
+  // worktree 必须**读回来**：整份账本是读完-改-写回去的，不认这一格的话，
+  // 下一次任何一条记账都会把「这条 run 住在哪条线上」抹掉 —— 于是后继节点回落主检出。
+  return { id: value.id, createdAt, nodes, ...typeof value.worktree === 'string' ? { worktree: value.worktree } : {} }
 }
 
 /**

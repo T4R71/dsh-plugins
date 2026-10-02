@@ -19,6 +19,9 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { RUN_NOTE_MAX, TASK_RUNS_FILE_ENV, TASK_RUNS_FILE_NAME, ledgerPathFor, runNodeWith, type RunNodeRecord } from '../src/session-store.ts'
 import { defineTool, type InferArgs, type ParameterJsonSchema, type ParameterSchemaSpec } from '@deepseek-ai/dsh-tools'
+// 隔离那一半的测试要真的建 git 仓：起线/复用/写穿检测都是 git 层面的行为，
+// 用假件替掉就等于把要测的东西替掉了。
+import { git, gitWithIdentity, worktreeMatches, worktreePathFor } from '../src/worktree.ts'
 
 /** 模型入参的推导类型；假调用者不是 `ToolRunContext`，所以下面把 exec 放宽成 unknown。 */
 type TaskArgs = InferArgs<ParameterSchemaSpec>
@@ -161,7 +164,7 @@ function ledgerFileAbsent(file: string): boolean {
  *   （或直接给一个 `taskRuns` 服务）、父 Agent 是谁。
  * @returns 被注册的工具定义、调用记录、目录查询记录，以及可变的会话历史。
  */
-function harness(options: { tree?: boolean; children?: readonly (string | { readonly id: string; readonly createdAt: number; readonly mode: 'one-shot' | 'continuable' | 'unknown'; readonly label?: string })[]; answers?: { id: string; selected: string[] }[]; presets?: Record<string, { persona?: string; allow?: string[]; deny?: string[]; maxDepth?: number; drop?: string[]; agentOptions?: { provider?: string; model?: string; reasoningEffort?: string; maxTokens?: number } }>; defaultRules?: string; runsFile?: string; parentAgent?: Record<string, unknown>; beforeStart?: () => void } = {}): {
+function harness(options: { tree?: boolean; children?: readonly (string | { readonly id: string; readonly createdAt: number; readonly mode: 'one-shot' | 'continuable' | 'unknown'; readonly label?: string })[]; answers?: { id: string; selected: string[] }[]; presets?: Record<string, { persona?: string; allow?: string[]; deny?: string[]; maxDepth?: number; drop?: string[]; agentOptions?: { provider?: string; model?: string; reasoningEffort?: string; maxTokens?: number } }>; defaultRules?: string; runsFile?: string; worktreesFile?: string; worktreeGoal?: string; worktreeVerify?: string; worktreeMergeVerify?: string; worktreePrepare?: string; worktreeAuto?: boolean; parentAgent?: Record<string, unknown>; beforeStart?: () => void } = {}): {
   tool: Captured
   calls: string[]
   listed: string[]
@@ -175,6 +178,7 @@ function harness(options: { tree?: boolean; children?: readonly (string | { read
   starts: unknown[]
   sent: { agent: unknown; target: unknown; content: unknown; options: unknown }[]
   runsFile: string
+  worktreesFile: string
 } {
   const calls: string[] = []
   const listed: string[] = []
@@ -318,15 +322,27 @@ function harness(options: { tree?: boolean; children?: readonly (string | { read
     getSectionOrder: () => 0,
   },
   }
+  // worktree 账本**也在临时目录里**：它和 run 账本同一条纪律 —— 测试绝不碰真实 profile。
+  // 不隔离的话，同一台机器上别的 harness（甚至真实的插件进程）会互相看见彼此的线。
+  const worktreesFile = options.worktreesFile ?? join(mkdtempSync(join(tmpdir(), 'task-wt-spec-')), 'task-worktrees.json')
   const config: ResolvedConfig = {
     provider: 'default',
     defaultRules: options.defaultRules ?? '',
     presets: options.presets ?? {},
     runsFile,
+    worktreesFile,
+    worktreeGoal: options.worktreeGoal ?? '',
+    worktreeVerify: options.worktreeVerify ?? '',
+    worktreeMergeVerify: options.worktreeMergeVerify ?? '',
+    worktreePrepare: options.worktreePrepare ?? '',
+    // **默认关**：这些用例测的是别的功能，而「默认自动起隔离线」会把它们全部卷进
+    // 「要有一个干净的 git 仓」这件与它们无关的前提里。要测隔离的用例显式打开它。
+    // 默认值本身由「注册期的参数 DSL」那一带的配置断言钉住（zod 的 default 是 true）。
+    worktreeAuto: options.worktreeAuto ?? false,
   }
   apply(ctx as never, config)
   assert.ok(captured !== undefined, 'apply must register exactly one tool')
-  return { tool: captured, calls, listed, messages, treeNodes, nodesOf, treeCalls, sections, listeners, notified, starts, sent, runsFile }
+  return { tool: captured, calls, listed, messages, treeNodes, nodesOf, treeCalls, sections, listeners, notified, starts, sent, runsFile, worktreesFile }
 }
 
 /**
@@ -342,7 +358,7 @@ function makeCaller(messages: FakeMessage[] = [], signal: AbortSignal = AbortSig
 /** 一个带 session 的假调用者。 */
 const caller = makeCaller()
 
-it('注册期的参数 DSL 能编译，且编出来的动作全集就是那九个', () => {
+it('注册期的参数 DSL 能编译，且编出来的动作全集就是那十一个', () => {
   const { tool } = harness()
   assert.strictEqual(tool.name, 'task')
   // `defineTool` 在注册时把参数 DSL 编成 JSON Schema 写进定义（实测：`defineTool` 返回的
@@ -350,7 +366,7 @@ it('注册期的参数 DSL 能编译，且编出来的动作全集就是那九�
   const properties = tool.parameters.properties as { action?: { enum?: readonly string[] } }
   assert.deepStrictEqual(
     properties.action?.enum,
-    ['plan', 'step', 'ask', 'dispatch', 'run', 'send', 'interrupt', 'list', 'result'],
+    ['plan', 'step', 'ask', 'dispatch', 'commit', 'run', 'send', 'interrupt', 'list', 'result', 'worktree'],
   )
 })
 
@@ -405,7 +421,7 @@ it('未知动作在参数层就被拒，报错把合法动作全集列出来', a
   // 报错里带合法集合；`execute` 的 `default` 分支对模型不可达。
   await assert.rejects(
     () => run(tool, { action: 'nope' }, caller),
-    /invalid arguments: "action" must be one of \["plan","step","ask","dispatch","run","send","interrupt","list","result"\]/,
+    /invalid arguments: "action" must be one of \["plan","step","ask","dispatch","commit","run","send","interrupt","list","result","worktree"\]/,
   )
 })
 
@@ -1543,8 +1559,9 @@ it('账本路径不是 volatile：它只用来挪文件，绝不进设置页的�
   //   2) 放到单独的 Loader 行上 —— 那一行在这个宿主里没装载成功，而 Loader 只把错误写进没人
   //      读得到的 logger，账本于是**静默地记不住**。
   // 现在账本是一个文件，task 行上只留一个可选的文件位置，而且**不是** volatile。
-  assert.deepStrictEqual(Object.keys(TaskRowConfig.dict ?? {}).sort(), ['defaultRules', 'presets', 'provider', 'runsFile'],
-    'task 行就这四格：账本本体不在配置里，只有一个位置开关')
+  assert.deepStrictEqual(Object.keys(TaskRowConfig.dict ?? {}).sort(),
+    ['defaultRules', 'presets', 'provider', 'runsFile', 'worktreeAuto', 'worktreeGoal', 'worktreeMergeVerify', 'worktreePrepare', 'worktreeVerify', 'worktreesFile'],
+    'task 行就这几格：账本本体不在配置里，只有位置开关与几个默认值（隔离那一半）')
   assert.notStrictEqual(TaskRowConfig.dict?.runsFile?.meta.volatile, true,
     'runsFile 绝不能是 volatile：那会让它出现在设置页的可热改字段里')
   assert.strictEqual(TASK_RUNS_FILE_NAME, 'task-runs.json', '默认文件名固定，便于排障时找得到')
@@ -2338,7 +2355,10 @@ it('过程记录提醒（2026-10-01 冻结 v3）：只进「本插件派出的�
   const text = String(reminder?.text ?? '')
   // **逐字**：中枢 2026-10-01 冻结的那一段（v3，强制语气、只留三个要求 + 并行许可）。
   // 改一个字这条就会红 —— 这正是它存在的意义。
-  assert.equal(text, '【过程记录（必须）】多步的活：**开工第一步必须**用 `task plan` 在**你自己的任务树**里写下阶段计划（分几段、每段做什么由你自己定）；**每完成一段必须**用 `task step` 推进到 completed，并在 detail 里写下这一段的结论。阶段之间**可以并行**，不要求先后顺序。')
+  // **逐字**：中枢 2026-10-01 冻结的那一段仍在最前，后面**原样追加**一句常驻的隔离纪律。
+  // 追加而不是改写：那一段是按「每轮常驻成本」量过的，改它等于把量过的账作废。
+  assert.equal(text, '【过程记录（必须）】多步的活：**开工第一步必须**用 `task plan` 在**你自己的任务树**里写下阶段计划（分几段、每段做什么由你自己定）；**每完成一段必须**用 `task step` 推进到 completed，并在 detail 里写下这一段的结论。阶段之间**可以并行**，不要求先后顺序。'
+    + '改代码的派发**默认自动**开隔离检出（重试复用同一条线；只读的活传 worktree: "-" 关掉）：提交走 task commit 并如实记录验证方式，合回后跑整套检查、过了才统一提交主线。')
   // 要点逐条点名（文案冻结之后只能用**子串**断言，但每一条都是用户点名要的）。
   assert.ok(text.includes('必须'), '要点：语气是强制的：' + text)
   assert.ok(text.startsWith('【过程记录（必须）】'), '锚点必须逐字在：' + text)
@@ -2355,5 +2375,132 @@ it('过程记录提醒（2026-10-01 冻结 v3）：只进「本插件派出的�
   const stranger = await assembleFor(h.listeners, 'sess-other')
   assert.strictEqual(stranger.result, stranger.produced, '没被派出的会话必须原样返回同一个引用')
   assert.equal(JSON.stringify(stranger.produced).includes('【阶段建议】'), false)
+})
+
+/**
+ * 造一个**干净的**临时 git 仓，专供「隔离线」那几条用例当会话 cwd。
+ *
+ * 干净是刻意的：`createWorktree` 对脏检出是**拒绝**。不建出真仓的话，
+ * 「默认自动隔离」这件事根本无从断言 —— 起线第一步就是 `git worktree add`。
+ * @returns 仓库根目录的绝对路径。
+ */
+async function repoForLines(): Promise<string> {
+  const repo = mkdtempSync(join(tmpdir(), 'task-line-repo-'))
+  await git(repo, ['init', '--quiet'])
+  writeFileSyncNode(join(repo, 'README.md'), '# seed\n', 'utf8')
+  await git(repo, ['add', '-A'])
+  await gitWithIdentity(repo, ['commit', '--no-verify', '-m', 'seed'])
+  return repo
+}
+
+/**
+ * worktree 账本里在飞的线名（排序）。
+ * @param file - 账本文件路径。
+ * @returns 线名；文件不存在或读不动时是空表。
+ */
+function lineNames(file: string): string[] {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(readFileSyncNode(file, 'utf8'))
+  } catch {
+    return []
+  }
+  const items = (parsed as { worktrees?: unknown } | undefined)?.worktrees
+  return isPlainRecord(items) ? Object.keys(items).sort() : []
+}
+
+/**
+ * 一个把**会话 cwd** 指到某个仓里的假调用者。
+ *
+ * 会话 cwd 走的是会话 header（`childSessionMeta` 写的就是它），所以这里照真实形状给：
+ * `agent.session.header.cwd`。不加这一格的话起线会退回宿主进程的 cwd ——
+ * 那是本仓的源码目录，测试会真的在开发者自己的检出上建 worktree。
+ * @param repo - 这次会话在哪个仓里干活。
+ * @returns 假的 exec。
+ */
+function callerIn(repo: string): unknown {
+  return { agent: { session: { id: SESSION, header: { cwd: repo } } }, signal: AbortSignal.timeout(2000) }
+}
+
+it('默认自动：改代码的派发**不给** worktree 也会自己开一条线，简报里带线名与检出路径', async () => {
+  const repo = await repoForLines()
+  const h = harness({ tree: true, runsFile: freshLedgerFile(), worktreeAuto: true, worktreePrepare: '' })
+  await run(h.tool, { action: 'dispatch', prompt: 'go', bind: 'A' }, callerIn(repo))
+  const names = lineNames(h.worktreesFile)
+  assert.equal(names.length, 1, '默认档必须自己开出一条线：' + JSON.stringify(names))
+  // 线名 = auto-<可读键>-<会话+键的短哈希>：可读的那半给人看，哈希那半保证不撞。
+  assert.match(names[0] as string, /^auto-a-[0-9a-f]{8}$/)
+  assert.equal(await worktreeMatches(worktreePathFor(repo, names[0] as string), 'wt/' + names[0]), true)
+  const brief = briefOf(h.starts[0])
+  assert.ok(brief.startsWith('【隔离检出（重要）】'), '简报必须以隔离前言开头：' + brief)
+  assert.ok(brief.includes('线名：`' + names[0] + '`'), brief)
+  assert.ok(brief.includes(worktreePathFor(repo, names[0] as string)), '检出绝对路径要逐字给出：' + brief)
+  assert.ok(brief.includes('go'), '孩子自己的活还在：' + brief)
+})
+
+it('显式关闸：worktree: "-" 的派发不建线，一个字节都不写', async () => {
+  const repo = await repoForLines()
+  const h = harness({ tree: true, runsFile: freshLedgerFile(), worktreeAuto: true, worktreePrepare: '' })
+  await run(h.tool, { action: 'dispatch', prompt: 'go', worktree: '-' }, callerIn(repo))
+  assert.deepStrictEqual(lineNames(h.worktreesFile), [])
+  assert.equal(ledgerFileAbsent(h.worktreesFile), true, '关闸档连账本文件都不该创建')
+  assert.equal(h.starts.length, 1, '关闸只关隔离，不关派发')
+  assert.ok(!briefOf(h.starts[0]).includes('【隔离检出'), briefOf(h.starts[0]))
+})
+
+it('worktreeAuto=false：退回老行为（这一格是显式关掉的，默认是开的）', async () => {
+  const repo = await repoForLines()
+  const h = harness({ tree: true, runsFile: freshLedgerFile(), worktreePrepare: '' })
+  await run(h.tool, { action: 'dispatch', prompt: 'go' }, callerIn(repo))
+  assert.deepStrictEqual(lineNames(h.worktreesFile), [])
+  assert.ok(!briefOf(h.starts[0]).includes('【隔离检出'), briefOf(h.starts[0]))
+})
+
+it('schema 默认值：worktreeAuto 默认 true —— 纪律是默认开的，关掉要显式写', async () => {
+  const dict = TaskRowConfig.dict ?? {}
+  assert.equal((dict.worktreeAuto as { meta?: { default?: unknown } } | undefined)?.meta?.default, true,
+    'worktreeAuto 的默认值必须是 true，否则「默认就走隔离线」只是句口号')
+})
+
+it('同名 = 同一条线：第二次同名的派发接着用那条线，不重建、也不撞「分支已存在」', async () => {
+  const repo = await repoForLines()
+  const h = harness({ tree: true, runsFile: freshLedgerFile(), worktreePrepare: '' })
+  await run(h.tool, { action: 'dispatch', prompt: 'go', bind: 'A', worktree: 'line-1' }, callerIn(repo))
+  await run(h.tool, { action: 'dispatch', prompt: 'go again', bind: 'A', worktree: 'line-1' }, callerIn(repo))
+  assert.deepStrictEqual(lineNames(h.worktreesFile), ['line-1'])
+  assert.equal(await worktreeMatches(worktreePathFor(repo, 'line-1'), 'wt/line-1'), true)
+  assert.equal(h.starts.length, 2, '两次都真的派出去了')
+  assert.ok(briefOf(h.starts[1]).includes('线名：`line-1`'), briefOf(h.starts[1]))
+})
+
+it('起线失败就拒派：脏主检出时默认档当场抛，并在报错里给出关闸写法', async () => {
+  const repo = await repoForLines()
+  writeFileSyncNode(join(repo, 'README.md'), '# dirty\n', 'utf8')
+  const h = harness({ tree: true, runsFile: freshLedgerFile(), worktreeAuto: true, worktreePrepare: '' })
+  await assert.rejects(
+    () => run(h.tool, { action: 'dispatch', prompt: 'go' }, callerIn(repo)),
+    /worktree: "-"/,
+  )
+  assert.equal(h.starts.length, 0, '线起不来 ⇒ 一个孩子都不许派出去（绝不降级成在主检出上跑）')
+})
+
+it('run：默认档给整条流水线开一条线，账本里记着这条 run 住在哪条线上', async () => {
+  const repo = await repoForLines()
+  const ledger = freshLedgerFile()
+  const h = harness({ tree: true, runsFile: ledger, worktreeAuto: true, worktreePrepare: '' })
+  await run(h.tool, { action: 'run', run: 'r1', nodes: [{ id: 'A', prompt: 'a' }] }, callerIn(repo))
+  const names = lineNames(h.worktreesFile)
+  assert.equal(names.length, 1, JSON.stringify(names))
+  assert.match(names[0] as string, /^auto-r1-[0-9a-f]{8}$/)
+  assert.equal(ledgerRuns(ledger)[0]?.worktree, names[0], 'run 必须自带线名：自动放行的后继靠它找回同一份代码')
+  assert.ok(briefOf(h.starts[0]).includes('线名：`' + names[0] + '`'), briefOf(h.starts[0]))
+})
+
+it('commit：点名一条不存在的线当场抛，并把在飞的线列出来', async () => {
+  const h = harness({ tree: true, runsFile: freshLedgerFile() })
+  await assert.rejects(
+    () => run(h.tool, { action: 'commit', line: 'nope', units: ['u'] }, makeCaller()),
+    /no isolated line named "nope"/,
+  )
 })
 

@@ -88,6 +88,30 @@ import {
   type RunSpecNode,
   type TaskRunsService,
 } from './session-store.ts'
+// 并行修改的隔离那一半（起线 / 提交 / 合回 / 写穿检测）与它的账本都在下面两个模块里。
+// 拆开是为了让本文件的改动面尽量小 —— 合回主线时冲突面也小。
+import {
+  commitFeature,
+  createWorktree,
+  detectLeak,
+  dropWorktree,
+  finalizeReport,
+  isolationPreamble,
+  findMaterializedLinks,
+  mergeWorktree,
+  prepareWorktree,
+  readRepoLayout,
+  worktreeMatches,
+  worktreeWorkflowNote,
+  type WorkUnit,
+} from './worktree.ts'
+import {
+  createWorktreeStore,
+  worktreesPathFor,
+  type WorktreePrepared,
+  type WorktreeRecord,
+  type WorktreeStore,
+} from './worktree-state.ts'
 
 /**
  * 决策节点的 id 前缀。`ask` 写下的每一个问题都带这个前缀，
@@ -336,12 +360,69 @@ export interface ResolvedConfig {
   /**
    * 后端账本文件的位置；空串走 `ledgerPathFor` 的默认位置。
    *
-   * 两格都标成可选是**实情**而不是宽容：schema 里它们各有默认值（空串），所以「没写」
-   * 与「写空串」在解析之后是同一件事，代码里两处也都按 `?? ''` 读。这样单测可以直接
-   * 只给真正要考的那几格，不必抄一遍默认值 —— 抄出来的默认值一旦哪天变了，测试还会
-   * 静默绿着。
+   * 上面 `defaultRules` 与这一格、以及下面 worktree 的那几格**都标成可选**，是**实情**
+   * 而不是宽容：schema 里每一格都有默认值（文本格是空串，`worktreePrepare` 的默认是
+   * `pnpm install --frozen-lockfile`，`worktreeAuto` 是 true），真实部署经 `Config`
+   * 解析之后每一格都是填满的；代码里也各按自己的兜底读 —— 文本格 `?? ''`，
+   * `worktreeAuto` 按 `=== true` 判（省略即最保守的那一档）。这样单测与老调用方可以
+   * 直接只给真正要考的那几格，不必抄一遍默认值 —— 抄出来的默认值一旦哪天变了，
+   * 测试还会静默绿着。
    */
   readonly runsFile?: string
+  /**
+   * worktree 账本文件的位置（在飞的隔离线住在哪儿）。
+   *
+   * **这一格与下面那几格都是可选的**：省略时按**最保守**的档走 —— 不隔离、不装依赖、
+   * 没有验证命令、不能合回。老调用方（测试里那些只写四格的 `apply(ctx, {...})`）因此
+   * 不会被卷进「要有一个干净的 git 仓」这件与它们无关的前提里；而真实部署走
+   * {@link Config} 的 zod 默认值，每一格都是填满的。
+   *
+   * 空串（默认）走 {@link worktreesPathFor}：**与 run 账本同目录同名规律** ——
+   * 两半状态必须住在一起，「重启之后去哪儿读回来」才只有一个答案。
+   */
+  readonly worktreesFile?: string
+  /**
+   * 起线时默认挂在简报开头的**线意图**。
+   *
+   * 它是这条线「在干什么、别碰哪些文件」的一句话。逐条派发时中枢可以覆盖它；
+   * 这条默认值存在的原因是：**常态化的隔离不能依赖中枢每次记得写**。
+   */
+  readonly worktreeGoal?: string
+  /**
+   * 这条线**没有**声明机械验证命令时，用哪一条当默认。空串表示没有默认。
+   *
+   * 为什么要有它：机械验证只有中枢知道（`npx tsc -b` / `pnpm test` 是仓级知识），
+   * 而「每一条线都要手写一遍」这件事在常态化之下必然会被漏掉。
+   */
+  readonly worktreeVerify?: string
+  /**
+   * 合回时那条**整套检查**的默认命令。空串表示没有默认（那就必须逐条声明，否则不能合回）。
+   */
+  readonly worktreeMergeVerify?: string
+  /**
+   * 装依赖用哪条命令。默认 `pnpm install --frozen-lockfile`。
+   *
+   * **为什么默认带 `--frozen-lockfile`**：它正是「这条线的依赖与主线一致」这句话的判据 ——
+   * 锁文件与 workspace 不一致时它当场失败（实测过：`pnpm-lock.yaml` 被 gitignore、
+   * 或者锁文件里少了某个包的 importer，都会在这里炸），而这比「装上一个不一致的树、
+   * 合回验证过了、上主线才炸」好得多。要绕开就显式改这一格。
+   */
+  readonly worktreePrepare?: string
+  /**
+   * **改代码的派发默认就走隔离线**（用户 2026-10-02 拍的板）。
+   *
+   * true 时，`dispatch` / `run` **不给 `worktree` 参数也会自动开一条线**：
+   * 线名由插件按「会话 + 目标」生成，同一个目标重试/续跑复用同一条。
+   * 只做只读调研、确实不该隔离的派发，显式传 `worktree: "-"` 关掉。
+   *
+   * 关掉这一格就退回「要不要隔离由中枢每次记得说」——那正是这套纪律要消灭的东西，
+   * 所以 **schema 的默认是 true**：真实部署经 `Config` 解析之后这一格永远是 true。
+   * 而**直接**构造配置（单测、老调用方）省略这一格时是**不开**的 —— 代码按 `=== true`
+   * 判，于是「省略」落在最保守的那一档，不会因为类型标了可选反而更激进。
+   * 它**不是**可以偷偷降级的开关：开着的这条路上，线起不来（主检出脏、不是 git 仓、
+   * 依赖对不上）时派发**当场失败**，绝不改成「那就在主检出上跑吧」。
+   */
+  readonly worktreeAuto?: boolean
 }
 
 /**
@@ -385,7 +466,7 @@ export interface PresetAgentOptionsField {
   maxTokens?: number
 }
 
-export const Config: z<{ provider: string; defaultRules?: string; presets: Dict<PresetSpecField>; runsFile?: string }> = z.object({
+export const Config: z<{ provider: string; defaultRules?: string; presets: Dict<PresetSpecField>; runsFile?: string; worktreesFile?: string; worktreeGoal?: string; worktreeVerify?: string; worktreeMergeVerify?: string; worktreePrepare?: string; worktreeAuto?: boolean }> = z.object({
   /** `ctx.subagents` 里的 provider 名，必填——`startContinuable` 的第一个参数就是它。 */
   provider: z.string().required(),
   /**
@@ -437,6 +518,26 @@ export const Config: z<{ provider: string; defaultRules?: string; presets: Dict<
    * 挪动文件的机会（以及给测试一个不碰真实 profile 的入口）。
    */
   runsFile: z.string().default(''),
+  /**
+   * worktree 账本的位置；空串走 {@link worktreesPathFor}（与 run 账本同目录）。
+   *
+   * 与 `runsFile` 一样**不是 volatile**：它只用来挪文件，不是可热改的开关。
+   * 给测试一个不碰真实 profile 的入口，正是它存在的一半理由。
+   */
+  worktreesFile: z.string().default(''),
+  /** 起线时写进简报开头的那句线意图；空串即不写。 */
+  worktreeGoal: z.string().default(''),
+  /** 这条线没声明机械验证命令时用的默认命令；空串即没有默认。 */
+  worktreeVerify: z.string().default(''),
+  /** 合回时那条整套检查的默认命令；空串即必须逐条声明。 */
+  worktreeMergeVerify: z.string().default(''),
+  /** 装依赖的命令，默认 `pnpm install --frozen-lockfile`。 */
+  worktreePrepare: z.string().default('pnpm install --frozen-lockfile'),
+  /**
+   * 改代码的派发**默认自动**进隔离线。默认 true —— 这是常态化的那一档，
+   * 关掉它等于退回「隔离是可选的装饰」。只读调研用 `worktree: "-"` 逐次关。
+   */
+  worktreeAuto: z.boolean().default(true),
 })
 
 /** 提问服务回答里的一条。 */
@@ -614,6 +715,223 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
   const runs = (): TaskRunsService => createTaskRuns(ctx, runLedgerFile)
 
   /**
+   * 隔离线的账本。位置与 run 账本**同一条决议链、同一个目录**（只是换个文件名）——
+   * 两半状态必须住在一起，理由与 {@link createTaskRuns} 那一处一模一样。
+   */
+  const worktreeStore: WorktreeStore = createWorktreeStore(worktreesPathFor(config.worktreesFile ?? '', runLedgerFile))
+
+  /**
+   * 这条线的**机械**验证命令：逐条声明的优先，其次取本行配置的默认。
+   *
+   * 判空走的是「去白之后是不是空串」：给一个只有空白的命令等于没给，
+   * 而 `runShellLine` 会把它当一整行跑 —— 那种「跑了个空命令还当通过」的假象必须掐掉。
+   * @param declared - 调用方逐条声明的命令。
+   * @returns 要跑的命令；一处都没有时是 undefined。
+   */
+  const verifyCommandFor = (declared?: string): string | undefined => {
+    const given = (declared ?? '').trim()
+    if (given !== '') return given
+    const fallback = (config.worktreeVerify ?? '').trim()
+    return fallback === '' ? undefined : fallback
+  }
+
+  /**
+   * 合回时那条**整套检查**：逐条声明的优先，其次取本行配置的默认。
+   * @param declared - 调用方逐条声明的命令。
+   * @returns 要跑的命令；一处都没有时是 undefined（那就不能合回）。
+   */
+  const mergeVerifyFor = (declared?: string): string | undefined => {
+    const given = (declared ?? '').trim()
+    if (given !== '') return given
+    const fallback = (config.worktreeMergeVerify ?? '').trim()
+    return fallback === '' ? undefined : fallback
+  }
+
+  /**
+   * 起线时的一句话意图：逐条给的优先，其次取本行配置的默认，最后「没写」。
+   *
+   * 它拼在隔离前言**之后**：前言是纪律（不许碰主检出），这一段是**这次要干什么**。
+   * @param declared - 调用方给的那句。
+   * @returns 意图文本；一处都没有时是 undefined。
+   */
+  const goalFor = (declared?: string): string | undefined => {
+    const given = (declared ?? '').trim()
+    if (given !== '') return given
+    const fallback = (config.worktreeGoal ?? '').trim()
+    return fallback === '' ? undefined : fallback
+  }
+
+  /**
+   * 这个 Agent 那条会话的工作目录。
+   *
+   * 读的是**会话 header 里的 cwd**（宿主建会话时写死的那一份），不是 `process.cwd()` ——
+   * 后者是**宿主进程**的启动目录，跟「这条会话在哪个仓里干活」可以毫无关系
+   * （GUI 从安装目录起、会话在别的仓里）。header 里没有 cwd 时才退回进程 cwd。
+   * @param agent - 调用方 Agent。
+   * @returns 一个绝对路径。
+   */
+  const sessionCwd = (agent: Agent): string => {
+    const header = (agent.session as { header?: { cwd?: unknown } } | undefined)?.header
+    const cwd = header?.cwd
+    return typeof cwd === 'string' && cwd.trim() !== '' ? cwd : process.cwd()
+  }
+
+  /**
+   * 一条线的**依赖断言**：装上依赖，并借此证明这条线拿到的依赖集合与主线一致。
+   *
+   * 为什么不能只看「装成功了没有」：见 {@link prepareWorktree} 的注释（误提交的 junction
+   * 在主线无害、进 worktree 变成真目录，锁文件的 importer 数量当场对不上）。
+   *
+   * 失败时**返回而不抛**：由调用方决定报成什么样。结局**落盘** —— 复用这条线的那一次
+   * 靠它决定跳不跳过重装（见 {@link WorktreePrepared}）。
+   * @param record - 这条线。
+   * @returns 断言结局与命令的真实输出。
+   */
+  const assertLineDependencies = async (record: WorktreeRecord): Promise<{ readonly prepared: WorktreePrepared; readonly output: string }> => {
+    const outcome = await prepareWorktree(record.path, config.worktreePrepare ?? '')
+    const prepared: WorktreePrepared = { command: outcome.command, ok: outcome.ok, at: Date.now() }
+    await worktreeStore.put({ ...record, prepared })
+    return { prepared, output: outcome.output }
+  }
+
+  /**
+   * 依赖断言没通过时的报错文案。
+   * @param record - 这条线。
+   * @param prepared - 断言结局。
+   * @param output - 命令的真实输出。
+   * @returns 报错文本。
+   */
+  const dependencyFailure = (record: WorktreeRecord, prepared: WorktreePrepared, output: string): string =>
+    'task worktree: line "' + record.name + '" at ' + record.path
+    + ' 的依赖与主线对不上 —— `' + prepared.command + '` 没通过（这条线留在盘上、账本里也记着它；修好原因之后**同名**再派一次会接着用这条线）'
+    + '。绝不降级成 `--no-frozen-lockfile`：那会装上与主线不同的版本。\n' + output
+
+  /**
+   * 起一条隔离线（同名就接回同一条），并断言它的依赖与主线一致。
+   *
+   * 两条路，先认第一条：
+   *   - **同名 = 同一条线**：账本里有这个名字、检出还在、分支也对得上 ⇒ 接着用，
+   *     不重建。重试、续跑、自动线名都会走这里；依赖断言过过的才跳过重装；
+   *   - 否则新建；检出没了而分支还在时 {@link createWorktree} 会把那条分支接回来 ——
+   *     于是「名字撞了」永远不会变成一个再也派不出去的永久结局。
+   * @param spec - 线名、验证命令、意图与分叉点。
+   * @param cwd - 会话的工作目录（仓库根的搜索起点）。
+   * @returns 这条线的账本记录。
+   */
+  const startLine = async (spec: { readonly name: string; readonly verify?: string; readonly mergeVerify?: string; readonly goal?: string; readonly base?: string }, cwd: string): Promise<WorktreeRecord> => {
+    const layout = await readRepoLayout(cwd)
+    const verify = verifyCommandFor(spec.verify)
+    const mergeVerify = mergeVerifyFor(spec.mergeVerify)
+    const goal = goalFor(spec.goal)
+    const known = (await worktreeStore.read())[spec.name]
+    if (known !== undefined && await worktreeMatches(known.path, known.branch)) {
+      if (known.prepared?.ok === true) return known
+      const again = await assertLineDependencies(known)
+      if (!again.prepared.ok) throw new Error(dependencyFailure(known, again.prepared, again.output))
+      return { ...known, prepared: again.prepared }
+    }
+    const created = await createWorktree({
+      repo: layout.root,
+      name: spec.name,
+      ...spec.base === undefined ? {} : { base: spec.base },
+      ...verify === undefined ? {} : { verify },
+      ...mergeVerify === undefined ? {} : { mergeVerify },
+      ...goal === undefined ? {} : { goal },
+    })
+    const record: WorktreeRecord = {
+      name: spec.name,
+      repo: layout.root,
+      path: created.path,
+      branch: created.branch,
+      base: created.base,
+      createdAt: Date.now(),
+      ...verify === undefined ? {} : { verify },
+      ...mergeVerify === undefined ? {} : { mergeVerify },
+      ...goal === undefined ? {} : { goal },
+      main: { porcelain: created.mainPorcelain },
+    }
+    // 账本先落：后面两步失败时，这条线**仍然在盘上**，账本里必须找得到它，
+    // 否则人只能靠 `git worktree list` 去猜它是什么、该不该删。
+    await worktreeStore.put(record)
+    // **依赖断言**：失败就**不许派发** —— 让一个与主线依赖不一致的孩子开工，正是
+    // 「合回验证过了、上主线才炸」的成因。
+    const asserted = await assertLineDependencies(record)
+    if (!asserted.prepared.ok) throw new Error(dependencyFailure(record, asserted.prepared, asserted.output))
+    // **固化检测**：主检出里是 junction/symlink 的东西，在 worktree 里必须还是链接。
+    // 实测过一次：误提交的 junction 进 worktree 被 git 固化成真目录，于是 pnpm 看到的工作区
+    // 项目数比锁文件的 importer 多一个 —— 「主线完全无害、进 worktree 就炸」正是这类东西。
+    const materialized = await findMaterializedLinks(layout.root, created.path)
+    if (materialized.length > 0) {
+      throw new Error('task worktree: line "' + spec.name + '" at ' + created.path
+        + ' materialised links that are symlinks in the main checkout: ' + materialized.join(', ')
+        + ' — git turned them into real directories here, so this checkout does not hold the same dependency set as the main line')
+    }
+    return { ...record, prepared: asserted.prepared }
+  }
+
+  /**
+   * 这次派发落在**哪条**隔离线上（`undefined` = 这次不隔离）。三档，顺序就是优先级：
+   *   1. `worktree: "-"`（也认 off/none/no/false）⇒ **显式关闸**，只读调研的活用它；
+   *   2. `worktree: "<名>"` ⇒ 用中枢点名的那条线（同名 = 同一条线）；
+   *   3. 什么都不给 ⇒ **默认档**：改代码的派发**自动**开一条线（`worktreeAuto` 可关），
+   *      线名由 {@link autoLineName} 按「会话 + 目标」生成 —— 重试与续跑复用的正是它。
+   *
+   * 第 3 档起线失败时**当场抛**，并在报错里附上关闸的写法：「默认就在主检出上跑」
+   * 是这套纪律唯一不能有的出口。
+   * @param parent - 发起这次派发的 Agent（借它读会话 cwd 与会话 id）。
+   * @param spec - 中枢声明的线名、这次派发的身份键、验证命令、意图与分叉点。
+   * @returns 线记录，或 undefined（这次不隔离）。
+   */
+  const lineFor = async (
+    parent: Agent,
+    spec: {
+      readonly declared?: string
+      readonly key: string
+      readonly verify?: string
+      readonly mergeVerify?: string
+      readonly goal?: string
+      readonly base?: string
+    },
+  ): Promise<WorktreeRecord | undefined> => {
+    const cwd = sessionCwd(parent)
+    const start = (name: string): Promise<WorktreeRecord> => startLine({
+      name,
+      ...spec.verify === undefined ? {} : { verify: spec.verify },
+      ...spec.mergeVerify === undefined ? {} : { mergeVerify: spec.mergeVerify },
+      ...spec.goal === undefined ? {} : { goal: spec.goal },
+      ...spec.base === undefined ? {} : { base: spec.base },
+    }, cwd)
+    const declared = (spec.declared ?? '').trim()
+    if (declared !== '') {
+      if (WORKTREE_OFF.includes(declared.toLowerCase())) return undefined
+      return await start(declared)
+    }
+    if (config.worktreeAuto !== true) return undefined
+    const name = autoLineName(spec.key, sessionId({ agent: parent }))
+    try {
+      return await start(name)
+    } catch (error) {
+      throw new Error((error instanceof Error ? error.message : String(error))
+        + '\n（这条隔离线是**默认**开出来的，线名 `' + name + '`；只做只读调研、确实不该隔离的派发，显式传 `worktree: "-"` 关掉。）')
+    }
+  }
+
+  /**
+   * 起线时挂在简报**最前面**的那一段：隔离前言 + 线意图 + 收工方式。
+   *
+   * 三段都是**代码里的常量/模板**，不是让中枢手写 —— 「别碰主检出」这句话
+   * 每派一条线都要写一遍的话，迟早会漏掉一条，而那条线就跑在主检出上。
+   * @param record - 这条线的账本记录。
+   * @returns 简报前缀。
+   */
+  const linePreamble = (record: WorktreeRecord): string => {
+    const parts = [isolationPreamble({ name: record.name, path: record.path, branch: record.branch, repo: record.repo })]
+    if (record.goal !== undefined) parts.push('【线意图】' + record.goal)
+    parts.push(worktreeWorkflowNote(record.name, record.verify, record.mergeVerify))
+    return parts.join('\n')
+  }
+
+  /**
    * 把这条会话记录过的决策渲染成一段提示词。
    *
    * 这是「决策在压缩时重放」的落点。决策**不放在对话里**——对话会被压缩掉——
@@ -786,7 +1104,7 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
     if (read === undefined || !Array.isArray(read.sections)) return produced
     return {
       ...read,
-      sections: [...read.sections, { name: PROCESS_NUDGE_SECTION, order: PROCESS_NUDGE_ORDER, text: PROCESS_NUDGE }],
+      sections: [...read.sections, { name: PROCESS_NUDGE_SECTION, order: PROCESS_NUDGE_ORDER, text: PROCESS_NUDGE + ISOLATION_NUDGE }],
     } as unknown as typeof produced
   }, { global: true })
 
@@ -1117,10 +1435,103 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
       // 结算正文（上面那次 `settledNotice` 的产物）一并交出去：它会被写进账本，
       // 从此下游取结论不必再回到会话历史里翻 —— 历史会被压缩，账本不会。
       await advanceRuns(sid, childId, outcome, body)
+      // **隔离线的收尾**：这条孩子落在线上的话，把线的状态如实写进它的节点 detail。
+      // 顺序在 advanceRuns **之后**：结算结论先落地，收尾报告是补充说明，
+      // 它绝不能把子代理自己报的那一行结论顶掉。
+      await reportLineSettlement(sid, childId)
     } catch (error) {
       ctx.logger?.warn?.('task: settling the node of child "' + childId + '" failed: ' + String(error))
     }
   }, { global: true })
+
+  /**
+   * 这条孩子落在哪条隔离线上（没有就是 undefined）。
+   *
+   * 判据是**双向**的：线账本里记着 path 与 branch，而已派出去的孩子的会话 id 记在
+   * 各条 run 的节点上。两处对不上（比如线被收掉了）时返回 undefined —— 那说明这孩子
+   * 不在隔离里，绝不编一条出来。
+   * @param sid - 父会话 id。
+   * @param childId - 子会话 id。
+   * @returns 线记录，或 undefined。
+   */
+  const lineOfChild = async (sid: string, childId: string): Promise<WorktreeRecord | undefined> => {
+    const field = await worktreeStore.read()
+    // ① `dispatch` 那条通道：孩子被**直接记在线账本上**（它没有 run）。
+    // 线按名字排序遍历，保证同一个孩子只可能匹到一条线，结果稳定可复现。
+    for (const name of Object.keys(field).sort()) {
+      const record = field[name]
+      if (record?.children?.includes(childId) === true) return record
+    }
+    // ② `run` 那条通道：run 自己记着线名，节点上记着 childId，两处对上就是它。
+    const named = (await runs().list(sid)).map(record => record.worktree)
+      .filter((name): name is string => typeof name === 'string' && name !== '')
+    for (const name of named) {
+      const record = field[name]
+      if (record !== undefined) return record
+    }
+    return undefined
+  }
+
+  /**
+   * 把一条子会话挂到某条线上。**读-改-写**：线账本是整份重写的，所以必须先读。
+   * @param name - 线名。
+   * @param childId - 子会话 id。
+   */
+  const addChildToLine = async (name: string, childId: string): Promise<void> => {
+    const field = await worktreeStore.read()
+    const record = field[name]
+    if (record === undefined) return
+    const children = record.children ?? []
+    if (children.includes(childId)) return
+    await worktreeStore.put({ ...record, children: [...children, childId] })
+  }
+
+  /**
+   * 一条线的一句话摘要（工具返回值里给出，让中枢一眼看到「这条线在哪个检出、哪个分支」）。
+   * @param record - 线记录。
+   * @returns 单行文本。
+   */
+  const lineSummary = (record: WorktreeRecord): string => 'isolated line ' + record.name + ' → ' + record.branch + ' at ' + record.path
+
+  /**
+   * 结算时对隔离线做的收尾：**自动提交归零**（用户纠正过的那一条）+ 写穿检测 + 如实报数。
+   *
+   * 三件事，一件都不能少：
+   *   1. **趋势报告**：这条线改了多少文件、有几个提交、还剩几个**未验证**的改动没提交
+   *      （收工剩的改动一律**不**自动提交 —— 把它们封进历史正是要避免的事）；
+   *   2. **写穿检测**：主检出相对起线时的快照变了吗？变了就**大声报警**并列出路径；
+   *   3. 把结论写进节点的 detail（**附加**，不覆盖子代理自己报的那一行结论）。
+   *
+   * 全程**绝不抛**：调用点在 `session/event` 监听器里，一次 git 读失败不许把事件分发炸掉。
+   * @param sid - 父会话 id。
+   * @param childId - 刚结算的子会话 id。
+   */
+  const reportLineSettlement = async (sid: string, childId: string): Promise<void> => {
+    try {
+      const line = await lineOfChild(sid, childId)
+      if (line === undefined) return
+      const report = await finalizeReport(line.path, line.base)
+      const leak = await detectLeak(line.repo, line.main.porcelain)
+      const head = '[' + line.name + ' @ ' + line.branch + '] '
+      const parts = [head + report.note]
+      if (report.hash !== undefined) parts.push('hash ' + report.hash)
+      if (leak.leaked) {
+        // **大声报警**：这是「指示 + 事后检测」这一档隔离里唯一能给出的东西，
+        // 所以它必须显眼、必须点名路径，绝不缩成一句「有变化」。
+        parts.push('⚠ 写穿隔离：主检出 ' + line.repo + ' 相对起线时被改动，涉及 ' + leak.paths.join('、'))
+      } else if (leak.detail !== undefined) {
+        parts.push(leak.detail)
+      }
+      const port = tree()
+      const bound = flattenNodes(port.read(sid)).filter(node => node.assignedTo === childId)
+      for (const node of bound) {
+        const existing = node.detail ?? ''
+        await port.step(sid, node.id, { detail: truncate(existing === '' ? parts.join('；') : existing + '｜' + parts.join('；'), DETAIL_MAX) })
+      }
+    } catch (error) {
+      ctx.logger?.warn?.('task: reporting the isolated line of child "' + childId + '" failed: ' + String(error))
+    }
+  }
 
   /**
    * 派发收尾：绑节点、推进状态、给出返回值。两条派发通道共用。
@@ -1174,6 +1585,13 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
       readonly label?: string
       readonly bind?: string
       readonly concise?: boolean
+      /**
+       * 这条孩子要落的**隔离线**。给了它，简报**开头**会多出一段隔离前言（见 {@link linePreamble}）。
+       *
+       * 为什么前言拼在这里而不是在 `dispatch` 动作里：自动放行（run 的后继节点）也走这个函数。
+       * 把它放在动作里，run 派出去的后继就拿不到前言 —— 而它们改的正是同一份代码。
+       */
+      readonly worktree?: WorktreeRecord
     },
     signal: AbortSignal,
   ): Promise<{ task_id: string; node?: string; status: string; result?: string }> => {
@@ -1198,7 +1616,13 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
     const maxDepth = ctx.subagents.resolveMaxDepth(preset.maxDepth)
     const request: Omit<SubagentStartRequest, 'label' | 'signal' | 'outputSchema'> = {
       ...spec.label !== undefined ? { label: spec.label } : {},
-      prompt: [{ type: 'text', text: withNodeBrief(spec.prompt, spec.bind, spec.concise === true) }],
+      // 隔离前言在最前、节点指令在最后：孩子先看到「你在哪个检出、别碰哪个目录」，
+      // 再看自己的活，最后才是回传状态那一行 —— 顺序与它要遵照的优先级一致。
+      prompt: [{ type: 'text', text: withNodeBrief(
+        spec.worktree === undefined ? spec.prompt : linePreamble(spec.worktree) + '\n\n' + spec.prompt,
+        spec.bind,
+        spec.concise === true,
+      ) }],
       parent,
       ...persona !== undefined ? { persona } : {},
       ...preset.toolFilter !== undefined ? { toolFilter: preset.toolFilter } : {},
@@ -1392,6 +1816,17 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
     // 全部被槽位吃掉时 `text` 是空串，这里就一个字都不追加。
     const prompt = composeBrief(upstream)
     try {
+      // **这条 run 有没有住在一个隔离检出里**：有的话，每个节点（含自动放行的后继）
+      // 都要拿到同一段隔离前言 —— 它们改的是同一份代码。
+      //
+      // 线**不见了**就当场拒派：这条 run 声明过它要隔离，往后继身上悄悄退回主检出
+      // 正是这套纪律唯一不能有的那种降级。要放弃就显式收线（收线会连分支一起去掉），
+      // 而不是让后面的节点落在主检出上。
+      const line = run.worktree === undefined ? undefined : (await worktreeStore.read())[run.worktree]
+      if (run.worktree !== undefined && line === undefined) {
+        throw new Error('task run: 这条 run 声明住在隔离线 "' + run.worktree + '" 上，但线账本里已经没有它了'
+          + '（线被收掉了？）。后继节点**不退回主检出** —— 先把线找回来（或改声明）再放行。')
+      }
       const started = await dispatchTo(parent, {
         prompt,
         ...node.preset === undefined ? {} : { preset: node.preset },
@@ -1399,6 +1834,7 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
         bind: node.id,
         // run 链路才有的那一句：结语里给下游用的结论要简略。
         concise: true,
+        ...line === undefined ? {} : { worktree: line },
       }, AUTO_DISPATCH_SIGNAL)
       // 派发成功时 note 照例清空：陈旧的原因不该留在已经跑起来的那一步上。
       const recorded = await ledger.commit(sid, list => patchRunNode(list, run.id, node.id, record => runNodeWith(record, 'dispatched', started.task_id, started.result)))
@@ -1576,8 +2012,8 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
       action: {
         type: 'string',
         required: true,
-        enum: ['plan', 'step', 'ask', 'dispatch', 'run', 'send', 'interrupt', 'list', 'result'],
-        description: 'plan 写节点；step 推进一个节点；ask 问用户；dispatch 起一个子代理（直连）；run 声明一条依赖流水线——起点立刻派出，后继在前置全部完成时由插件自动派出（不必再调 dispatch，它也不会给你发消息）；run 的两个补充入口：retry=true 只重评估既有 run 的待办节点（还没派出去的那些），resume=<节点 id> 把已派出但没干成的节点交回它原来那个孩子接着干（不新派）；send 继续它；interrupt 停它；list 读树或子代理；result 读某个子代理的结果。',
+        enum: ['plan', 'step', 'ask', 'dispatch', 'commit', 'run', 'send', 'interrupt', 'list', 'result', 'worktree'],
+        description: 'plan 写节点；step 推进一个节点；ask 问用户；dispatch 起一个子代理（直连，默认自动进隔离线）；commit 在隔离检出里按功能提交一批工作单元（line 点名哪条线、记录这次是怎么验证的）；run 声明一条依赖流水线——起点立刻派出，后继在前置全部完成时由插件自动派出（不必再调 dispatch，它也不会给你发消息）；run 的两个补充入口：retry=true 只重评估既有 run 的待办节点（还没派出去的那些），resume=<节点 id> 把已派出但没干成的节点交回它原来那个孩子接着干（不新派）；send 继续它；interrupt 停它；list 读树或子代理；result 读某个子代理的结果；worktree 管并行修改的隔离检出（起线 / 列出在飞的线 / 合回并统一提交 / 收线）。',
       },
       nodes: {
         type: 'array',
@@ -1616,6 +2052,25 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
       scope: { type: 'string', enum: ['tree', 'children', 'descendants'], description: 'list：tree（默认）读树，children 读直接子代理（默认最新 10 个），descendants 读下面所有子代理。' },
       limit: { type: 'number', description: 'list(scope=children)：最多返回几个孩子，默认 10，取最新的；返回值里带 total/truncated。' },
       merge: { type: 'number', description: 'list(scope=tree)：往下拼几层子代理自己写的树，拼在各自 bind 的节点下。0 或省略只读本会话自己的树。子代理始终写自己的树，拼接靠 bind 已记下的 assignedTo。' },
+      worktree: {
+        type: 'string',
+        description: 'dispatch/run：给这条活指定**隔离检出**（git worktree）+ 分支 wt/<名>（字母数字点线）。**默认不用给**：改代码的派发会自动开一条线（线名由插件按「会话 + 节点」生成，重试与续跑复用的正是同一条）；简报开头由插件拼上隔离前言（线名、检出绝对路径、分支、禁止碰主检出、收工前不要自己合并）。只做只读调研、确实不该隔离的派发，显式传 "-" 关掉。worktree 动作也用它点名要操作哪条线。',
+      },
+      worktreeVerify: { type: 'string', description: 'dispatch/run：这条线的**机械验证命令**（一整行 shell）。中枢声明、插件按线存下，`commit` 跑的是存下来的那条——子代理可以追加检查但省略不了它。省略则回落 task 行配置的 worktreeVerify。' },
+      worktreeMergeVerify: { type: 'string', description: 'dispatch/run：合回之后要跑的**整套检查**（一整行 shell，例如全套测试 + typecheck）。省略则回落配置。一条线没有它就不能合回（fail-closed）。' },
+      worktreeGoal: { type: 'string', description: 'dispatch/run：一句话说明这条线在干什么、别碰哪些文件；写进简报。省略则回落配置的 worktreeGoal。' },
+      worktreeBase: { type: 'string', description: 'dispatch/run：分叉点（commit-ish），省略即主检出的 HEAD。' },
+      units: { type: 'array', items: { type: 'string' }, description: 'commit：这次提交汇总的**工作单元**（一个或多个）。一次提交可以装多个单元——粒度自己判断，不是 1:1。' },
+      feature: { type: 'string', description: 'commit：`units` 的单数简写（只给一个单元时用它）。两者都给则以 units 为准。' },
+      verifiedBy: { type: 'string', description: 'commit：**判断档**验证——谁检查过这次改动（中枢，或某个验证代理的会话 id）。与机械验证并存也行，只有它也行。' },
+      note: { type: 'string', description: 'commit：判断档的依据（一句话），与 verifiedBy 一起进提交信息。' },
+      onFail: { type: 'string', enum: ['record', 'block'], description: 'commit：机械验证**未通过**时怎么办。record（默认）= 照样提交，把「未通过」与真实输出如实记进提交信息与返回值；block = 一个字节都不提交，回真实输出。本动作是记录员不是守门员，门禁在中枢手里。' },
+      extraCheck: { type: 'string', description: 'commit：追加的机械检查（一整行 shell），**只加不减**。' },
+      verify: { type: 'string', description: 'commit：临时覆盖这次跑的机械验证命令；省略即用这条线存下来的那条（中枢声明的那条才作数）。' },
+      line: { type: 'string', description: 'worktree：要操作的线名（worktree 动作的目标）。' },
+      mode: { type: 'string', enum: ['list', 'merge', 'drop'], description: 'worktree：list（默认）列出在飞的线（含在哪条检出、哪个分支、有几个提交、多少未提交改动）；merge 合回并统一提交到主线；drop 收线（删掉检出与分支，只在已合回或明确放弃时做）。' },
+      force: { type: 'boolean', description: 'worktree mode=drop：线还有未合回的提交或未提交的改动时仍要收线（不可挽回，明确放弃才用）。' },
+      title: { type: 'string', description: 'worktree mode=merge：落进整合提交信息里的一句话。' },
     },
     output: {
       schema: {
@@ -1629,6 +2084,14 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
           tree: { type: 'string', description: '渲染成可读文本的任务树。' },
           run: { type: 'string', description: 'run：本次声明的 run id。' },
           dispatched: { type: 'array', items: { type: 'string' }, description: 'run：本次调用里已经派出去的节点 id（起点们）。后继由插件在前置完成时自动派出，不会出现在这个列表里。' },
+          branch: { type: 'string', description: 'worktree：这条线的分支名（wt/<名>）。' },
+          path: { type: 'string', description: 'worktree：这条线的检出绝对路径。' },
+          hash: { type: 'string', description: 'commit/worktree merge：真实 commit hash（短）。' },
+          files: { type: 'number', description: 'commit：这次提交涉及的改动文件数。' },
+          uncommitted: { type: 'number', description: 'commit：提交之后工作区里还剩几个未提交的改动。' },
+          verification: { type: 'string', description: 'commit：这次提交是怎么被验证的——machine（机械验证跑过）/ judgement（判断档）/ both / none。' },
+          merged: { type: 'boolean', description: 'worktree mode=merge：这条线是否已合回并统一提交到主线。' },
+          worktrees: { type: 'array', items: { type: 'string' }, description: 'worktree mode=list：在飞的线，每条一行（名字 / 分支 / 检出路径 / 提交数 / 未提交改动数）。' },
         },
       },
       render: (_args, value) => [{ type: 'text', text: 'task ' + String(value.status) }],
@@ -1650,13 +2113,146 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
             assertTitledNodes('dispatch', args.nodes as readonly { readonly id: string; readonly title?: string }[])
             await tree().write(sessionId(exec), args.nodes as readonly FlatNode[], args.replace === true)
           }
+          // **隔离线**：改代码的派发**默认**就落在一个独立检出上（`worktree: "-"` 才关）。
+          //
+          // 顺序是硬约束：线必须在**起孩子之前**建好 —— 简报里要写检出的绝对路径，
+          // 而那条路径只有起完线才知道。起线失败（脏检出、名字非法、git 拒绝、依赖对不上）时
+          // 直接抛给调用方，**绝不降级成「在主检出上跑」** —— 那正是要防的那件事。
+          const line = await lineFor(parent, {
+            ...args.worktree === undefined ? {} : { declared: args.worktree },
+            key: args.bind ?? args.label ?? (args.prompt ?? ''),
+            ...args.worktreeVerify === undefined ? {} : { verify: args.worktreeVerify },
+            ...args.worktreeMergeVerify === undefined ? {} : { mergeVerify: args.worktreeMergeVerify },
+            ...args.worktreeGoal === undefined ? {} : { goal: args.worktreeGoal },
+            ...args.worktreeBase === undefined ? {} : { base: args.worktreeBase },
+          })
           // 派发本体与自动放行**共用同一个函数**：这里只负责它自己那一半（层数闸门、写节点）。
-          return await dispatchTo(parent, {
+          const dispatched = await dispatchTo(parent, {
             prompt: args.prompt ?? '',
             ...args.preset === undefined ? {} : { preset: args.preset },
             ...args.label === undefined ? {} : { label: args.label },
             ...args.bind === undefined ? {} : { bind: args.bind },
+            ...line === undefined ? {} : { worktree: line },
           }, exec.signal)
+          // 孩子已经起来了，把「谁在这条线上」补记进线账本 —— 结算时要靠它认线。
+          // 失败只记日志：这一步跑在派发**成功之后**，一次账本写失败绝不能反过来
+          // 把「孩子已经在跑」这个结论改写成失败。
+          if (line !== undefined) {
+            try {
+              await addChildToLine(line.name, dispatched.task_id)
+            } catch (error) {
+              ctx.logger?.warn?.('task worktree: could not record child ' + dispatched.task_id + ' on line ' + line.name + ': ' + String(error))
+            }
+          }
+          return {
+            ...dispatched,
+            ...line === undefined ? {} : { worktree: lineSummary(line) },
+            ...line === undefined ? {} : { result: lineSummary(line) },
+          }
+        }
+        case 'commit': {
+          // **记录员，不是守门员**：真的提交 + 如实记录这次是怎么被验证的。
+          // 判不判得过由中枢复核（它可以让子代理重做、amend、reset）—— 门禁不在插件里。
+          const lineName = (args.line ?? '').trim()
+          const field = await worktreeStore.read()
+          const known = Object.keys(field).sort()
+          // 线名省略时只有**恰好一条**在飞的线才能推断出来；两条以上必须点名。
+          const picked = lineName !== ''
+            ? field[lineName]
+            : (known.length === 1 ? field[known[0] as string] : undefined)
+          if (picked === undefined) {
+            throw new Error(lineName !== ''
+              ? 'task commit: no isolated line named "' + lineName + '" (live lines: ' + (known.length === 0 ? 'none' : known.join(', ')) + ')'
+              : 'task commit: ' + String(known.length) + ' isolated lines are live, so `line` is required (live lines: ' + known.join(', ') + ')')
+          }
+          const units: WorkUnit[] = (args.units ?? []).map(name => ({ name }))
+          if (units.length === 0 && args.feature !== undefined && args.feature.trim() !== '') units.push({ name: args.feature })
+          const outcome = await commitFeature({
+            name: picked.name,
+            path: picked.path,
+            node: args.node ?? args.bind ?? '',
+            units,
+            // **线存下来的那条**优先于逐次传入的那条：中枢声明的那条才作数，
+            // 子代理传 `verify` 只能改这一次跑什么，改不掉线上记着的那一份。
+            ...verifyCommandFor(args.verify ?? picked.verify) === undefined ? {} : { verify: verifyCommandFor(args.verify ?? picked.verify) as string },
+            ...args.extraCheck === undefined ? {} : { extraCheck: args.extraCheck },
+            ...args.verifiedBy === undefined ? {} : { verifiedBy: args.verifiedBy },
+            ...args.note === undefined ? {} : { note: args.note },
+            ...args.onFail === undefined ? {} : { onFail: args.onFail },
+            ...picked.verifyCwd === undefined ? {} : { verifyCwd: picked.verifyCwd },
+          })
+          return {
+            status: outcome.committed ? 'completed' : 'failed',
+            node: args.node ?? args.bind ?? '',
+            result: outcome.note,
+            verification: outcome.verification,
+            ...outcome.hash === undefined ? {} : { hash: outcome.hash },
+            ...outcome.files === undefined ? {} : { files: outcome.files },
+            ...outcome.uncommitted === undefined ? {} : { uncommitted: outcome.uncommitted },
+            ...outcome.output === undefined ? {} : { output: outcome.output },
+          }
+        }
+        case 'worktree': {
+          const mode = args.mode ?? 'list'
+          const field = await worktreeStore.read()
+          if (mode === 'list') {
+            // 每条线一行：名字 / 分支 / 检出路径 / 提交数 / 未提交改动数 / 写穿检测。
+            // 「这条线在哪个 worktree、哪个分支」是这一档存在的全部理由。
+            const names = Object.keys(field).sort()
+            if (names.length === 0) return { status: 'unknown', worktrees: ['(no isolated line is live)'] }
+            const rows: string[] = []
+            for (const name of names) {
+              const record = field[name] as WorktreeRecord
+              const report = await finalizeReport(record.path, record.base)
+              const leak = await detectLeak(record.repo, record.main.porcelain)
+              rows.push(record.name + ' | ' + record.branch + ' | ' + record.path
+                + ' | commits ' + String(report.commits)
+                + ' | uncommitted ' + String(report.uncommitted)
+                + (report.hash === undefined ? '' : ' | head ' + report.hash)
+                + (record.verify === undefined ? ' | no verify command' : ' | verify: ' + record.verify)
+                + (leak.leaked ? ' | ⚠ LEAK: main checkout changed (' + leak.paths.join(', ') + ')' : ''))
+            }
+            return { status: 'unknown', worktrees: rows }
+          }
+          const lineName = (args.line ?? '').trim()
+          const record = lineName === '' ? undefined : field[lineName]
+          if (record === undefined) {
+            throw new Error('task worktree: no isolated line named "' + lineName + '" (live lines: '
+              + (Object.keys(field).length === 0 ? 'none' : Object.keys(field).sort().join(', ')) + ')')
+          }
+          if (mode === 'merge') {
+            // **合回不自动做**：可能有冲突，也可能主线在别人手上。这里只在被点名时执行。
+            const outcome = await mergeWorktree({
+              name: record.name,
+              repo: record.repo,
+              path: record.path,
+              branch: record.branch,
+              base: record.base,
+              ...mergeVerifyFor(args.verify ?? record.mergeVerify) === undefined ? {} : { verify: mergeVerifyFor(args.verify ?? record.mergeVerify) as string },
+              ...args.title === undefined ? {} : { title: args.title },
+              prepare: config.worktreePrepare ?? '',
+            })
+            // 合回成功之后这条线的成果已经在主线上，账本上的那条线不再「在飞」——
+            // **但绝不自动删掉检出**：那是 `mode=drop` 的事，人要先看一眼。
+            return {
+              status: outcome.merged ? 'completed' : 'failed',
+              merged: outcome.merged,
+              result: outcome.note,
+              ...outcome.hash === undefined ? {} : { hash: outcome.hash },
+              ...outcome.output === undefined ? {} : { output: outcome.output },
+            }
+          }
+          // mode === 'drop'：只在已合回、或明确放弃时做。
+          const dropped = await dropWorktree({
+            repo: record.repo,
+            name: record.name,
+            path: record.path,
+            branch: record.branch,
+            base: record.base,
+            ...args.force === undefined ? {} : { force: args.force },
+          })
+          if (dropped.dropped) await worktreeStore.drop(record.name)
+          return { status: dropped.dropped ? 'completed' : 'failed', result: dropped.note }
         }
         case 'run': {
           const parent = requireAgent(exec)
@@ -1720,7 +2316,19 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
           // 树只被写 title/detail：**依赖不进树**（判据是用户那句「树是树，后端是后端」）。
           // 顺序是硬约束：bind 要求节点已存在，所以树必须先落，起点才派得出去。
           await tree().write(sid, nodes.map(runTreeNode), false)
-          const run: RunRecord = { id: args.run, createdAt: Date.now(), nodes }
+          // **隔离线**：与 `dispatch` 同一条纪律 —— 线必须先建好，简报里才写得出它的路径。
+          // run 派出去的每个节点（含自动放行的后继）都落在**同一条线**上：
+          // 它们改的是同一份代码，一条线一个检出，合回也是整条线一起合。
+          // 自动线名取 run id：同一条 run 重试/续跑接回的正是那条线，不会开出第二条。
+          const line = await lineFor(parent, {
+            ...args.worktree === undefined ? {} : { declared: args.worktree },
+            key: args.run,
+            ...args.worktreeVerify === undefined ? {} : { verify: args.worktreeVerify },
+            ...args.worktreeMergeVerify === undefined ? {} : { mergeVerify: args.worktreeMergeVerify },
+            ...args.worktreeGoal === undefined ? {} : { goal: args.worktreeGoal },
+            ...args.worktreeBase === undefined ? {} : { base: args.worktreeBase },
+          })
+          const run: RunRecord = { id: args.run, createdAt: Date.now(), nodes, ...line === undefined ? {} : { worktree: line.name } }
           await ledger.store(sid, run)
           // 起点（needs 为空）立刻派出，一个 run 里可以有多个起点，并行。
           const dispatched: string[] = []
@@ -2190,6 +2798,57 @@ const AUTO_DISPATCH_FAILED_PREFIX = '派发失败：'
  * 或闸门。措辞强制、执行不拦 —— 这两件事互不矛盾，正是这一版要的形态。
  */
 const PROCESS_NUDGE = '【过程记录（必须）】多步的活：**开工第一步必须**用 `task plan` 在**你自己的任务树**里写下阶段计划（分几段、每段做什么由你自己定）；**每完成一段必须**用 `task step` 推进到 completed，并在 detail 里写下这一段的结论。阶段之间**可以并行**，不要求先后顺序。'
+
+/**
+ * 常驻的**隔离纪律**那一句：与 {@link PROCESS_NUDGE} 同段、同一个装配点。
+ *
+ * 为什么要有它：并行改动互相踩是**每轮都会发生**的事，而它只在「这一轮有人想起要隔离」时
+ * 才不发生。把它钉在每轮的提示词里，是让「改代码就隔离」这件事不再依赖谁记得。
+ *
+ * 长度是**成本**：这一段每轮都进装配，所以目标 80 字符上下 —— 只留三件事：
+ * 什么时候隔离、提交走哪条路、合回由谁定。**不加解释、不举例。**
+ */
+const ISOLATION_NUDGE = '改代码的派发**默认自动**开隔离检出（重试复用同一条线；只读的活传 worktree: "-" 关掉）：提交走 task commit 并如实记录验证方式，合回后跑整套检查、过了才统一提交主线。'
+
+/**
+ * `worktree:` 上表示「这次别隔离」的那几个写法。
+ *
+ * 为什么要有这一档：默认档开着之后，**只读的活**（调研、审查、读代码回答问题）也被卷进
+ * 一条检出里是不划算的 —— 起线要一次全量装依赖，而它一个字节都不会改。
+ * 于是给一个**显式**的关闸：写出来才关，写不出来就隔离。
+ */
+const WORKTREE_OFF: readonly string[] = ['-', 'off', 'none', 'no', 'false']
+
+/**
+ * 自动线名：一个同时能当目录名与分支名的短名字。
+ *
+ * 形状 `auto-<可读键>-<会话+键的短哈希>`。可读的那半给排障的人看；哈希那半保证
+ * **不同会话、不同节点**不会撞到同一条线上 —— 线账本是按名字索引的，撞了就意味着
+ * 两个不相关的活共用一条检出，而它们会互相把对方的改动一起提上去。
+ * @param key - 这次派发的身份（节点 id / label / run id）。
+ * @param session - 发起这次派发的会话 id。
+ * @returns 线名。
+ */
+function autoLineName(key: string, session: string): string {
+  const slug = key.toLowerCase().replace(/[^a-z0-9._-]+/gu, '-').replace(/^-+|-+$/gu, '').slice(0, 24)
+  return 'auto-' + (slug === '' ? '' : slug + '-') + shortHash(session + '\n' + key)
+}
+
+/**
+ * 一段文本的短哈希（FNV-1a 32 位，固定 8 个十六进制字符）。
+ *
+ * 只用来造**稳定且不撞**的线名，不做任何安全用途。
+ * @param text - 待哈希的文本。
+ * @returns 8 个十六进制字符。
+ */
+function shortHash(text: string): string {
+  let hash = 0x811c9dc5
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index)
+    hash = Math.imul(hash, 0x01000193) >>> 0
+  }
+  return hash.toString(16).padStart(8, '0')
+}
 
 /**
  * 这一段在段表里的名字（去重与排障用）。
