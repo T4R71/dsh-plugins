@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "双轴访问模式",
+    "description": "把文件沙箱的读、写两条轴——deny、workspace、all 或带路径清单的 custom——做成可安装的 profile 层。"
+  }
+}

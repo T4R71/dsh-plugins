@@ -1,0 +1,413 @@
+/**
+ * Section-name-matched system-prompt rewriting, as one host plugin.
+ *
+ * TWO MODES, ONE SEAM.
+ *
+ * The seam is `system-prompt/assemble`, a cordis waterfall over the assembled
+ * prompt. This plugin registers ONE listener with `{ global: true }` and no
+ * `prepend`, which means it runs after every listener that did not prepend —
+ * including upstream's own invariant companion, whose listener is
+ * `{ global: true, prepend: true }` (`packages/core/system-prompt/src/invariant.ts:47-51`)
+ * and therefore sits INSIDE this one. That ordering is the shape upstream
+ * already uses for a read-only observer, so it is the accepted one.
+ *
+ *   observe  `await next()`, write what arrived, and RETURN THE SAME OBJECT,
+ *            unchanged. Nothing is added, removed, reordered or retexted.
+ *   rewrite  `await next()`, apply the rule file to the RETURNED sections, and
+ *            return a NEW assembly built from new section objects.
+ *
+ * THE THREE RULES THIS LISTENER OBEYS, and why each is not optional:
+ *
+ *   B1 — return the value. `assemble` awaits this waterfall and returns it
+ *   verbatim (`packages/core/system-prompt/src/index.ts:625-628`), so failing to
+ *   return `next()`'s value does not "skip a step": it deletes the whole system
+ *   prompt. Observe mode returns the very same reference for this reason.
+ *
+ *   B2 — expand, never mutate in place. The section objects are shared with the
+ *   assembly the registry built and with any snapshot another listener kept.
+ *   Rewrite mode therefore builds fresh objects and a fresh array; observe mode
+ *   builds nothing at all.
+ *
+ *   B3/B5 — leave `variables`, `contexts` and `tools` alone. `variables` has live
+ *   writers and a persistent reader that records what it reads; `contexts` is
+ *   emptied wholesale after the waterfall when the runtime suppressor is on, and
+ *   is asserted on by name elsewhere. A rewrite there is either discarded or
+ *   corrupting, so this plugin returns all three by reference.
+ *
+ * `complete: true` IS NOT REWRITABLE THROUGH THIS SEAM, and this plugin says so
+ * instead of pretending otherwise. `assemble` snapshots a complete section
+ * BEFORE running the waterfall and restores it after, collapsing the sections to
+ * that one element (`:601-611`, `:629-634`). The mark never reaches a listener,
+ * so the only available test is the restore's OUTPUT SHAPE — a sections array
+ * shorter than two. `detectCompleteShape` in `./sections.ts` carries the test
+ * and, next to it, the exact limits of that test.
+ *
+ * @module @t4r71/dsh-prompt-plan
+ */
+
+import { join } from 'node:path'
+import type { Context } from '@deepseek-ai/cordis'
+import type {} from '@deepseek-ai/dsh-settings'
+import type {} from '@deepseek-ai/dsh-system-prompt'
+import { Config as ConfigSchema, PROMPT_PLAN_ROW_ID, settingsDirectoryOf } from './config.ts'
+import type { Config, ResolvedConfig } from './config.ts'
+import { resolvedConfig } from './config.ts'
+import { sha256 } from './digest.ts'
+import { Observer, PURITY_CRITERIA } from './observe.ts'
+import { compileRules, applyRules } from './rewrite.ts'
+import type { CompiledRule, RuleTrace } from './rewrite.ts'
+import { detectCompleteShape, detectCompleteRegistry } from './sections.ts'
+import { completeRefusal, completeRegistrationRefusal, readSectionList } from './sections.ts'
+import type { SectionRecord } from './sections.ts'
+import { loadRuleFile, ruleFilePath } from './rules.ts'
+import type { RuleSet } from './rules.ts'
+
+export * from './actions.ts'
+export * from './config.ts'
+export * from './digest.ts'
+export * from './naming.ts'
+export * from './observe.ts'
+export * from './rewrite.ts'
+export * from './rules.ts'
+export * from './sections.ts'
+export * from './transform.ts'
+export * from './yaml.ts'
+
+/** The name of the artifact directory created beside the resolved rule file. */
+export const DEFAULT_ARTIFACT_DIRECTORY = 'prompt-plan-observations'
+
+/** How many nearest names a mismatch diagnostic lists. */
+export const NEAREST_NAME_LIMIT = 10
+
+/**
+ * Where this plugin's two file-facing paths resolve to.
+ *
+ * Kept as a small value type so the mount-time log line and the observer agree
+ * by construction rather than by two spellings of the same join.
+ */
+export interface Paths {
+  /** The rule file, or `undefined` when nothing could be resolved. */
+  readonly rulesFile: string | undefined
+  /** The artifact directory. */
+  readonly artifactDir: string
+}
+
+/**
+ * Resolve both paths from the config and the settings service.
+ * @param config - the resolved config.
+ * @param settingsDirectory - the directory this row's settings were declared in, if known.
+ * @returns the two paths the plugin will use.
+ */
+export function resolvePaths(config: ResolvedConfig, settingsDirectory: string | undefined): Paths {
+  const rulesFile = ruleFilePath({ rulesFile: config.rulesFile, settingsDirectory, hash: sha256 })
+  if (config.artifactDir.length > 0) {
+    return { rulesFile, artifactDir: config.artifactDir }
+  }
+  // Beside the rule file, which is in the profile directory: the operator's
+  // decision is that rules and observation products stay on the profile side,
+  // away from the package.
+  const base = rulesFile === undefined
+    ? settingsDirectory
+    : join(rulesFile, '..')
+  return {
+    rulesFile,
+    artifactDir: base === undefined ? join(process.cwd(), DEFAULT_ARTIFACT_DIRECTORY) : join(base, DEFAULT_ARTIFACT_DIRECTORY),
+  }
+}
+
+/** The plugin class. */
+export class PromptPlan {
+  /**
+   * Nothing is injected, and the listener still needs only the seam.
+   *
+   * The complete-section test reads the `systemPrompt` service, but it does so
+   * OPTIONALLY through {@link systemPrompt}: a cordis service cursor reachable
+   * from a context whose fiber did not inject it. Declaring it as an injection
+   * would make this plugin fail to load in a composition that has no prompt
+   * registry at all — and in such a composition the seam it listens on never
+   * fires either, so refusing to load would be a worse failure than a missing
+   * test. {@link detectCompleteRegistry} reports "not reachable" as its own
+   * outcome, which the handler logs as a warning rather than as a clean result.
+   */
+  static inject = [] as const
+
+  /**
+   * The prompt registry this listener is bound to, when it is reachable.
+   *
+   * Filled in the constructor from the mounting context, NOT declared as an
+   * injected field: this is a LOOKUP whose absence is survivable, not a
+   * dependency. `undefined` means the complete-section test could not run; it
+   * never means "no complete section is registered", and the handler logs the
+   * two differently for exactly that reason.
+   */
+  private presetRegistry: unknown
+
+  /** This row's composition config schema, validated by the loader before construction. */
+  static Config = ConfigSchema
+
+  private resolved: ResolvedConfig
+  private observer: Observer | undefined
+  private ruleSet: RuleSet | undefined
+  private compiled: CompiledRule[] = []
+  /**
+   * The directory this row's settings were declared in, read ONCE at mount.
+   *
+   * Kept rather than re-read because it is also the base the default artifact
+   * directory is derived from: re-reading it in {@link reloadRules} could resolve
+   * a rule file in a different directory than the artifacts are being written to,
+   * which is a silent split an operator would have no way to notice.
+   */
+  private readonly settingsDirectory: string | undefined
+
+  /**
+   * @param ctx - host context.
+   * @param config - the config captured at mount.
+   */
+  constructor(ctx: Context, config: Config) {
+    this.resolved = resolvedConfig(config)
+    try {
+      // The service accessor is typed by CLASS, and this package does not import
+      // the registry's class (it is a peer dependency resolved by the host, and
+      // the plugin is built to run without it). The name-keyed form is what the
+      // accessor accepts at runtime — measured: `ctx.get('systemPrompt')` returns
+      // the registry instance with its `layers`, while `ctx.get(SystemPrompt)`
+      // returns a different object for the same service. The cast is the price of
+      // a lookup by name, and it is deliberate that a failure here is survivable.
+      // See the class doc for why this is not an injected dependency.
+      this.presetRegistry = ctx.get('systemPrompt' as never)
+      if (this.presetRegistry === undefined) {
+        ctx.logger?.debug('prompt-plan: the systemPrompt service was not resolvable at mount; it will be looked up per assembly for the complete:true test')
+      }
+    } catch {
+      // A cordis context refuses an unavailable service by throwing. That is a
+      // legitimate composition — a host with no prompt registry — and it is not
+      // an error to propagate into a waterfall.
+      this.presetRegistry = undefined
+    }
+    this.settingsDirectory = settingsDirectoryOf(
+      ctx.get('settings') as { describe: () => readonly { ns: string; directory?: string }[] } | undefined,
+      PROMPT_PLAN_ROW_ID,
+    )
+    const paths = resolvePaths(this.resolved, this.settingsDirectory)
+    this.observer = new Observer({
+      directory: paths.artifactDir,
+      mode: this.resolved.mode,
+      report: (record) => {
+        ctx.logger?.error(
+          'prompt-plan: PURITY VIOLATION at assembly %s — %s',
+          String(record.ordinal),
+          record.failures.join('; '),
+        )
+      },
+    })
+    // The mount line. It carries the purity criterion in force, so a host log
+    // and the purity.jsonl lines written beside it can be tied to one revision of
+    // the criterion without inspecting the installed package.
+    ctx.logger?.info(
+      'prompt-plan: mounted; mode %s; purity criteria %s; rule file %s; artifacts %s; settings dir %s',
+      this.resolved.mode,
+      String(PURITY_CRITERIA),
+      paths.rulesFile ?? '(unresolved)',
+      paths.artifactDir,
+      this.settingsDirectory ?? '(unresolved)',
+    )
+    if (this.resolved.mode === 'rewrite') void this.reloadRules(ctx)
+
+    // The seam. `global` because the assembly may be dispatched for an agent
+    // scope this context is not under, and a rewriter bound to the wrong scope
+    // would silently stop applying. No `prepend`: upstream's invariant companion
+    // prepends, and running after it is the documented ordering.
+    ctx.on('system-prompt/assemble', async (assembly, context, next) => {
+      const produced = await next()
+      // The cast is the seam's price: `handle` is written against `unknown` so
+      // that it cannot smuggle a wrong shape past the reader, and this is the
+      // single place where the value re-enters the typed waterfall. `handle`
+      // either returns `produced` itself or a fresh object built from it.
+      //
+      // `context.scope` is passed through because it is the ONLY handle on the
+      // registry layer this assembly merges: the complete-section test reads that
+      // layer (see `handle`).
+      return await this.handle(ctx, assembly, produced, context?.scope) as typeof produced
+    }, { global: true })
+
+    // A clean shutdown must not lose a queued artifact write. The waterfall
+    // handler never awaits the disk (that would put filesystem latency in front
+    // of every model turn), so the drain happens here.
+    ctx.effect(() => () => { void this.observer?.drain() }, 'prompt-plan: drain observation artifacts')
+  }
+
+  /**
+   * Re-read the rule file.
+   *
+   * Called at mount in rewrite mode. Deliberately NOT called per assembly: a
+   * rule file change should be an explicit act, and a per-assembly stat would
+   * put a syscall in front of every model turn.
+   * @param ctx - host context, for logging.
+   * @returns whether a usable rule set is in force afterwards.
+   */
+  async reloadRules(ctx: Context): Promise<boolean> {
+    const load = await loadRuleFile({
+      rulesFile: this.resolved.rulesFile,
+      settingsDirectory: this.settingsDirectory,
+      hash: sha256,
+    })
+    if (!load.ok) {
+      this.ruleSet = undefined
+      this.compiled = []
+      if (load.problem === 'MISSING') {
+        ctx.logger?.warn('prompt-plan: no rule file at %s; rewrite mode will refuse every assembly until one exists', load.path)
+      } else {
+        ctx.logger?.error('prompt-plan: the rule file at %s %s', load.path, load.problem)
+      }
+      return false
+    }
+    const compiled = compileRules(load.ruleSet.rules)
+    if (!compiled.ok) {
+      this.ruleSet = undefined
+      this.compiled = []
+      ctx.logger?.error('prompt-plan: %s', compiled.problem)
+      return false
+    }
+    this.ruleSet = load.ruleSet
+    this.compiled = compiled.rules
+    ctx.logger?.info(
+      'prompt-plan: loaded %s rule(s) from %s (sha256 %s)',
+      String(load.ruleSet.rules.length),
+      load.ruleSet.path,
+      load.ruleSet.sha256.slice(0, 12),
+    )
+    return true
+  }
+
+  /**
+   * The waterfall handler.
+   *
+   * Total by construction: every branch returns an assembly. A branch that could
+   * not decide returns the value it was handed rather than nothing, because
+   * returning nothing is the failure B1 names.
+   * @param ctx - host context, for logging.
+   * @param incoming - the assembly as it entered the waterfall.
+   * @param produced - what the inner chain returned; the authoritative value.
+   * @returns the assembly to use.
+   */
+  private async handle(ctx: Context, incoming: unknown, produced: unknown, scope: unknown): Promise<unknown> {
+    const read = readSectionList(produced)
+    if (!read.ok) {
+      ctx.logger?.error('prompt-plan: refusing to rewrite an assembly it cannot read — %s', read.problem)
+      return produced
+    }
+    const before = read.sections
+    const incomingRead = readSectionList(incoming)
+    const incomingShape = detectCompleteShape(incomingRead.ok ? incomingRead.sections : [])
+
+    // THE TEST THAT MATTERS, and the one the original code did not have.
+    //
+    // `detectCompleteShape` fires on "fewer than two sections", which is the shape
+    // the post-waterfall restore leaves. It cannot fire on the case that actually
+    // breaks a rewrite: a `complete: true` section registered in the assembly's
+    // scope makes `assemble` REPLACE the returned sections with that one section
+    // AFTER this listener returns (packages/core/system-prompt/src/index.ts:629-634),
+    // so the listener sees — and correctly reports — a normal multi-section
+    // assembly, and its own output is discarded with no error at all. Measured:
+    // 17 sections in, 17 out, rewrite applied, final prompt = the one persona
+    // section. The register is therefore read from the REGISTRY, which is the only
+    // place the mark exists once the assembly has been built.
+    const registry = detectCompleteRegistry(this.registryOf(ctx), scope)
+    if (!registry.ok) {
+      // Not the same as "no complete section": say which one it is, so nobody
+      // reads a silent probe failure as a clean bill of health.
+      ctx.logger?.warn('prompt-plan: could not test for a complete:true section — %s; the rewrite proceeds, and its output will be discarded if one is registered', registry.problem)
+    } else if (registry.registrations.length > 0) {
+      ctx.logger?.error('prompt-plan: %s', completeRegistrationRefusal(registry.registrations, this.resolved.mode))
+      if (this.resolved.mode === 'rewrite') return produced
+    }
+
+    if (this.resolved.mode === 'rewrite') {
+      const verdict = detectCompleteShape(before)
+      if (verdict.detected) {
+        ctx.logger?.error('prompt-plan: %s', completeRefusal(verdict, this.resolved.mode))
+        return produced
+      }
+    }
+
+    const outcome = this.resolved.mode === 'rewrite'
+      ? this.rewrite(ctx, before)
+      : { sections: before, trace: [] as readonly RuleTrace[] }
+
+    this.record(before, outcome.sections, produced === incoming, detectCompleteShape(outcome.sections).detected || incomingShape.detected, outcome.trace)
+    if (outcome.sections === before) return produced
+    return { ...(produced as Record<string, unknown>), sections: outcome.sections }
+  }
+
+  /** Apply the rules, refusing rather than guessing when the file is unusable. */
+  private rewrite(ctx: Context, sections: readonly SectionRecord[]): { sections: readonly SectionRecord[]; trace: readonly RuleTrace[] } {
+    if (this.ruleSet === undefined || this.compiled.length === 0) {
+      ctx.logger?.error(
+        'prompt-plan: rewrite mode is on but no usable rule set is loaded (rules %s); the assembly is returned unchanged',
+        this.ruleSet === undefined ? 'absent or malformed' : 'empty',
+      )
+      return { sections, trace: [] }
+    }
+    const result = applyRules(sections, this.compiled, 'refuse')
+    if (!result.ok) {
+      ctx.logger?.error('prompt-plan: %s', result.refusal.problem)
+      return { sections, trace: [] }
+    }
+    return { sections: result.sections, trace: result.trace }
+  }
+
+  /**
+   * The prompt registry, looked up lazily when the mount-time lookup failed.
+   *
+   * The mount-time lookup is an optimisation, not the contract: a Loader row is
+   * constructed while the tree is still being composed, so the registry may not
+   * be resolvable yet. MEASURED: in the headless composition the constructor's
+   * `ctx.get('systemPrompt')` returned `undefined`, the value was cached, and the
+   * complete-section test therefore never ran — a silent no-op of exactly the
+   * kind this change exists to remove. The lookup is retried until it succeeds
+   * once, and the result is cached from then on.
+   * @param ctx - the listener's context.
+   * @returns the registry, or undefined when this composition has none.
+   */
+  private registryOf(ctx: Context): unknown {
+    if (this.presetRegistry !== undefined) return this.presetRegistry
+    try {
+      this.presetRegistry = ctx.get('systemPrompt' as never)
+    } catch {
+      return undefined
+    }
+    if (this.presetRegistry === undefined) {
+      ctx.logger?.warn('prompt-plan: the systemPrompt service is still not resolvable; the complete:true test cannot run for this assembly')
+    }
+    return this.presetRegistry
+  }
+
+  /** Hand one assembly's evidence to the observer, without awaiting the disk. */
+  private record(
+    before: readonly SectionRecord[],
+    after: readonly SectionRecord[],
+    sameReference: boolean,
+    completeShape: boolean,
+    trace: readonly RuleTrace[],
+  ): void {
+    if (!this.resolved.observe || this.observer === undefined) return
+    const rendered = trace.map(entry =>
+      `${entry.id} [${entry.match}] -> ${entry.action}; matched ${entry.matched.length === 0 ? '(none)' : entry.matched.map(name => JSON.stringify(name)).join(', ')}; sections ${entry.sectionsBefore} -> ${entry.sectionsAfter}`)
+    void this.observer.record(
+      before,
+      after,
+      sameReference,
+      completeShape,
+      this.resolved.fullText,
+      this.ruleSet === undefined ? undefined : { path: this.ruleSet.path, sha256: this.ruleSet.sha256 },
+      rendered,
+    ).catch((error: unknown) => {
+      // An artifact write that fails must never fail the turn: the prompt is
+      // already correct, and losing an observation line is not worth an error
+      // in front of the model.
+      void error
+    })
+  }
+}
+
+export default PromptPlan

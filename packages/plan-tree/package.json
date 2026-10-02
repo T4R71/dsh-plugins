@@ -1,6 +1,6 @@
 {
   "name": "@t4r71/dsh-plan-tree",
-  "description": "Logged, projected plan tree: plan_write declares the whole tree once, plan_step walks it node by node",
+  "description": "Plan tree in the plugin's own settings namespace: plan_write declares the whole tree once, plan_step walks it node by node",
   "version": "0.1.0",
   "publishConfig": {
     "access": "public"
@@ -22,33 +22,55 @@
       "types": "./lib/types/types.d.ts",
       "default": "./lib/types/types.js"
     },
+    "./session-store": {
+      "types": "./lib/types/session-store.d.ts",
+      "default": "./lib/session-store.js"
+    },
     "./client": {
       "types": "./lib/types/client.d.ts",
       "default": "./lib/types/client.js"
     },
+    "./cordis.patch.yml": "./cordis.patch.yml",
     "./src/*": "./src/*",
+    "./locale/*.json": "./locale/*.json",
     "./package.json": "./package.json"
+  },
+  "scripts": {
+    "build": "tsc -b && tsdown",
+    "typecheck": "tsc -b && tsc -p tsconfig.test.json --noEmit",
+    "test": "node --import tsx/esm --test tests/plan-tree.spec.ts tests/task-tree.spec.ts"
   },
   "files": [
     "lib/index.js",
+    "lib/session-store.js",
+    "cordis.patch.yml",
     "lib/types/**/*.js",
-    "lib/types/**/*.d.ts"
+    "lib/types/**/*.d.ts",
+    "icon.svg",
+    "locale/*.json"
   ],
   "license": "MIT",
   "dependencies": {
     "zod": "^4.4.3"
   },
   "peerDependencies": {
-    "@deepseek-ai/dsh-session": "0.1.6-alpha.2",
-    "@deepseek-ai/dsh-session-projection": "0.1.6-alpha.2",
-    "@deepseek-ai/dsh-tools": "0.1.6-alpha.2",
-    "@deepseek-ai/cordis": "^4.0.4"
+    "@deepseek-ai/cordis": "^4.0.4",
+    "@deepseek-ai/dsh-session": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-tools": "^0.2.0-rc.2"
   },
   "devDependencies": {
-    "@deepseek-ai/dsh-agent": "0.1.6-alpha.2",
-    "@deepseek-ai/dsh-session": "0.1.6-alpha.2",
-    "@deepseek-ai/dsh-session-projection": "0.1.6-alpha.2",
-    "@deepseek-ai/dsh-tools": "0.1.6-alpha.2",
-    "@deepseek-ai/cordis": "^4.0.4"
-  }
+    "@deepseek-ai/cordis": "^4.0.4",
+    "@deepseek-ai/cosmokit": "^1.8.5",
+    "@deepseek-ai/dsh-agent": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-llm": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-session": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-system-prompt": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-tools": "0.2.0-rc.2",
+    "@deepseek-ai/schemastery": "^3.18.4",
+    "@types/node": "^24.0.0",
+    "tsdown": "^0.22.2",
+    "tsx": "^4.22.4",
+    "typescript": "^6.0.3"
+  },
+  "icon": "./icon.svg"
 }

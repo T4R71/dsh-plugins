@@ -7,7 +7,10 @@
  *       代理执行项   第 2 层 —— 一个功能块并行丢给几个代理，行尾写是谁
  *         内部阶段   第 3 层 —— 代理自己绘制的工作阶段，默认收起、可展开
  *
- * 纯计算，不碰 DOM。折叠语义：折叠的节点，其子树整段隐藏。
+ * 纯计算，不碰 DOM。折叠语义：折叠的节点，其子树整段隐藏，节点自己那一行照旧显示。
+ *
+ * 已完成的节点默认折叠 —— 做完的那一支不再铺开它的孩子，只留自己一行（仍然可以手动展开）。
+ * 这是纯粹的呈现层规则：树的数据没有被改写，completed 在存储里就是 completed。
  */
 import { lifeOf, deathReason, kindOf, subtitleOf, answerOf, type TreeNode } from './semantics.ts'
 
@@ -30,7 +33,18 @@ export interface OutlineRow {
   reason?: string | undefined
   answer?: string | undefined
   assignedTo?: string | undefined
+  /** 行尾那个 `(名字 · 状态)`；对不上成员时不写，退回 `@childId`。 */
+  owner?: RowOwner | undefined
 }
+
+/** 行尾队友标记：名字与**运行时**状态，两者都逐字来自 Agent Teams 投影。 */
+export interface RowOwner {
+  name: string
+  status: string
+}
+
+/** assignedTo → 队友标记的字典；由面板算好后按值传进来。 */
+export type OwnerIndex = Readonly<Record<string, RowOwner>>
 
 /** 四种状态的计数。 */
 export interface StatusCounts {
@@ -112,8 +126,12 @@ const INTERNAL_FROM_DEPTH = 3
 
 /**
  * 哪些节点默认折叠：
- *   1. 走不通的分支 —— 子树已经作废，收起来；
- *   2. 代理内部阶段（第 3 层及更深）—— 需要时再展开。
+ *   1. 已经完成的节点 —— 它自己的孩子不再铺开，这一行留着（用户裁定：折叠只是「先不画这一段」）；
+ *   2. 走不通的分支 —— 子树已经作废，收起来；
+ *   3. 代理内部阶段（第 3 层及更深）—— 需要时再展开。
+ *
+ * 只影响默认值：用户点开过之后由 `TaskTreePanel` 自己的集合接管。
+ * 数据侧一个字节都不动 —— 这里只决定「这一段画不画」。
  * @param roots - 根节点数组
  * @returns 默认折叠的 id 集合
  */
@@ -122,7 +140,8 @@ export function defaultCollapsed(roots: readonly TreeNode[]): Set<string> {
   const visit = (node: TreeNode, depth: number, upstreamDead: boolean): void => {
     const life = lifeOf(node, upstreamDead)
     const kids = node.children ?? []
-    if (kids.length > 0 && (life === 'dead' || life === 'orphan' || depth >= INTERNAL_FROM_DEPTH)) {
+    if (kids.length > 0
+      && (node.status === 'completed' || life === 'dead' || life === 'orphan' || depth >= INTERNAL_FROM_DEPTH)) {
       out.add(node.id)
     }
     for (const k of kids) visit(k, depth + 1, upstreamDead || life === 'dead')
@@ -133,18 +152,33 @@ export function defaultCollapsed(roots: readonly TreeNode[]): Set<string> {
 
 /**
  * 摊平成大纲。深度优先，一个节点一行，顺序就是阅读顺序。
+ *
+ * `owners` 是可选的：给不出成员字典（这个 profile 没装 Agent Teams 那一行）时，
+ * 行尾照旧显示 `@childId` —— 认不出是谁，但绝不把已有的信息丢掉。
  * @param roots - 根节点数组
  * @param collapsed - 已被用户折叠的 id 集合
+ * @param owners - assignedTo → 队友标记；没有就传 undefined
  * @returns 行数组
  */
-export function buildOutline(roots: readonly TreeNode[], collapsed: ReadonlySet<string>): OutlineRow[] {
+export function buildOutline(
+  roots: readonly TreeNode[],
+  collapsed: ReadonlySet<string>,
+  owners?: OwnerIndex | undefined,
+): OutlineRow[] {
   const rows: OutlineRow[] = []
   const visit = (node: TreeNode, depth: number, upstreamDead: boolean, link: boolean): void => {
     const life = lifeOf(node, upstreamDead)
     const kids = node.children ?? []
     const isCollapsed = collapsed.has(node.id)
-    const detail = subtitleOf(node)
+    // 死因有自己的位置（reason），这时候副标题只能把同一段文本再显示一遍 ——
+    // 真机实测：detail 是「状态：未收到回报｜…」（前缀既不是「死因：」也不是「答：」）时，
+    // subtitleOf 与 deathReason 都返回整条正文，界面上就同时出现「因为：X」与「X」。
+    // 去重放在这里，不放进 subtitleOf：那个函数只看得到节点，判不出死与不死，
+    // 要判就得把 lifeOf 的死亡判据再抄一份（status === 'blocked' || 前缀是「死因：」），
+    // 日后改 lifeOf 两处会静默走偏；而这里上一行就是刚算出来的 life。
+    const detail = life === 'dead' ? '' : subtitleOf(node)
     const answer = answerOf(node)
+    const owner = node.assignedTo === undefined ? undefined : owners?.[node.assignedTo]
     rows.push({
       id: node.id, title: node.title, status: node.status, life, kind: kindOf(node, life),
       depth, link, hasChildren: kids.length > 0, collapsed: isCollapsed,
@@ -154,6 +188,7 @@ export function buildOutline(roots: readonly TreeNode[], collapsed: ReadonlySet<
       ...(life === 'dead' ? { reason: deathReason(node) } : {}),
       ...(answer ? { answer } : {}),
       ...(node.assignedTo !== undefined ? { assignedTo: node.assignedTo } : {}),
+      ...(owner === undefined ? {} : { owner }),
     })
     if (isCollapsed) return
     for (let i = 0; i < kids.length; i++) {

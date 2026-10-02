@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Dual-axis access mode",
+    "description": "The file sandbox's read and write axes — deny, workspace, all or custom with allow/deny path lists — as an installable profile layer."
+  }
+}

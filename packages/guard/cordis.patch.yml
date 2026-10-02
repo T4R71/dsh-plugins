@@ -1,0 +1,21 @@
+# @t4r71/dsh-guard 的组合包补丁：只插入本包自己的一行。
+#
+# 本包是宿主侧的单一 cordis 插件（导出 `apply` 与 schemastery 的 `Config`），没有
+# 客户端半边，因此补丁里只有一行，id 与 name 各自的作用是：
+#
+#   id   `guard` —— Loader entry id。0.1.7 里 entry id 同时是设置命名空间
+#        （SettingsForms.write 按 options.id 找条目），也是插件页那一行的键。
+#   name `@t4r71/dsh-guard` —— 要被加载的包名，必须与本包 package.json 的 name 逐字相同。
+#
+# 挂载点：本包在 apply() 里注册三个监听器 —— `llm/stream`（瀑布式拦截流式分片）、
+# `agent/turn-stopping`（刹车/空响应/空转的续写仲裁）、`agent/request-error`
+# （自动重试的兜底层）。inject 声明为 ['llm', 'sessions']，所以这一行必须挂在提供
+# llm 与 session 服务的 profile 上。
+#
+# 本包不与 @deepseek-ai/dsh-llm-pi-ai 竞争：它只使用事件接缝，原版接入层原封不动
+# 也能触发全部三条规则。
+- insert:
+    - id: guard
+      name: '@t4r71/dsh-guard'
+      config:
+        verbose: true

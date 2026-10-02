@@ -1,0 +1,410 @@
+/**
+ * Strip whole tool declarations out of the `tools:sdk` prompt section, while
+ * leaving the tools CALLABLE.
+ *
+ * ## Why this is safe, and where the danger actually is
+ *
+ * The sandbox's `tools` binding comes from `registry.schemas(exec.agent)`
+ * (`packages/core/tools/src/index.ts:1240-1242`), which is the view of VISIBLE
+ * tools. The `tools:sdk` section is a separate rendering of the same view
+ * (`renderToolsSdk`, `packages/core/tools/src/ts-types.ts:297-317`). Removing
+ * TEXT from one section therefore leaves `await tools.<name>(args)` working,
+ * because the binding never reads this text.
+ *
+ * The mirror image is the trap: anything that touches VISIBILITY — disable,
+ * deny, `tools.restrict`, a tool filter — removes the binding too, and the model
+ * then gets `TypeError: tools.<name> is not a function`. This module only ever
+ * rewrites text, and it never consults or mutates the registry.
+ *
+ * ## The two declarations of one tool, and how each is found
+ *
+ * `renderToolsSdk` emits, for every tool in lexicographic order:
+ *
+ *   interface ToolArgsMap {          <- and ToolOutputMap, same shape
+ *     <doc lines, one per description line>
+ *     <name>: <type>;                <- exactly this tool's member
+ *   }
+ *
+ * A tool has exactly TWO members in the section, one in each map. The anchor is
+ * the member DECLARATION line — `^  <name>:` with exactly the renderer's two
+ * spaces of indent — and a member runs to the next line at that same indent, or
+ * to the map's closing brace. Doc lines and nested braces travel with the member
+ * being removed, because they belong to whatever follows them.
+ *
+ * ## The refusal discipline
+ *
+ * Three independent checks, and any failure returns the input text UNCHANGED:
+ *
+ *   1. Structure — every `{ `/`(`/`[` outside a string or comment is paired, and
+ *      the map bodies are found by brace matching rather than by a regex.
+ *   2. Accounting — the characters removed must equal, exactly, the sum of the
+ *      per-tool lengths measured before the removal.
+ *   3. Re-read — the remainder must still brace-balance and must still carry the
+ *      same number of members per map, minus the ones removed.
+ *
+ * A partial strip is worse than no strip: it would publish a `tools:sdk` text
+ * that declares half a tool. So the failure mode is always "return the whole
+ * text as it was", never "strip what could be stripped".
+ *
+ * @module @t4r71/dsh-prompt-plan/strip
+ */
+
+/** The section this module operates on. */
+export const TOOLS_SDK_SECTION = 'tools:sdk'
+
+/** The map names the renderer emits, in the order it emits them. */
+export const SDK_MAPS = ['ToolArgsMap', 'ToolOutputMap'] as const
+
+/** One tool's removal, as measured before the removal. */
+export interface StrippedTool {
+  /** The tool name, as written in the map. */
+  readonly name: string
+  /** Declaration lines removed from `ToolArgsMap`, including its doc lines. */
+  readonly argsChars: number
+  /** Declaration lines removed from `ToolOutputMap`. */
+  readonly outputChars: number
+}
+
+/** A refusal, with the sentence naming what could not be established. */
+export interface StripRefusal {
+  /** Which check refused. */
+  readonly check: 'structure' | 'accounting' | 'reread'
+  /** One sentence, for the log line. */
+  readonly problem: string
+}
+
+/** What one strip produced. */
+export type StripOutcome =
+  | { readonly ok: true; readonly text: string; readonly removed: readonly StrippedTool[]; readonly removedChars: number }
+  | { readonly ok: false; readonly refusal: StripRefusal }
+
+/** One located map body inside the section text. */
+interface MapBody {
+  /** The line index of the `interface <name> {` line. */
+  readonly headerLine: number
+  /** The line index of the body's first line; equals the closing brace when empty. */
+  readonly firstBodyLine: number
+  /** The line index of the closing brace line. */
+  readonly closingLine: number
+}
+
+/** A member's line span, inclusive on both ends. */
+interface MemberSpan {
+  readonly name: string
+  readonly startLine: number
+  readonly endLine: number
+  readonly chars: number
+}
+
+/**
+ * Whether one line's braces and brackets nest, ignoring strings and comments.
+ *
+ * A line-oriented scanner rather than a regex, because the generated TypeScript
+ * carries string literals (`"ToolCallError"`, doc prose with braces) that a
+ * regex cannot tell from structure. Line comments and block comments are tracked
+ * across lines by the caller through {@link ScanState}.
+ */
+interface ScanState {
+  /** Carets accumulated across lines while inside a `/* … *​/` comment. */
+  inBlockComment: boolean
+}
+
+/**
+ * Scan one line's structural characters.
+ * @param line - the line's text.
+ * @param state - the carried block-comment flag; mutated.
+ * @returns the net nesting delta of the line, and whether it ended inside a string.
+ */
+function scanLine(line: string, state: ScanState): { delta: number; openString: boolean } {
+  let delta = 0
+  let quote = ''
+  let index = 0
+  while (index < line.length) {
+    const char = line[index] ?? ''
+    if (state.inBlockComment) {
+      if (char === '*' && line[index + 1] === '/') {
+        state.inBlockComment = false
+        index += 2
+        continue
+      }
+      index += 1
+      continue
+    }
+    if (quote !== '') {
+      if (char === '\\') {
+        index += 2
+        continue
+      }
+      if (char === quote) quote = ''
+      index += 1
+      continue
+    }
+    if (char === '/' && line[index + 1] === '*') {
+      state.inBlockComment = true
+      index += 2
+      continue
+    }
+    if (char === '/' && line[index + 1] === '/') break
+    if (char === '"' || char === "'" || char === '`') {
+      quote = char
+      index += 1
+      continue
+    }
+    if (char === '{' || char === '(' || char === '[') delta += 1
+    else if (char === '}' || char === ')' || char === ']') delta -= 1
+    index += 1
+  }
+  return { delta, openString: quote !== '' }
+}
+
+/** The whole text's brace balance, as a structural sanity check. */
+function balanced(text: string): boolean {
+  const state: ScanState = { inBlockComment: false }
+  let depth = 0
+  for (const line of text.split('\n')) {
+    const scanned = scanLine(line, state)
+    depth += scanned.delta
+    if (depth < 0) return false
+  }
+  return depth === 0 && !state.inBlockComment
+}
+
+/**
+ * Locate one map's body by brace matching, from its `interface` header line.
+ *
+ * The header is matched on the exact line the renderer emits
+ * (``interface ToolArgsMap {``), so a section that does not carry the
+ * renderer's shape is refused instead of being mis-parsed.
+ * @param lines - the section text's lines.
+ * @param mapName - the map's interface name.
+ * @returns the body's line span, or the sentence explaining why it is not there.
+ */
+function locateMap(lines: readonly string[], mapName: string): MapBody | string {
+  const header = `interface ${mapName} {`
+  const headerIndex = lines.findIndex(line => line === header)
+  if (headerIndex < 0) return `no line equal to ${JSON.stringify(header)}`
+  const state: ScanState = { inBlockComment: false }
+  let depth = 0
+  for (let index = headerIndex; index < lines.length; index += 1) {
+    const line = lines[index] ?? ''
+    const scanned = scanLine(line, state)
+    if (scanned.openString) return `line ${index + 1} ends inside a string literal`
+    depth += scanned.delta
+    if (index === headerIndex) continue
+    if (depth === 0) {
+      if (line.trim() !== '}') return `the ${mapName} body closes on line ${index + 1}, which is not a lone brace`
+      return { headerLine: headerIndex, firstBodyLine: headerIndex + 1, closingLine: index }
+    }
+  }
+  return `the ${mapName} body never closes`
+}
+
+/**
+ * One map's member ranges, keyed by the member name on the declaration line.
+ *
+ * The anchor is the renderer's own indentation: a member line is `  <name>:`, at
+ * exactly two spaces. Anything deeper belongs to the member above it — which is
+ * why the scan is over lines and ranges, not over a regular expression.
+ * @param lines - the section text's lines.
+ * @param body - the located map body.
+ * @returns one span per member, in file order, with its name.
+ */
+function membersOf(lines: readonly string[], body: MapBody): MemberSpan[] {
+  const spans: MemberSpan[] = []
+  const pattern = /^  ([^\s:]+):/
+  let index = body.firstBodyLine
+  while (index < body.closingLine) {
+    const line = lines[index] ?? ''
+    const matched = pattern.exec(line)
+    // A non-member line before the first member can only be a doc line of the
+    // member that follows it, so it is skipped without being claimed.
+    if (matched === null) {
+      index += 1
+      continue
+    }
+    const name = matched[1] ?? ''
+    // The member's DOC LINES sit above it and belong to it: the renderer emits
+    // one doc line per description line of the tool. They are claimed here, by
+    // walking back over contiguous doc/blank lines that no earlier member owns.
+    let start = index
+    while (start - 1 >= body.firstBodyLine) {
+      const above = lines[start - 1] ?? ''
+      if (above.trimStart().startsWith('/**') || above.trimStart().startsWith('*') || above.trimStart().startsWith('*/')) {
+        start -= 1
+        continue
+      }
+      break
+    }
+    // The member runs until its own TYPE closes. It is NOT enough to stop at the
+    // next line that is not two-space indented: a member's type spans many lines
+    // and carries nested braces of its own —
+    //
+    //   schedule_create: {
+    //     /** … */
+    //     at?: string | {
+    //       date: string;
+    //     };
+    //   };
+    //
+    // — so the end is found by brace DEPTH, relative to the member's declaration
+    // line. A blank line is never emitted inside a body, so one means malformed
+    // input and is refused rather than guessed through.
+    const depthState: ScanState = { inBlockComment: false }
+    let depth = 0
+    let end = index
+    while (end < body.closingLine) {
+      const candidate = lines[end] ?? ''
+      if (end > index && candidate.length === 0) {
+        return spans
+      }
+      const scanned = scanLine(candidate, depthState)
+      if (scanned.openString) return spans
+      depth += scanned.delta
+      end += 1
+      if (depth === 0) break
+    }
+    // A member whose type never closes would swallow the rest of the map; the
+    // caller's re-read check catches the result, but refusing here keeps the
+    // span list honest.
+    if (depth !== 0) return spans
+    spans.push({ name, startLine: start, endLine: end - 1, chars: 0 })
+    index = end
+  }
+  return spans
+}
+
+/** Sum the character weight of one span, counting its trailing newline. */
+function spanChars(lines: readonly string[], span: MemberSpan): number {
+  let total = 0
+  for (let index = span.startLine; index <= span.endLine; index += 1) {
+    total += (lines[index] ?? '').length + 1
+  }
+  return total
+}
+
+/** What one strip attempt measured, whether or not it was applied. */
+export interface StripAnalysis {
+  /** One entry per tool found in BOTH maps, with its two declaration lengths. */
+  readonly tools: readonly StrippedTool[]
+  /**
+   * Names requested that were absent from one or both maps. Absent is not an
+   * error — a tool that is not visible in this assembly is simply not there.
+   */
+  readonly missing: readonly string[]
+}
+
+/**
+ * Measure — and, unless `dryRun`, remove — the named tools' declarations.
+ *
+ * Total: every path returns, and every failure returns `ok: false` with the
+ * sentence naming the failed check. The caller decides what to do with a
+ * refusal; upstream (`applyTransformOp`) treats it as "return the text as it
+ * was".
+ * @param text - the `tools:sdk` section text for this scope.
+ * @param names - the tool names whose declarations are to be removed.
+ * @param dryRun - measure only; the returned text is then the input text.
+ * @returns the outcome, or the refusal naming the failed check.
+ */
+export function stripToolDeclarations(text: string, names: readonly string[], dryRun: boolean): StripOutcome {
+  try {
+    if (names.length === 0) return { ok: true, text, removed: [], removedChars: 0 }
+    const lines = text.split('\n')
+    const bodies: MapBody[] = []
+    for (const mapName of SDK_MAPS) {
+      const located = locateMap(lines, mapName)
+      if (typeof located === 'string') return { ok: false, refusal: { check: 'structure', problem: `the ${mapName} interface could not be located: ${located}` } }
+      bodies.push(located)
+    }
+    const argsBody = bodies[0] as MapBody
+    const outputBody = bodies[1] as MapBody
+    const argsMembers = membersOf(lines, argsBody)
+    const outputMembers = membersOf(lines, outputBody)
+
+    // Every requested name is looked up in BOTH maps. A name in one map only is
+    // a shape this module refuses to guess about: removing half a tool is the
+    // failure it exists to prevent.
+    const wanted = new Set(names)
+    const tools: StrippedTool[] = []
+    const missing: string[] = []
+    const argsSpans: MemberSpan[] = []
+    const outputSpans: MemberSpan[] = []
+    for (const name of names) {
+      const argsSpan = argsMembers.find(span => span.name === name)
+      const outputSpan = outputMembers.find(span => span.name === name)
+      if (argsSpan === undefined || outputSpan === undefined) {
+        missing.push(name)
+        continue
+      }
+      tools.push({
+        name,
+        argsChars: spanChars(lines, argsSpan),
+        outputChars: spanChars(lines, outputSpan),
+      })
+      argsSpans.push(argsSpan)
+      outputSpans.push(outputSpan)
+    }
+    const removedChars = tools.reduce((total, tool) => total + tool.argsChars + tool.outputChars, 0)
+
+    if (dryRun) return { ok: true, text, removed: tools, removedChars }
+
+    const drop = new Set<number>()
+    for (const span of [...argsSpans, ...outputSpans]) {
+      for (let index = span.startLine; index <= span.endLine; index += 1) drop.add(index)
+    }
+    const kept = lines.filter((_line, index) => !drop.has(index))
+    const stripped = kept.join('\n')
+
+    // CHECK 2 — accounting. The removal is line-based, so the characters that
+    // disappeared must be exactly the sum measured above. A difference means the
+    // span arithmetic and the filter disagree, which is not a state to publish.
+    const measured = text.length - stripped.length
+    if (measured !== removedChars) {
+      return { ok: false, refusal: { check: 'accounting', problem: `removal changed ${measured} characters but the per-tool sum is ${removedChars}` } }
+    }
+
+    // CHECK 3 — re-read. The remainder must still parse structurally, and each
+    // map must still carry exactly the members it had minus the ones removed.
+    if (!balanced(stripped)) {
+      return { ok: false, refusal: { check: 'reread', problem: 'the stripped text no longer brace-balances' } }
+    }
+    const keptLines = stripped.split('\n')
+    for (const [position, mapName] of SDK_MAPS.entries()) {
+      const before = position === 0 ? argsMembers.length : outputMembers.length
+      const removed = position === 0 ? argsSpans.length : outputSpans.length
+      const relocated = locateMap(keptLines, mapName)
+      if (typeof relocated === 'string') {
+        return { ok: false, refusal: { check: 'reread', problem: `after stripping, the ${mapName} interface could not be re-located: ${relocated}` } }
+      }
+      const after = membersOf(keptLines, relocated).length
+      if (after !== before - removed) {
+        return { ok: false, refusal: { check: 'reread', problem: `after stripping, ${mapName} carries ${after} members where ${before - removed} were expected` } }
+      }
+    }
+    // A name that was requested and measured must be gone from the text; a
+    // remainder that still spells it as a member means the span was wrong.
+    for (const tool of tools) {
+      if (keptLines.some(line => line === `  ${tool.name}:` || line.startsWith(`  ${tool.name}: `))) {
+        return { ok: false, refusal: { check: 'reread', problem: `${tool.name} still appears as a member of the stripped text` } }
+      }
+    }
+    void wanted
+    return { ok: true, text: stripped, removed: tools, removedChars }
+  } catch (error: unknown) {
+    // The backstop, and the reason this module never throws into the waterfall:
+    // the system prompt must assemble even when this pass is broken.
+    const reason = error instanceof Error ? error.message : String(error)
+    return { ok: false, refusal: { check: 'structure', problem: `unexpected failure while stripping: ${reason}` } }
+  }
+}
+
+/**
+ * Measure the named tools without removing anything.
+ * @param text - the `tools:sdk` section text.
+ * @param names - the tool names to measure.
+ * @returns the per-tool declaration lengths and the names that were absent.
+ */
+export function measureToolDeclarations(text: string, names: readonly string[]): StripAnalysis | StripRefusal {
+  const outcome = stripToolDeclarations(text, names, true)
+  if (!outcome.ok) return outcome.refusal
+  return { tools: outcome.removed, missing: [] }
+}

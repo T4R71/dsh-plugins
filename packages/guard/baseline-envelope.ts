@@ -1,0 +1,220 @@
+/**
+ * Items 5 and 6 — the settle-envelope rule for subagent closing messages.
+ *
+ * ## The problem
+ *
+ * \`@deepseek-ai/dsh-subagent\` delivers a settled child's closing message into
+ * the parent as a *plain* durable \`user\` message whose third text block is the
+ * child's entire final answer, unbounded
+ * (\`dsh-subagent/lib/index.js:633-654\`, \`createSettlementMessage\`; the
+ * concatenation at \`:640-646\` has no cap, and the only bounded field is
+ * \`source.summary\`, which never reaches a model).
+ *
+ * Measured on this deployment's parent session: 29 settlement messages,
+ * 172,344 characters of JSON / 160,237 characters of text, largest single
+ * closing message 15,562 characters.
+ *
+ * ## Why an envelope and not a truncation
+ *
+ * A child's closing message is the *result of the work*. Dropping any of it is
+ * not a saving, it is a lost deliverable, so the rule is not keep-the-head.
+ * It is: the full text is written to disk and hashed, and what enters the
+ * parent's transcript is a pointer plus the sections the dispatch brief asked
+ * the child to lead with. The parent can always read the rest back — the
+ * envelope names where it is and what it hashes to, so the parent can also
+ * verify that what it reads back is what the child wrote.
+ *
+ * ## The seam, and why it does not cost a cache miss
+ *
+ * The settlement message is \`role: 'user'\` and travels through
+ * \`parent.inbox\` -> \`dsh-agent-loop/lib/index.js:906 claim()\` ->
+ * \`:912\` \`payload.messages\` of the \`agent/pre-step\` waterfall; the listener's
+ * return value is what \`:1061\` commits and \`:1063\` builds the request from.
+ * Replacing it there happens *before the first commit*, so the original never
+ * enters a prompt prefix and no cache is invalidated. \`dsh-agent\`'s own
+ * \`disposeNotice\` listener (\`dsh-agent/lib/index.js:193-204\`) rewrites the same
+ * array, which is the precedent.
+ *
+ * The analysis behind all of the above is \`M:/DSH-T4/scratch/settle-envelope.md\`
+ * and \`M:/DSH-T4/scratch/json-mode.md\`; those conclusions are taken as given
+ * and are not re-derived here.
+ *
+ * ## Item 6: the section convention
+ *
+ * JSON mode is not reachable — \`LlmCallConfig\`
+ * (\`dsh-llm/lib/typert.host.js:340-341\`) has no output-format field, and
+ * \`task\` can only start a *continuable* child
+ * (\`packages/task/src/index.ts:1432\` \`startContinuable\`), whose spec type
+ * omits \`outputSchema\` (\`dsh-subagent/lib/typert.host.js:346-348\`). So the
+ * substitute is a convention on both sides: the dispatch brief asks the child
+ * to lead its closing message with a fixed set of sections, and the envelope
+ * shows those sections' first lines while spilling the whole message.
+ *
+ * ## Fidelity guarantee
+ *
+ * - The full closing text is always written before the envelope is built; if
+ *   the write fails, the message is left untouched rather than replaced by a
+ *   pointer that leads nowhere.
+ * - The envelope carries the \`sha256\` of the exact spilled text, so a reader
+ *   can prove the read-back matches.
+ * - With \`settleEnvelope: false\` nothing in this module runs and the message
+ *   is committed byte-for-byte as the harness built it.
+ *
+ * @module @t4r71/dsh-guard/envelope
+ */
+
+import type { ContentBlock, UserMessage } from '@deepseek-ai/dsh-llm'
+import { byteLength, sha256Hex, spillDirectory, writeSpill } from './src/spill.ts'
+
+/** Whether settle-envelope rewriting is willing to run. */
+export interface EnvelopeDecision {
+  /** The switch; \`false\` returns every message untouched. */
+  readonly enabled: boolean
+  /** How many leading lines of each requested section the envelope shows. */
+  readonly headLines: number
+}
+
+/** The section headings the dispatch brief asks a child to lead with, in order. */
+export const ENVELOPE_SECTIONS = ['结论', '证据', '判不了']
+
+/** The harness's own lead-ins, which the envelope keeps verbatim. */
+const CLOSING_LEAD_IN = 'Its closing message:'
+const NO_CLOSING = 'It left no closing message.'
+
+/** Every text block of a message, in order; \`undefined\` when any block is not text. */
+function textsOf(content: readonly ContentBlock[]): string[] | undefined {
+  const out: string[] = []
+  for (const block of content) {
+    if (block.type !== 'text') return undefined
+    out.push(block.text)
+  }
+  return out
+}
+
+/** One requested section found in a closing message. */
+export interface FoundSection {
+  /** The heading, normalised to the requested spelling. */
+  readonly heading: string
+  /** The first \`headLines\` lines of the section body. */
+  readonly body: readonly string[]
+}
+
+/**
+ * The requested sections present in a closing message, in the order they appear.
+ *
+ * Both the markdown form the brief asks for and a bare heading are accepted; a
+ * child that wrote \`## 结论\` and one that wrote \`结论:\` mean the same thing, and
+ * refusing one of them would make the convention a trap.
+ *
+ * @param closing - the child's closing text.
+ * @param headLines - how many lines of a section body to keep.
+ * @returns one entry per heading found.
+ */
+export function leadingSections(closing: string, headLines: number): FoundSection[] {
+  const lines = closing.split('\n')
+  const found: FoundSection[] = []
+  for (let index = 0; index < lines.length; index += 1) {
+    const trimmed = (lines[index] as string).trim()
+    let heading: string | undefined
+    // Text following the heading on its own line, as in `结论：ok`. A child that
+    // writes the section and its first sentence together is following the
+    // instruction, not breaking it, so this is captured rather than dropped —
+    // otherwise the heading would be recognised and its content thrown away.
+    let inline: string | undefined
+    for (const section of ENVELOPE_SECTIONS) {
+      if (trimmed === '## ' + section || trimmed === '##' + section
+        || trimmed === section || trimmed === section + ':' || trimmed === section + '：') {
+        heading = section
+        break
+      }
+      for (const separator of [':', '：']) {
+        for (const prefix of ['## ' + section, '##' + section, section]) {
+          const lead = prefix + separator
+          if (trimmed.startsWith(lead) && trimmed.length > lead.length) {
+            heading = section
+            inline = trimmed.slice(lead.length)
+            break
+          }
+        }
+        if (heading !== undefined) break
+      }
+      if (heading !== undefined) break
+    }
+    if (heading === undefined) continue
+    const body: string[] = []
+    if (inline !== undefined && headLines > 0) body.push(inline)
+    for (let i = index + 1; i < lines.length && body.length < headLines; i += 1) {
+      const candidate = lines[i] as string
+      // A blank line ends the section. Without this the separator a child puts
+      // between two headings is counted as body, so a budget of one line shows
+      // the heading's first line plus the gap — which is how the envelope came
+      // to spend its display budget on whitespace.
+      if (candidate.trim() === '') break
+      if (candidate.trim().startsWith('##')) break
+      body.push(candidate)
+    }
+    found.push({ heading, body })
+  }
+  return found
+}
+
+/**
+ * Build the content that replaces a settlement message's closing blocks.
+ *
+ * The returned blocks keep the harness's own lead-in lines, so the message
+ * still reads as a settlement notice in the transcript, and then carry the
+ * envelope. The original closing text is NOT reproduced: it is at the path the
+ * envelope names, with its hash.
+ *
+ * @param message - the settlement message as the harness built it.
+ * @param decision - whether and how to envelope.
+ * @returns replacement content, or \`undefined\` to leave the message alone.
+ */
+export function envelopeContent(message: UserMessage, decision: EnvelopeDecision): ContentBlock[] | undefined {
+  if (!decision.enabled) return undefined
+  const source = message.source as { kind?: unknown, senderSessionId?: unknown } | undefined
+  if (source?.kind !== 'subagent-settled') return undefined
+  const texts = textsOf(message.content)
+  if (texts === undefined) return undefined
+  const marker = texts.indexOf(CLOSING_LEAD_IN)
+  // A child that left nothing, or a shape this build does not recognise: the
+  // message is already short, so there is nothing to save and nothing to risk.
+  if (marker < 0 || texts.length <= marker + 1) return undefined
+  if (texts.includes(NO_CLOSING)) return undefined
+
+  const closing = texts.slice(marker + 1).join('')
+  const childId = typeof source.senderSessionId === 'string' ? source.senderSessionId : 'unknown'
+  const digest = sha256Hex(closing)
+  const path = writeSpill(spillDirectory('settle', childId), digest.slice(0, 16) + '.md', closing)
+  // The write is the whole recovery path. If it failed, handing over the
+  // original is the only faithful choice; an envelope pointing at nothing would
+  // be a silent loss of the child's work.
+  if (path === undefined) return undefined
+
+  const head = texts.slice(0, marker + 1)
+  const sections = leadingSections(closing, decision.headLines)
+  const lineCount = closing.split('\n').length
+  const envelope: string[] = [
+    'Envelope of its closing message (' + String(byteLength(closing)) + ' bytes, '
+      + String(lineCount) + ' lines).',
+    'Full text: ' + path,
+    'sha256 ' + digest,
+    'Read it with the read tool; the hash above verifies what you read back.',
+  ]
+  if (sections.length === 0) {
+    envelope.push('It used none of the requested section headings ('
+      + ENVELOPE_SECTIONS.join(' / ') + '); read the full text at the path above.')
+  } else {
+    for (const section of sections) {
+      envelope.push('', '## ' + section.heading)
+      for (const line of section.body) envelope.push(line)
+    }
+    envelope.push('', '(first ' + String(decision.headLines)
+      + ' line(s) of each requested section; the rest is in the full text)')
+  }
+
+  return [
+    ...head.map(text => ({ type: 'text' as const, text })),
+    { type: 'text' as const, text: envelope.join('\n') },
+  ]
+}

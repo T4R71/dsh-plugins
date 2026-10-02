@@ -1,0 +1,62 @@
+{
+  "name": "@t4r71/dsh-task-tree",
+  "description": "The task growing tree bundle: a self-contained package carrying the taskTree host projection, its browser panel drawn as an SVG flow chart, and the patch that inserts both",
+  "version": "0.1.0",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/T4R71/dsh-plugins.git",
+    "directory": "packages/task-tree"
+  },
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/types/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./src/*": "./src/*",
+    "./locale/*.json": "./locale/*.json",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "build": "tsc -b && tsdown",
+    "typecheck": "tsc -b && tsc -p tsconfig.test.json --noEmit",
+    "test": "node --import tsx/esm --test tests/bundle-listing.spec.ts"
+  },
+  "files": [
+    "lib/index.js",
+    "cordis.patch.yml",
+    "lib/types/**/*.d.ts",
+    "icon.svg",
+    "locale/*.json"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@t4r71/dsh-plan-tree": "workspace:^",
+    "@t4r71/dsh-task": "workspace:^",
+    "@t4r71/dsh-ui-task-tree": "workspace:^"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.4"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.4",
+    "@deepseek-ai/dsh-app-boot": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-plugin-manager": "0.2.0-rc.2",
+    "@types/node": "^24.0.0",
+    "tsdown": "^0.22.2",
+    "tsx": "^4.22.4",
+    "typescript": "^6.0.3"
+  },
+  "icon": "./icon.svg"
+}

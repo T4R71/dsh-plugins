@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "First-class task tool",
+    "description": "One task tool owning the task tree and the child agents working it: async dispatch, preset persona and tool filter, status and result collection."
+  }
+}

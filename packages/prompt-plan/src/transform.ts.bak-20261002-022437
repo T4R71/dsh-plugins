@@ -1,0 +1,181 @@
+/**
+ * Declarative shape-preserving transforms: what a rule does to the text a
+ * section carries WITHOUT replacing it.
+ *
+ * WHY THIS EXISTS. A section whose `text` is a FUNCTION is generated per
+ * assembly, per scope: `tools:sdk` renders the tool set the calling agent can
+ * actually see, `tool:read` disappears for an agent with no `read` tool, and so
+ * on. A constant `replace` throws that away: every agent gets one frozen copy of
+ * the text, which is worse than useless — the SDK then advertises tool names
+ * that agent cannot call. A transform keeps the per-scope difference and only
+ * removes or selects the parts a rule names.
+ *
+ * PURITY IS THE CONTRACT, and it is a measured one rather than a stylistic one:
+ * the assembled system prompt is the prefix of every request, and a KV-cache
+ * prefix is reused only while the bytes are unchanged. A transform that varies
+ * with wall-clock time, iteration order of a Set, or a locale would silently
+ * destroy that reuse. Every operation here is therefore a pure function of its
+ * input text and the rule's own literals: same text in, same text out, in any
+ * process, in any order.
+ *
+ * The operations are a CLOSED, DECLARATIVE SET on purpose. A rule file is
+ * authored by hand and read by an operator; a rule that can run arbitrary code
+ * cannot be reviewed by reading it, and this package's whole posture is that a
+ * hand-edited file gets a sentence naming the problem, not a silently different
+ * prompt. When the set is not enough, the answer is a new named operation here,
+ * with its own tests, not an escape hatch.
+ *
+ * @module @t4r71/dsh-prompt-plan/transform
+ */
+
+/**
+ * Drop every line matching a regular expression.
+ *
+ * For example `pattern: ^\s*\*\s` on generated TypeScript removes the JSDoc
+ * description lines above each declaration while leaving the declarations
+ * themselves — and because the declarations differ per scope, so does the
+ * result.
+ */
+export interface DropLinesOp {
+  readonly op: 'dropLines'
+  /** The pattern, as written in the rule file, compiled once. */
+  readonly pattern: RegExp
+  /** The pattern's source, kept for diagnostics. */
+  readonly source: string
+  /**
+   * Whether a line that becomes empty after dropping is left as an empty line or
+   * removed entirely. Default `true` (leave it), so line numbering is stable and
+   * a rule cannot silently reflow a block.
+   */
+  readonly blank?: boolean
+}
+
+/**
+ * Keep only the lines matching a regular expression, plus at most one blank line
+ * where a run of them was.
+ *
+ * A line filter for prose-shaped section text. Blank runs collapse to one blank
+ * line rather than vanishing, so a kept list still looks like a list.
+ */
+export interface KeepLinesOp {
+  readonly op: 'keepLines'
+  readonly pattern: RegExp
+  readonly source: string
+}
+
+/**
+ * Keep or drop whole blocks of lines, each block identified by its HEADER line —
+ * the line matching `headerPattern`.
+ *
+ * HOW A BLOCK IS FOUND, stated exactly because there is no ambiguity allowed in
+ * a rewrite: the block header is the line that matches `headerPattern`; the
+ * block's body is every following line up to (not including) the next line that
+ * matches `headerPattern`. Text before the first header is never part of a block
+ * and is always kept — that is the shared preamble every generated SDK block has,
+ * and dropping it would break the text for every scope at once.
+ *
+ * A block is KEPT when its header matches `keepPattern`; `denyPattern` then
+ * removes a block that would otherwise be kept (deny wins). With the generated
+ * TypeScript SDK — `  name: ReturnType;` for every visible tool — a rule that
+ * keeps three names produces a text that still contains exactly those three,
+ * in the scope's own order.
+ */
+export interface KeepBlocksOp {
+  readonly op: 'keepBlocks'
+  readonly headerPattern: RegExp
+  readonly keepPattern: RegExp
+  readonly denyPattern?: RegExp
+  readonly headerSource: string
+  readonly keepSource: string
+  readonly denySource?: string
+}
+
+/** The closed set of transform operations. */
+export type TransformOp = DropLinesOp | KeepLinesOp | KeepBlocksOp
+
+/** The discriminator values, for validation and diagnostics. */
+export const TRANSFORM_OPS: readonly TransformOp['op'][] = ['dropLines', 'keepLines', 'keepBlocks']
+
+/** Split text into lines the way every transform measures them. */
+function linesOf(text: string): string[] {
+  return text.split('\n')
+}
+
+/**
+ * Apply one operation.
+ * @param text - the section's text for THIS scope; never mutated.
+ * @param op - the compiled operation.
+ * @returns the transformed text. A new string, always.
+ */
+export function applyTransformOp(text: string, op: TransformOp): string {
+  switch (op.op) {
+    case 'dropLines':
+      return linesOf(text).filter(line => !op.pattern.test(line)).join('\n')
+    case 'keepLines': {
+      const kept: string[] = []
+      let pendingBlank = false
+      for (const line of linesOf(text)) {
+        if (op.pattern.test(line)) {
+          if (pendingBlank && kept.length > 0) kept.push('')
+          pendingBlank = false
+          kept.push(line)
+          continue
+        }
+        if (line.trim().length === 0) pendingBlank = true
+      }
+      return kept.join('\n')
+    }
+    case 'keepBlocks': {
+      const lines = linesOf(text)
+      const kept: string[] = []
+      let index = 0
+      // The preamble: everything before the first header line is not part of any
+      // block and is kept verbatim.
+      while (index < lines.length && !op.headerPattern.test(lines[index] ?? '')) {
+        kept.push(lines[index] ?? '')
+        index += 1
+      }
+      while (index < lines.length) {
+        const header = lines[index] ?? ''
+        const body: string[] = []
+        index += 1
+        while (index < lines.length && !op.headerPattern.test(lines[index] ?? '')) {
+          body.push(lines[index] ?? '')
+          index += 1
+        }
+        const keep = op.keepPattern.test(header) && !(op.denyPattern?.test(header) ?? false)
+        if (keep) kept.push(header, ...body)
+      }
+      return kept.join('\n')
+    }
+    default: {
+      const exhaustive: never = op
+      throw new Error(`prompt-plan: unknown transform operation ${JSON.stringify(exhaustive)}`)
+    }
+  }
+}
+
+/**
+ * Apply a rule's whole operation list, in file order.
+ *
+ * Order is significant and stated rather than implied: `dropLines` before
+ * `keepBlocks` is a different text from the reverse, and a rule file is read
+ * top-to-bottom, so the list is applied top-to-bottom.
+ * @param text - the section's text for this scope.
+ * @param ops - the compiled operations, in file order.
+ * @returns the transformed text.
+ */
+export function applyTransform(text: string, ops: readonly TransformOp[]): string {
+  let current = text
+  for (const op of ops) current = applyTransformOp(current, op)
+  return current
+}
+
+/**
+ * Describe a transform for a trace line, without the pattern bodies.
+ * @param ops - the compiled operations.
+ * @returns a short human description.
+ */
+export function describeTransform(ops: readonly TransformOp[]): string {
+  return `transform [${ops.map(op => op.op === 'keepBlocks' ? `keepBlocks /${op.headerSource}/` : `${op.op} /${op.source}/`).join('; ')}]`
+}

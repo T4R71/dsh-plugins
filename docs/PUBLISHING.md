@@ -5,7 +5,7 @@
 ## 0. 前置
 
 - `docs/COMPATIBILITY.md` 里该包的「构建 / 真机冷装」两列已是最新。
-- `peerDependencies` 的 DSH 锚是精确版本，不是 `^`。
+- `peerDependencies` 的 DSH 锚是**范围**，例如 `^0.1.7-rc.2`（`AGENTS.md`「版本与 peer 锚」）。不要钉精确版本：0.1.7 的装载闸门按 `semver.satisfies(runtime, requirement, { includePrerelease: true })` 判定，精确版本号只对那一个版本为真，别的运行版本一律判 false 并被**静默 `disabled`**。（`packages/dual-axis` / `dual-axis-ui` 两条仍是精确锚——那是 0.1.0 首发时发布的内容，改动属于包侧工作，不在本文件口径内。）
 - npm 令牌在 `C:\Users\TRI\.npmrc`（本机路径）；**不要在文档或日志里回显它的内容**。
 
 ## 1. 打包
@@ -82,4 +82,4 @@ curl -sS https://registry.npmjs.org/@t4r71%2F<plugin> | grep -E '"gitHead"|"vers
 
 ## 顺序建议
 
-按迁移工作量升序发布：`stream-guard` → `idle-guard` → `plan-tree` → `task-tree-host` → `task-tree` → `ui-plan-tree` / `ui-task-tree`，双轴系最后（它已经发布过，只在需要时升版）。
+按迁移工作量升序发布：`stream-guard` → `idle-guard` → `plan-tree` → `task-tree` → `ui-plan-tree` / `ui-task-tree`，双轴系最后（它已经发布过，只在需要时升版）。`task-tree-host` 已于 2026-09-29 整包删除，不再发布。

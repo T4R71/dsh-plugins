@@ -1,0 +1,29 @@
+# The plan-tree bundle patch: one row inserting the plan-tree host half, plus the
+# one row its settings namespace needs.
+#
+# The row id `plan-tree` is load-bearing twice over in 0.1.7:
+#   - it is the Loader entry id, and thus the settings namespace of THIS row's
+#     own config (`SettingsForms.write` looks the entry up by `options.id`);
+#   - the client half's tab body is registered under this package's name.
+#
+# The plan tree itself lives in a SECOND, independent row (`plan-tree-sessions`):
+# the namespace holding every session's tree is that row's entry id, and this row
+# cannot carry it. A row's namespace is projected into the settings page's form,
+# so an undeclared field inside the `plan-tree` row would show up there; the
+# session row's Config declares exactly one field (`trees`) and no page renders
+# it. The tree used to ride the session log (`plan/declared`, `plan/step`), which
+# 0.1.7's persistence read path refuses WHOLE
+# (`dsh-session-persistence/lib/index.js:184`), so the log is no longer involved.
+
+- insert:
+    - id: plan-tree
+      name: '@t4r71/dsh-plan-tree'
+
+    # 每条会话那棵任务树的权威存储。这是一行**独立**的 Loader entry，id 就是设置命名空间
+    # （0.1.7 里 ns == entry id），字段只有 `trees`：会话 id → 树。
+    #
+    # 为什么不塞进上面那行的 Config：那一行的 ns 绑着设置页的行表单，多一个未声明字段
+    # 会被投影进那张表单；而这一行的 Config 只声明 `trees` 一个 volatile 字段，
+    # 设置页不渲染它（客户端半边没有为它注册行）。
+    - id: plan-tree-sessions
+      name: '@t4r71/dsh-plan-tree/session-store'

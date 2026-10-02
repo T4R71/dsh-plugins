@@ -1,7 +1,7 @@
 {
   "name": "@t4r71/dsh-dual-axis",
   "description": "The dual-axis access-mode bundle: the file sandbox's read and write axes, custom allow/deny paths included, as an installable profile layer",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "publishConfig": {
     "access": "public"
   },
@@ -26,6 +26,7 @@
       "default": "./lib/session-store.js"
     },
     "./cordis.patch.yml": "./cordis.patch.yml",
+    "./locale/*.json": "./locale/*.json",
     "./package.json": "./package.json"
   },
   "dsh": {
@@ -44,7 +45,9 @@
     "lib/read-guard.js",
     "lib/session-store.js",
     "cordis.patch.yml",
-    "lib/types/**/*.d.ts"
+    "lib/types/**/*.d.ts",
+    "icon.svg",
+    "locale/*.json"
   ],
   "license": "MIT",
   "author": "T4R71 <T4R71@outlook.com>",
@@ -65,40 +68,41 @@
   ],
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.4",
-    "@deepseek-ai/dsh-agent": "0.1.7-rc.2",
-    "@deepseek-ai/dsh-commands": "0.1.7-rc.2",
-    "@deepseek-ai/dsh-fs": "0.1.7-rc.2",
-    "@deepseek-ai/dsh-fs-sandbox": "0.1.7-rc.2",
-    "@deepseek-ai/dsh-sandbox": "0.1.7-rc.2",
-    "@deepseek-ai/dsh-sandbox-policy": "0.1.7-rc.2",
-    "@deepseek-ai/dsh-session": "0.1.7-rc.2",
-    "@deepseek-ai/dsh-session-projection": "0.1.7-rc.2",
-    "@deepseek-ai/dsh-settings": "0.1.7-rc.2",
-    "@deepseek-ai/dsh-system-prompt": "0.1.7-rc.2",
-    "@deepseek-ai/dsh-tools": "0.1.7-rc.2",
+    "@deepseek-ai/dsh-agent": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-commands": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-fs": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-fs-sandbox": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-sandbox": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-sandbox-policy": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-session": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-session-projection": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-settings": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-system-prompt": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-tools": "^0.2.0-rc.2",
     "@deepseek-ai/schemastery": "^3.18.4",
     "zod": "^4.4.3"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.4",
     "@deepseek-ai/cosmokit": "^1.8.5",
-    "@deepseek-ai/dsh-agent": "0.1.7-rc.2",
-    "@deepseek-ai/dsh-commands": "0.1.7-rc.2",
-    "@deepseek-ai/dsh-fs": "0.1.7-rc.2",
-    "@deepseek-ai/dsh-fs-local": "0.1.7-rc.2",
-    "@deepseek-ai/dsh-fs-sandbox": "0.1.7-rc.2",
-    "@deepseek-ai/dsh-sandbox": "0.1.7-rc.2",
-    "@deepseek-ai/dsh-sandbox-policy": "0.1.7-rc.2",
-    "@deepseek-ai/dsh-session": "0.1.7-rc.2",
-    "@deepseek-ai/dsh-session-projection": "0.1.7-rc.2",
-    "@deepseek-ai/dsh-settings": "0.1.7-rc.2",
-    "@deepseek-ai/dsh-system-prompt": "0.1.7-rc.2",
-    "@deepseek-ai/dsh-tools": "0.1.7-rc.2",
+    "@deepseek-ai/dsh-agent": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-commands": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-fs": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-fs-local": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-fs-sandbox": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-sandbox": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-sandbox-policy": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-session": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-session-projection": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-settings": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-system-prompt": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-tools": "0.2.0-rc.2",
     "@deepseek-ai/schemastery": "^3.18.4",
     "@types/node": "^24.0.0",
     "cross-env": "^10.1.0",
     "tsdown": "^0.22.2",
     "tsx": "^4.22.4",
     "typescript": "^6.0.3"
-  }
+  },
+  "icon": "./icon.svg"
 }

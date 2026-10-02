@@ -1,19 +1,29 @@
 /**
- * Plan tree: a logged, projected plan the model declares once and then walks
- * step by step.
+ * Plan tree: the plan the model declares once and then walks step by step.
  *
- * Two model-facing tools and one projection unit:
- * - `plan_write` declares the WHOLE tree (a single `plan/declared` snapshot).
- *   It is called once for a piece of work, not rewritten per step.
- * - `plan_step` updates ONE node's status (a single `plan/step` event),
- *   addressed by the node's tree-unique id.
- * - The `planTree` unit folds both into the current tree and publishes it to
- *   client carriers through its wire view.
+ * Four model-facing tools and no log writes:
+ * - `plan_write` declares the WHOLE tree (one whole-field replacement). It is
+ *   called once for a piece of work, not rewritten per step.
+ * - `plan_step` updates ONE node's status, addressed by the node's
+ *   tree-unique id.
+ * - `plan_dispatch` hands one node's prompt to a teammate and marks it
+ *   `in_progress` in the same store write.
+ * - `plan_ask` inserts a question as a node and writes the human's answer back.
  *
- * The fold is last-write-wins on the declaration and a structural update on a
- * step: the returned tree is a new object only when the addressed node was
- * actually found, so a `plan/step` naming an unknown id costs nothing
- * downstream (the `Object.is` rule of the projection framework).
+ * The tree lives in this package's OWN settings namespace, partitioned by
+ * session id (see `./session-store.ts`), NOT in the session log: the two event
+ * types this package used to append are outside 0.1.7's
+ * `KNOWN_SESSION_EVENT_TYPES`, and the persistence read path refuses a whole
+ * log carrying one, so a session this package had written to could not be
+ * reopened. A session projection folded those events and cannot be fed from
+ * outside the log (its `init`/`apply` see nothing but the session), so the
+ * panel reads the settings document instead — the same shape the published
+ * dual-axis bundle uses.
+ *
+ * The fold is last-write-wins on a declaration and a structural update on a
+ * step, and each write re-reads the document under a revision CAS: the
+ * returned tree is a new object only when the addressed node was actually
+ * found, so a `plan_step` naming an unknown id costs nothing downstream.
  *
  * @module @t4r71/dsh-plan-tree
  */
@@ -25,12 +35,9 @@ import { z as zod } from 'zod'
 import type { ZodType } from 'zod'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { PlanNode, PlanStatus } from './types.ts'
-// Type-only: resolves the required ctx.sessionProjections service declaration.
-import type {} from '@deepseek-ai/dsh-session-projection'
-// The `planTree` projection-key declaration lives in src/types.ts (its one
-// home); this re-export projects the type face onto the package root AND keeps
-// the module edge in the emitted index.d.ts, so aggregate programs consuming
-// the declarations still receive the SessionProjectionMap merge.
+import { PLAN_TREE_FIELD, planTreeStore } from './session-store.ts'
+import type { PlanTreeStore } from './session-store.ts'
+import { createTaskTreePort } from './task-tree.ts'
 export type * from './types.ts'
 
 /**
@@ -126,16 +133,122 @@ export const name = 'plan-tree'
 // `ctx.systemPrompt` throws "cannot get property without inject" and the whole
 // plugin fails to mount. The section and the tools belong together — a tool
 // with no usage guidance is present but never chosen.
-export const inject = ['tools', 'sessionProjections', 'systemPrompt']
+//
+// `settings` is deliberately absent: this plugin must load in a composition
+// that never mounted it, where the store simply has nothing to read (the tools
+// then report that no plan is declared). The service is reached through
+// `ctx.get('settings')`, exactly as the sibling bundle does.
+export const inject = ['tools', 'systemPrompt']
+
+/**
+ * Plugin configuration.
+ *
+ * One key, and it exists because the whole point of the `task` bundle line is that a
+ * deployment which mounts it must be able to drop these four tools: the four and
+ * `task` answer the same questions, and a model handed both spends a request
+ * choosing between two spellings of one intent.
+ */
+export interface Config {
+  /**
+   * Register `plan_write` / `plan_step` / `plan_dispatch` / `plan_ask` (default
+   * `true`).
+   *
+   * `true` is the default so an existing deployment cannot silently lose its tools
+   * by upgrading: a row that says nothing behaves exactly as it did before this key
+   * existed. Turning it off is an explicit act by a composition that mounted the
+   * `task` tool in their place.
+   *
+   * The `taskTree` service and the usage-policy prompt section are deliberately NOT
+   * gated on this key: {@link apply} explains why.
+   */
+  exposeTools?: boolean
+}
+
+/** Validated plugin configuration. */
+export type ResolvedConfig = Config
 
 /** The valid {@link PlanStatus} values, as a runtime set for input narrowing. */
 const STATUSES = ['pending', 'in_progress', 'completed', 'blocked'] as const
 
-/** Wire payload schema of the `planTree` projection (whole tree or pre-declaration null). */
-const planTreeSchema: ZodType<PlanNode[] | null> = zod.union([
-  zod.array(zod.lazy(() => planNodeSchema)),
-  zod.null(),
-])
+/**
+ * Validation of one tree read back out of the settings document.
+ *
+ * The document is untrusted — a human may have edited it, and a write from
+ * another process may have interleaved — so every read is parsed rather than
+ * asserted. The stored value is `unknown`, so the parse is what turns it into
+ * the `PlanNode[]` the tools and the panel both work with.
+ */
+const planTreeSchema: ZodType<PlanNode[]> = zod.array(zod.lazy(() => planNodeSchema))
+
+/**
+ * Read one session's tree out of the store, parsed.
+ *
+ * The single read point for all four tools, so "what does this session's plan
+ * currently say" has ONE answer: a tree validated the same way everywhere, and
+ * one place that decides what an unreadable document means.
+ * @param store - the session store for this host context.
+ * @param sessionId - the session whose plan to read.
+ * @returns the parsed tree, or `null` before the first declaration.
+ * @throws When no settings namespace is served, or a stored tree is unreadable.
+ */
+function readTree(store: PlanTreeStore, sessionId: string): PlanNode[] | null {
+  if (!store.served()) throw new Error(planTreeUnavailable)
+  const stored = store.get(sessionId)
+  if (stored === undefined) return null
+  const parsed = planTreeSchema.safeParse(stored)
+  if (!parsed.success) {
+    throw new Error(
+      'plan-tree: the stored plan of session ' + JSON.stringify(sessionId)
+      + ' is unreadable; the settings document field ' + JSON.stringify(PLAN_TREE_FIELD)
+      + ' must hold an array of plan nodes',
+    )
+  }
+  return parsed.data
+}
+
+/**
+ * The owning session id of a tool call, or a rejection.
+ *
+ * The tree is per-agent-session state: a non-agent caller (no owning session)
+ * has nowhere to write it, so a call without one is rejected rather than
+ * silently no-op'd. Returning the ID rather than the session keeps every caller
+ * free of a captured `exec.agent`, whose narrowing TypeScript drops inside a
+ * callback.
+ * @param exec - the tool invocation, carrying the calling agent when there is one.
+ * @param tool - the tool's name, for the rejection.
+ * @returns the owning session's id.
+ * @throws When the call carries no owning agent session.
+ */
+function sessionIdOf(exec: { agent?: Agent | undefined }, tool: string): string {
+  if (!exec.agent) throw new Error(tool + ' requires an owning agent session')
+  return String(exec.agent.session.header.id)
+}
+
+/**
+ * Write one session's tree back, whole-field.
+ *
+ * The single write point for all four tools, so every one of them fails the
+ * same way when the store cannot be written: a lost write is reported as a
+ * failure rather than a silent no-op, because the model's next step is decided
+ * by the tree it believes it just wrote.
+ * @param store - the session store for this host context.
+ * @param sessionId - the session the tree belongs to.
+ * @param nodes - the complete next tree.
+ * @throws When no settings namespace is served, or the revision race was lost.
+ */
+async function writeTree(
+  store: PlanTreeStore,
+  sessionId: string,
+  nodes: readonly PlanNode[],
+): Promise<void> {
+  if (!store.served()) throw new Error(planTreeUnavailable)
+  await store.replace(sessionId, nodes)
+}
+
+/** The rejection every tool gives when the settings namespace is not composed. */
+const planTreeUnavailable =
+  'plan-tree: the plan tree store has no settings namespace; '
+  + 'the composition must load the `plan-tree-sessions` row of @t4r71/dsh-plan-tree'
 
 const planNodeSchema: ZodType<PlanNode> = zod.object({
   id: zod.string(),
@@ -155,8 +268,8 @@ const planNodeSchema: ZodType<PlanNode> = zod.object({
 })
 
 /**
- * Fold one `plan/step` into a node: replace its status, and its assignment or
- * answer only when the step carries one.
+ * Fold one step into a node: replace its status, and its assignment or answer
+ * only when the step carries one.
  *
  * The three states of an optional field are all meaningful and all reachable:
  * ABSENT leaves the node's existing value standing (so an `in_progress` step
@@ -191,8 +304,8 @@ function applyStep(
 /**
  * Replace one node's status (and assignment/answer, when the step carries
  * them), rebuilding only the spine from the root to that node. A tree without
- * the id is returned by REFERENCE, which is what keeps an unmatched
- * `plan/step` free.
+ * the id is returned by REFERENCE, which is what keeps an unmatched step free:
+ * the caller compares against the input to decide whether to write at all.
  * @param nodes - the tree to update.
  * @param id - the addressed node's tree-unique id.
  * @param step - the status to write, plus an optional assignment and answer.
@@ -211,7 +324,8 @@ function setStatus(
     return { ...node, children }
   })
   // Changed iff some entry is a new object: identity is the change signal the
-  // projection framework's `Object.is` rule reads, so this is the exact test.
+  // callers read (they write only when this returns a tree), so this is the
+  // exact test.
   return next.some((node, index) => node !== nodes[index]) ? next : null
 }
 
@@ -235,13 +349,12 @@ function findNode(nodes: readonly PlanNode[], id: string): PlanNode | undefined 
  * Append one node at the END of the ROOT level, without touching any other
  * node.
  *
- * The tree is not restated, and this is deliberately NOT a `plan/declared`
- * snapshot. A whole-tree declaration means "the plan is settled, here it is"
- * and REPLACES everything; re-sending one to add a single node would make
- * every reader re-derive the entire tree, and — worse — a snapshot captured
- * from a stale read would silently drop work declared in between. Appending
- * only states the ONE new fact, so concurrent writers cannot clobber each
- * other's nodes.
+ * The tree is not restated, and this is deliberately NOT a whole-tree
+ * replacement. `plan_write` means "the plan is settled, here it is" and
+ * REPLACES everything; re-sending one to add a single node would drop work
+ * another writer declared in between. Appending states the ONE new fact, and
+ * the store applies the append INSIDE its write loop, so two appends to one
+ * session cannot clobber each other's nodes.
  *
  * The node lands at the root level because `plan_ask` names no parent: a
  * question raised mid-work is a top-level decision waiting on the human, not
@@ -525,12 +638,51 @@ function nodeShape(depth: number): NodeParameterShape {
 const nodeParameters = nodeShape(1)
 
 /**
- * Register the `planTree` unit on `ctx.sessionProjections`, the four
- * model-facing tools on `ctx.tools`, and the usage policy that tells a model
- * when to reach for them.
- * @param ctx - registrant context carrying the tool and session-projection registries.
+ * Register the four model-facing tools on `ctx.tools` and the usage policy that
+ * tells a model when to reach for them.
+ *
+ * The tree's state is NOT registered here: it lives in this package's own
+ * settings namespace (`plan-tree-sessions`), which a separate Loader row owns.
+ * These tools only read and write that store, through `ctx.get('settings')`.
+ * @param ctx - registrant context carrying the tool registry.
  */
-export function apply(ctx: Context): void {
+export function apply(ctx: Context, config: ResolvedConfig = {}): void {
+  // The tool switch. Read ONCE here, before anything is registered, so the whole
+  // four-tool surface is decided by one value and cannot be half-applied by a later
+  // throw. `?? true` because a row that predates this key carries no value for it and
+  // must keep its tools: an upgrade must never silently remove them.
+  const exposeTools = config.exposeTools ?? true
+
+  // The session store this context reads and writes. Resolved once per apply
+  // rather than per call: it is memoized by host context, and every tool below
+  // shares the same document cache.
+  const store = planTreeStore(ctx)
+
+  // The SAME store, exposed to the sibling `task` tool as the `taskTree`
+  // service. @t4r71/dsh-task owns no tree storage: it reaches this one through
+  // `ctx.get('taskTree')`, so that `task plan` / `task step` / `task list
+  // scope=tree` and the four tools above never disagree about what the session's
+  // tree says. Serving a SECOND store here would be the bug this line prevents.
+  //
+  // Deliberately OUTSIDE the `exposeTools` gate, because the two switches cut in
+  // opposite directions: `exposeTools: false` is exactly the setting a deployment
+  // chooses when it mounted `task` in place of these four tools, and `task` reads
+  // the tree through this port. Gating the port too would leave that deployment
+  // with neither the four tools nor the service that replaced them.
+  //
+  // Provided unconditionally in the other direction as well: a composition that
+  // never mounted the settings service still loads this plugin, and the port's
+  // writes then fail the same way the tools' do (see `PlanTreeStore.writeRecords`).
+  ctx.provide('taskTree' as never, createTaskTreePort(store) as never)
+
+  // Cancellation before anything is registered: a deployment that mounted the
+  // sibling `task` tool in place of these four registers neither the tools nor
+  // their usage policy, so the model is never told about tools it cannot call.
+  if (!exposeTools) {
+    ctx.logger?.info('plan-tree: exposeTools=false; the four plan tools and the plan:tree policy section are not registered')
+    return
+  }
+
   // Usage policy ships WITH the tool, which is the master convention here (see
   // `tool-workflow`): guidance lives in the tool plugin as a prompt section, not
   // in the deployment persona. Without this section the tools exist and are
@@ -548,480 +700,467 @@ export function apply(ctx: Context): void {
     text: PLAN_TREE_POLICY,
   })
 
-  // The declared tree with every folded step applied. Only `plan/declared`
-  // and `plan/step` are this unit's; every other event returns the same state
-  // reference, which is the framework's zero-work signal.
-  ctx.sessionProjections.register<'planTree', PlanNode[] | null>({
-    key: 'planTree',
-    stateSchema: planTreeSchema,
-    init: () => null,
-    apply: (state, event) => {
-      if (event.type === 'plan/declared') return event.data.plan
-      if (event.type === 'plan/step') {
-        if (state === null) return state
-        return setStatus(state, event.data.id, event.data) ?? state
-      }
-      return state
-    },
-    wire: { viewSchema: planTreeSchema, view: state => state },
-    stateVersion: 1,
-  })
-
+  // ---- the four model-facing tools, all four gated by `exposeTools` ----
   ctx.tools.register(defineTool({
-    name: 'plan_write',
-    description: PLAN_WRITE_DESCRIPTION,
-    parameters: {
-      nodes: {
-        type: 'array',
-        required: true,
-        description: 'The COMPLETE plan tree, replacing any previous tree.',
-        items: nodeParameters,
-      },
-    },
-    output: {
-      schema: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          total: { type: 'integer', required: true },
-          counts: {
-            type: 'object',
-            additionalProperties: false,
-            required: true,
-            properties: {
-              pending: { type: 'integer', required: true },
-              inProgress: { type: 'integer', required: true },
-              completed: { type: 'integer', required: true },
-              blocked: { type: 'integer', required: true },
-            },
-          },
-          dropped: { type: 'array', items: { type: 'string' }, description: 'Ids the previous tree carried and this declaration does not.' },
-          regressed: { type: 'array', items: { type: 'string' }, description: 'Ids that were completed before this declaration and are not now.' },
+      name: 'plan_write',
+      description: PLAN_WRITE_DESCRIPTION,
+      parameters: {
+        nodes: {
+          type: 'array',
+          required: true,
+          description: 'The COMPLETE plan tree, replacing any previous tree.',
+          items: nodeParameters,
         },
       },
-      render: (_args, value) => [{
-        type: 'text',
-        text: `Plan declared: ${value.total} step${value.total === 1 ? '' : 's'} `
-          + `(${value.counts.pending} pending, ${value.counts.inProgress} in progress, `
-          + `${value.counts.completed} completed, ${value.counts.blocked} blocked). `
-          + 'Use plan_step to update each step\'s status as you work.'
-          + (value.dropped === undefined || value.dropped.length === 0
-            ? ''
-            : ` WARNING: this REPLACED the tree and dropped ${value.dropped.length} node(s) not `
-              + `re-listed: ${value.dropped.join(', ')}.`)
-          + (value.regressed === undefined || value.regressed.length === 0
-            ? ''
-            : ` WARNING: it also reset progress on ${value.regressed.join(', ')}, which were completed.`),
-      }],
-    },
-    execute(args, exec) {
-      const nodes = toPlanNodes(args.nodes, new Set<string>())
-      assertDependenciesResolve(nodes)
-      if (!exec.agent) {
+      output: {
+        schema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            total: { type: 'integer', required: true },
+            counts: {
+              type: 'object',
+              additionalProperties: false,
+              required: true,
+              properties: {
+                pending: { type: 'integer', required: true },
+                inProgress: { type: 'integer', required: true },
+                completed: { type: 'integer', required: true },
+                blocked: { type: 'integer', required: true },
+              },
+            },
+            dropped: { type: 'array', items: { type: 'string' }, description: 'Ids the previous tree carried and this declaration does not.' },
+            regressed: { type: 'array', items: { type: 'string' }, description: 'Ids that were completed before this declaration and are not now.' },
+          },
+        },
+        render: (_args, value) => [{
+          type: 'text',
+          text: `Plan declared: ${value.total} step${value.total === 1 ? '' : 's'} `
+            + `(${value.counts.pending} pending, ${value.counts.inProgress} in progress, `
+            + `${value.counts.completed} completed, ${value.counts.blocked} blocked). `
+            + 'Use plan_step to update each step\'s status as you work.'
+            + (value.dropped === undefined || value.dropped.length === 0
+              ? ''
+              : ` WARNING: this REPLACED the tree and dropped ${value.dropped.length} node(s) not `
+                + `re-listed: ${value.dropped.join(', ')}.`)
+            + (value.regressed === undefined || value.regressed.length === 0
+              ? ''
+              : ` WARNING: it also reset progress on ${value.regressed.join(', ')}, which were completed.`),
+        }],
+      },
+      async execute(args, exec) {
+        const nodes = toPlanNodes(args.nodes, new Set<string>())
+        assertDependenciesResolve(nodes)
         // The tree is per-agent-session state; a non-agent caller (no owning
         // session) has nowhere to write it. Reject rather than silently no-op.
-        throw new Error('plan_write requires an owning agent session')
-      }
-      // A declaration REPLACES the tree (last-write-wins). Report what that
-      // destroys, because the caller cannot otherwise tell: re-declaring a
-      // parent WITHOUT its `children` drops the subtree, and re-listing a node
-      // as `pending` silently rolls back progress a `plan_step` recorded. The
-      // tool used to answer only with counts, so a destructive overwrite looked
-      // exactly like a fresh declaration.
-      const before = ctx.sessionProjections.stateOf(exec.agent.session, 'planTree') ?? null
-      const dropped: string[] = []
-      const regressed: string[] = []
-      if (before !== null) {
-        const afterIds = new Set<string>()
-        collectIds(nodes, afterIds)
-        const beforeIds = new Set<string>()
-        collectIds(before, beforeIds)
-        for (const id of beforeIds) if (!afterIds.has(id)) dropped.push(id)
-        const beforeStatus = new Map<string, PlanStatus>()
-        const walkStatuses = (list: readonly PlanNode[]): void => {
-          for (const node of list) {
-            beforeStatus.set(node.id, node.status)
-            if (node.children !== undefined) walkStatuses(node.children)
+        const sessionId = sessionIdOf(exec, 'plan_write')
+        // A declaration REPLACES the tree (last-write-wins). Report what that
+        // destroys, because the caller cannot otherwise tell: re-declaring a
+        // parent WITHOUT its `children` drops the subtree, and re-listing a node
+        // as `pending` silently rolls back progress a `plan_step` recorded. The
+        // tool used to answer only with counts, so a destructive overwrite looked
+        // exactly like a fresh declaration.
+        const before = readTree(store, sessionId)
+        const dropped: string[] = []
+        const regressed: string[] = []
+        if (before !== null) {
+          const afterIds = new Set<string>()
+          collectIds(nodes, afterIds)
+          const beforeIds = new Set<string>()
+          collectIds(before, beforeIds)
+          for (const id of beforeIds) if (!afterIds.has(id)) dropped.push(id)
+          const beforeStatus = new Map<string, PlanStatus>()
+          const walkStatuses = (list: readonly PlanNode[]): void => {
+            for (const node of list) {
+              beforeStatus.set(node.id, node.status)
+              if (node.children !== undefined) walkStatuses(node.children)
+            }
           }
-        }
-        walkStatuses(before)
-        const walkAfter = (list: readonly PlanNode[]): void => {
-          for (const node of list) {
-            const was = beforeStatus.get(node.id)
-            if (was === 'completed' && node.status !== 'completed') regressed.push(node.id)
-            if (node.children !== undefined) walkAfter(node.children)
+          walkStatuses(before)
+          const walkAfter = (list: readonly PlanNode[]): void => {
+            for (const node of list) {
+              const was = beforeStatus.get(node.id)
+              if (was === 'completed' && node.status !== 'completed') regressed.push(node.id)
+              if (node.children !== undefined) walkAfter(node.children)
+            }
           }
+          walkAfter(nodes)
         }
-        walkAfter(nodes)
-      }
-      exec.agent.session.append('plan/declared', { plan: nodes })
-      const counts = countStatuses(nodes)
-      return Promise.resolve({
-        total: totalNodes(nodes),
-        counts: {
-          pending: counts.pending,
-          inProgress: counts.in_progress,
-          completed: counts.completed,
-          blocked: counts.blocked,
-        },
-        ...(dropped.length === 0 ? {} : { dropped }),
-        ...(regressed.length === 0 ? {} : { regressed }),
-      })
-    },
-    presentCall: args => ({ card: 'generic', title: 'Declare plan', kind: 'other', rawInput: args.nodes }),
-  }))
-
-  ctx.tools.register(defineTool({
-    name: 'plan_step',
-    description: PLAN_STEP_DESCRIPTION,
-    parameters: {
-      id: { type: 'string', required: true, description: 'The id of the node to update, as declared by plan_write.' },
-      status: {
-        type: 'string',
-        required: true,
-        enum: [...STATUSES],
-        description: 'pending (not started) | in_progress (now) | completed (done) | blocked (cannot proceed).',
-      },
-      // Declared so a caller CAN set them. Without these two the parameter
-      // validator raises no violation for an undeclared property, so
-      // `plan_step { id, status, assignedTo }` returned SUCCESS while the
-      // assignment was dropped on the floor (the tool built its event from
-      // `args.status` alone). A field the event type carries must be reachable
-      // from the tool surface, or the caller is told it worked when it did not.
-      //
-      // NOTE: the parameter ROOT is an implicit open object (see
-      // ParameterSchemaSpec), so it cannot carry `additionalProperties: false`
-      // — a misspelled argument is therefore still accepted and ignored by the
-      // framework. Declaring every real field is the most this tool can do.
-      assignedTo: {
-        type: 'string',
-        description: 'Name of the teammate now doing this step. Omit to leave any existing assignment standing; pass an empty string to clear it.',
-      },
-      answer: {
-        type: 'string',
-        description: 'The human\'s answer to this step\'s question. Omit to leave any existing answer standing; pass an empty string to clear it.',
-      },
-    },
-    output: {
-      schema: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          id: { type: 'string', required: true },
-          status: { type: 'string', required: true, enum: [...STATUSES] },
+        await writeTree(store, sessionId, nodes)
+        const counts = countStatuses(nodes)
+        return {
+          total: totalNodes(nodes),
           counts: {
-            type: 'object',
-            additionalProperties: false,
-            required: true,
-            properties: {
-              pending: { type: 'integer', required: true },
-              inProgress: { type: 'integer', required: true },
-              completed: { type: 'integer', required: true },
-              blocked: { type: 'integer', required: true },
+            pending: counts.pending,
+            inProgress: counts.in_progress,
+            completed: counts.completed,
+            blocked: counts.blocked,
+          },
+          ...(dropped.length === 0 ? {} : { dropped }),
+          ...(regressed.length === 0 ? {} : { regressed }),
+        }
+      },
+      presentCall: args => ({ card: 'generic', title: 'Declare plan', kind: 'other', rawInput: args.nodes }),
+    }))
+
+    ctx.tools.register(defineTool({
+      name: 'plan_step',
+      description: PLAN_STEP_DESCRIPTION,
+      parameters: {
+        id: { type: 'string', required: true, description: 'The id of the node to update, as declared by plan_write.' },
+        status: {
+          type: 'string',
+          required: true,
+          enum: [...STATUSES],
+          description: 'pending (not started) | in_progress (now) | completed (done) | blocked (cannot proceed).',
+        },
+        // Declared so a caller CAN set them. Without these two the parameter
+        // validator raises no violation for an undeclared property, so
+        // `plan_step { id, status, assignedTo }` returned SUCCESS while the
+        // assignment was dropped on the floor (the tool built its event from
+        // `args.status` alone). A field the event type carries must be reachable
+        // from the tool surface, or the caller is told it worked when it did not.
+        //
+        // NOTE: the parameter ROOT is an implicit open object (see
+        // ParameterSchemaSpec), so it cannot carry `additionalProperties: false`
+        // — a misspelled argument is therefore still accepted and ignored by the
+        // framework. Declaring every real field is the most this tool can do.
+        assignedTo: {
+          type: 'string',
+          description: 'Name of the teammate now doing this step. Omit to leave any existing assignment standing; pass an empty string to clear it.',
+        },
+        answer: {
+          type: 'string',
+          description: 'The human\'s answer to this step\'s question. Omit to leave any existing answer standing; pass an empty string to clear it.',
+        },
+      },
+      output: {
+        schema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            id: { type: 'string', required: true },
+            status: { type: 'string', required: true, enum: [...STATUSES] },
+            counts: {
+              type: 'object',
+              additionalProperties: false,
+              required: true,
+              properties: {
+                pending: { type: 'integer', required: true },
+                inProgress: { type: 'integer', required: true },
+                completed: { type: 'integer', required: true },
+                blocked: { type: 'integer', required: true },
+              },
             },
           },
         },
+        render: (_args, value) => [{
+          type: 'text',
+          text: `Step ${JSON.stringify(value.id)} is now ${value.status}. `
+            + `(${value.counts.completed}/${value.counts.completed + value.counts.inProgress
+              + value.counts.pending + value.counts.blocked} done.)`,
+        }],
       },
-      render: (_args, value) => [{
-        type: 'text',
-        text: `Step ${JSON.stringify(value.id)} is now ${value.status}. `
-          + `(${value.counts.completed}/${value.counts.completed + value.counts.inProgress
-            + value.counts.pending + value.counts.blocked} done.)`,
-      }],
-    },
-    execute(args, exec) {
-      const id = args.id.trim()
-      if (id === '') throw new Error('invalid plan step: `id` must be a non-empty string')
-      if (!(STATUSES as readonly string[]).includes(args.status)) {
-        throw new Error(`invalid plan step: \`status\` must be one of ${STATUSES.join(', ')} (got ${JSON.stringify(args.status)})`)
-      }
-      if (!exec.agent) {
-        throw new Error('plan_step requires an owning agent session')
-      }
-      const session = exec.agent.session
-      // Read the folded tree back so an id the current plan does not carry is
-      // rejected here instead of being logged as a silent no-op.
-      const tree = ctx.sessionProjections.stateOf(session, 'planTree')
-      if (tree === undefined) throw new Error('plan_step requires the planTree session projection')
-      if (tree === null) {
-        throw new Error('plan_step found no plan: declare one with plan_write first')
-      }
-      // Both optional fields are read from the arguments. An OMITTED field
-      // leaves the node's existing value standing (see `applyStep`), while a
-      // BLANK one clears it — that is how a caller releases an assignment or
-      // retracts an answer, and it is the only way: without it the field could
-      // be written but never removed.
-      const assignedTo = args.assignedTo === undefined ? undefined : args.assignedTo.trim()
-      const answer = args.answer === undefined ? undefined : args.answer.trim()
-      const step: { status: PlanStatus; assignedTo?: string; answer?: string } = { status: args.status }
-      if (assignedTo !== undefined) step.assignedTo = assignedTo
-      if (answer !== undefined) step.answer = answer
-      if (setStatus(tree, id, step) === null) {
-        throw new Error(`plan_step found no node with id ${JSON.stringify(id)} in the current plan`)
-      }
-      session.append('plan/step', { id, status: args.status, ...assignedTo === undefined ? {} : { assignedTo }, ...answer === undefined ? {} : { answer } })
-      const updated = ctx.sessionProjections.stateOf(session, 'planTree') ?? tree
-      const counts = countStatuses(updated)
-      return Promise.resolve({
-        id,
-        status: args.status,
-        counts: {
-          pending: counts.pending,
-          inProgress: counts.in_progress,
-          completed: counts.completed,
-          blocked: counts.blocked,
-        },
-      })
-    },
-    presentCall: args => ({ card: 'generic', title: `Plan step: ${args.id}`, kind: 'other', rawInput: args }),
-  }))
-
-  ctx.tools.register(defineTool({
-    name: 'plan_dispatch',
-    description: PLAN_DISPATCH_DESCRIPTION,
-    parameters: {
-      id: { type: 'string', required: true, description: 'The plan node to dispatch.' },
-      task: { type: 'string', description: 'Override the node task prompt.' },
-      teammate: { type: 'string', description: 'Teammate name to hand the task to.' },
-    },
-    output: {
-      schema: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          id: { type: 'string', required: true },
-          status: { type: 'string', required: true, enum: [...STATUSES] },
-          dispatched: { type: 'boolean', required: true },
-          taskId: { type: 'string' },
-          dispatchedTo: { type: 'string' },
-          note: { type: 'string' },
-        },
+      async execute(args, exec) {
+        const id = args.id.trim()
+        if (id === '') throw new Error('invalid plan step: `id` must be a non-empty string')
+        if (!(STATUSES as readonly string[]).includes(args.status)) {
+          throw new Error(`invalid plan step: \`status\` must be one of ${STATUSES.join(', ')} (got ${JSON.stringify(args.status)})`)
+        }
+        const sessionId = sessionIdOf(exec, 'plan_step')
+        // Read the stored tree back so an id the current plan does not carry is
+        // rejected here instead of being written as a silent no-op.
+        const tree = readTree(store, sessionId)
+        if (tree === null) {
+          throw new Error('plan_step found no plan: declare one with plan_write first')
+        }
+        // Both optional fields are read from the arguments. An OMITTED field
+        // leaves the node's existing value standing (see `applyStep`), while a
+        // BLANK one clears it — that is how a caller releases an assignment or
+        // retracts an answer, and it is the only way: without it the field could
+        // be written but never removed.
+        const assignedTo = args.assignedTo === undefined ? undefined : args.assignedTo.trim()
+        const answer = args.answer === undefined ? undefined : args.answer.trim()
+        const step: { status: PlanStatus; assignedTo?: string; answer?: string } = { status: args.status }
+        if (assignedTo !== undefined) step.assignedTo = assignedTo
+        if (answer !== undefined) step.answer = answer
+        const next = setStatus(tree, id, step)
+        if (next === null) {
+          throw new Error(`plan_step found no node with id ${JSON.stringify(id)} in the current plan`)
+        }
+        await writeTree(store, sessionId, next)
+        const counts = countStatuses(next)
+        return {
+          id,
+          status: args.status,
+          counts: {
+            pending: counts.pending,
+            inProgress: counts.in_progress,
+            completed: counts.completed,
+            blocked: counts.blocked,
+          },
+        }
       },
-      render: (_args, value) => [{
-        type: 'text',
-        text: value.dispatched
-          ? `Step ${JSON.stringify(value.id)} is now ${value.status}; dispatched to `
-            + `${JSON.stringify(value.dispatchedTo ?? '')} as task ${JSON.stringify(value.taskId ?? '')}.`
-          : `Step ${JSON.stringify(value.id)} is now ${value.status}. ${value.note ?? ''}`,
-      }],
-    },
-    async execute(args, exec) {
-      const id = args.id.trim()
-      if (id === '') throw new Error('invalid plan dispatch: `id` must be a non-empty string')
-      if (!exec.agent) {
-        throw new Error('plan_dispatch requires an owning agent session')
-      }
-      const session = exec.agent.session
-      const tree = ctx.sessionProjections.stateOf(session, 'planTree')
-      if (tree === undefined) throw new Error('plan_dispatch requires the planTree session projection')
-      if (tree === null) {
-        throw new Error('plan_dispatch found no plan: declare one with plan_write first')
-      }
-      const target = findNode(tree, id)
-      if (target === undefined) {
-        throw new Error(`plan_dispatch found no node with id ${JSON.stringify(id)} in the current plan`)
-      }
-      const override = args.task?.trim()
-      const prompt = override !== undefined && override !== '' ? override : target.task
-      if (prompt === undefined) {
-        throw new Error(
-          `plan_dispatch found no task for node ${JSON.stringify(id)}: `
-          + 'declare it with plan_write or pass `task`',
-        )
-      }
+      presentCall: args => ({ card: 'generic', title: `Plan step: ${args.id}`, kind: 'other', rawInput: args }),
+    }))
 
-      // Optional sibling service: plan-tree must stay independently composable
-      // and must not depend on agent-team, so a missing service degrades the
-      // DISPATCH only — the plan transition below still happens.
-      const teammate = args.teammate?.trim()
-      const teams = ctx.get('agentTeams')
-      if (teams === undefined || teammate === undefined || teammate === '') {
-        // Nothing was handed to anyone, so NO assignment is recorded: a node
-        // marked `in_progress` with no assignee reads as "someone is on it and
-        // the panel just cannot say who", which is exactly the wrong story.
-        // The status still moves — the caller asked to start this step, and the
-        // prompt is reported back so it can be dispatched another way.
-        session.append('plan/step', { id, status: 'in_progress' })
+    ctx.tools.register(defineTool({
+      name: 'plan_dispatch',
+      description: PLAN_DISPATCH_DESCRIPTION,
+      parameters: {
+        id: { type: 'string', required: true, description: 'The plan node to dispatch.' },
+        task: { type: 'string', description: 'Override the node task prompt.' },
+        teammate: { type: 'string', description: 'Teammate name to hand the task to.' },
+      },
+      output: {
+        schema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            id: { type: 'string', required: true },
+            status: { type: 'string', required: true, enum: [...STATUSES] },
+            dispatched: { type: 'boolean', required: true },
+            taskId: { type: 'string' },
+            dispatchedTo: { type: 'string' },
+            note: { type: 'string' },
+          },
+        },
+        render: (_args, value) => [{
+          type: 'text',
+          text: value.dispatched
+            ? `Step ${JSON.stringify(value.id)} is now ${value.status}; dispatched to `
+              + `${JSON.stringify(value.dispatchedTo ?? '')} as task ${JSON.stringify(value.taskId ?? '')}.`
+            : `Step ${JSON.stringify(value.id)} is now ${value.status}. ${value.note ?? ''}`,
+        }],
+      },
+      async execute(args, exec) {
+        const id = args.id.trim()
+        if (id === '') throw new Error('invalid plan dispatch: `id` must be a non-empty string')
+        const sessionId = sessionIdOf(exec, 'plan_dispatch')
+        // Re-checked and captured once: the dispatch below happens after awaits,
+        // and a narrowing of `exec.agent` does not survive into that continuation.
+        if (!exec.agent) throw new Error('plan_dispatch requires an owning agent session')
+        const agent = exec.agent
+        const tree = readTree(store, sessionId)
+        if (tree === null) {
+          throw new Error('plan_dispatch found no plan: declare one with plan_write first')
+        }
+        const target = findNode(tree, id)
+        if (target === undefined) {
+          throw new Error(`plan_dispatch found no node with id ${JSON.stringify(id)} in the current plan`)
+        }
+        const override = args.task?.trim()
+        const prompt = override !== undefined && override !== '' ? override : target.task
+        if (prompt === undefined) {
+          throw new Error(
+            `plan_dispatch found no task for node ${JSON.stringify(id)}: `
+            + 'declare it with plan_write or pass `task`',
+          )
+        }
+
+        // Optional sibling service: plan-tree must stay independently composable
+        // and must not depend on agent-team, so a missing service degrades the
+        // DISPATCH only — the plan transition below still happens.
+        const teammate = args.teammate?.trim()
+        const teams = ctx.get('agentTeams')
+        if (teams === undefined || teammate === undefined || teammate === '') {
+          // Nothing was handed to anyone, so NO assignment is recorded: a node
+          // marked `in_progress` with no assignee reads as "someone is on it and
+          // the panel just cannot say who", which is exactly the wrong story.
+          // The status still moves — the caller asked to start this step, and the
+          // prompt is reported back so it can be dispatched another way.
+          await writeTree(store, sessionId, setStatus(tree, id, { status: 'in_progress' }) ?? tree)
+          return {
+            id,
+            status: 'in_progress' as const,
+            dispatched: false as const,
+            note: teammate === undefined || teammate === ''
+              ? 'No `teammate` was given, so the step was marked in_progress but the prompt was '
+                + 'handed to nobody. Pass `teammate` to dispatch it, or do the work yourself.'
+              : `No Team service is mounted in this composition, so ${JSON.stringify(teammate)} could `
+                + 'not be reached. The step is marked in_progress with NO assignee; dispatch it '
+                + 'another way or do the work yourself.',
+          }
+        }
+
+        const created = await teams.createTask(agent, {
+          subject: target.title,
+          description: prompt,
+        })
+        try {
+          await teams.sendMessage(agent, {
+            target: teammate,
+            content: [{ type: 'text', text: prompt }],
+            signal: exec.signal,
+          })
+        } catch (error: unknown) {
+          // Compensate: the task was created but never handed over, so leaving it
+          // would put a task on the board that no teammate was ever told about —
+          // and the plan step below does NOT run, so nothing points at it either.
+          // Best-effort: if the compensation itself fails, the original error is
+          // still the one worth reporting, so it is rethrown either way.
+          await teams.updateTask?.(
+            agent,
+            { taskId: created.id, expectedRevision: 1, action: 'delete' },
+          ).catch(() => undefined)
+          throw error
+        }
+        // The assignment rides the SAME store write as the status change: one
+        // atomic transition, so the panel never shows an `in_progress` node with
+        // nobody on it.
+        const assigned = setStatus(tree, id, { status: 'in_progress', assignedTo: teammate })
+        await writeTree(store, sessionId, assigned ?? tree)
         return {
           id,
           status: 'in_progress' as const,
-          dispatched: false as const,
-          note: teammate === undefined || teammate === ''
-            ? 'No `teammate` was given, so the step was marked in_progress but the prompt was '
-              + 'handed to nobody. Pass `teammate` to dispatch it, or do the work yourself.'
-            : `No Team service is mounted in this composition, so ${JSON.stringify(teammate)} could `
-              + 'not be reached. The step is marked in_progress with NO assignee; dispatch it '
-              + 'another way or do the work yourself.',
+          dispatched: true as const,
+          taskId: String(created.id),
+          dispatchedTo: teammate,
         }
-      }
-
-      const created = await teams.createTask(exec.agent, {
-        subject: target.title,
-        description: prompt,
-      })
-      try {
-        await teams.sendMessage(exec.agent, {
-          target: teammate,
-          content: [{ type: 'text', text: prompt }],
-          signal: exec.signal,
-        })
-      } catch (error: unknown) {
-        // Compensate: the task was created but never handed over, so leaving it
-        // would put a task on the board that no teammate was ever told about —
-        // and the plan step below does NOT run, so nothing points at it either.
-        // Best-effort: if the compensation itself fails, the original error is
-        // still the one worth reporting, so it is rethrown either way.
-        await teams.updateTask?.(
-          exec.agent,
-          { taskId: created.id, expectedRevision: 1, action: 'delete' },
-        ).catch(() => undefined)
-        throw error
-      }
-      // The assignment rides the SAME step event as the status change: one
-      // atomic transition the projection folds, so the panel never shows an
-      // `in_progress` node with nobody on it.
-      session.append('plan/step', { id, status: 'in_progress', assignedTo: teammate })
-      return {
-        id,
-        status: 'in_progress' as const,
-        dispatched: true as const,
-        taskId: String(created.id),
-        dispatchedTo: teammate,
-      }
-    },
-    presentCall: args => ({ card: 'generic', title: `Dispatch: ${args.id}`, kind: 'other', rawInput: args }),
-  }))
-
-  ctx.tools.register(defineTool({
-    name: 'plan_ask',
-    description: PLAN_ASK_DESCRIPTION,
-    parameters: {
-      id: { type: 'string', required: true, description: 'Unique id for the question\'s plan node; must not already exist in the tree.' },
-      question: { type: 'string', required: true, description: 'The question to put to the user.' },
-      title: { type: 'string', description: 'Short node title; defaults to the question itself.' },
-      options: {
-        type: 'array',
-        items: { type: 'string' },
-        description: 'Optional answers the user can pick from; they may still answer freely in their own words.',
       },
-    },
-    output: {
-      schema: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          id: { type: 'string', required: true },
-          question: { type: 'string', required: true },
-          status: { type: 'string', required: true, enum: [...STATUSES] },
-          answer: { type: 'string' },
-          delivered: { type: 'boolean', required: true },
-          note: { type: 'string' },
+      presentCall: args => ({ card: 'generic', title: `Dispatch: ${args.id}`, kind: 'other', rawInput: args }),
+    }))
+
+    ctx.tools.register(defineTool({
+      name: 'plan_ask',
+      description: PLAN_ASK_DESCRIPTION,
+      parameters: {
+        id: { type: 'string', required: true, description: 'Unique id for the question\'s plan node; must not already exist in the tree.' },
+        question: { type: 'string', required: true, description: 'The question to put to the user.' },
+        title: { type: 'string', description: 'Short node title; defaults to the question itself.' },
+        options: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Optional answers the user can pick from; they may still answer freely in their own words.',
         },
       },
-      render: (_args, value) => [{
-        type: 'text',
-        text: value.delivered
-          ? `Asked ${JSON.stringify(value.id)}: ${value.question} — the user answered: `
-            + `${value.answer ?? '(no text)'}. The node is now ${value.status}.`
-          : `Could NOT ask the user ${JSON.stringify(value.id)}: ${value.question} `
-            + `The node ${JSON.stringify(value.id)} stays \`blocked\`. ${value.note ?? ''}`.trim(),
-      }],
-    },
-    async execute(args, exec) {
-      const id = args.id.trim()
-      if (id === '') throw new Error('invalid plan ask: `id` must be a non-empty string')
-      const question = args.question.trim()
-      if (question === '') throw new Error('invalid plan ask: `question` must be a non-empty string')
-      if (!exec.agent) {
-        throw new Error('plan_ask requires an owning agent session')
-      }
-      const session = exec.agent.session
-      const tree = ctx.sessionProjections.stateOf(session, 'planTree')
-      if (tree === undefined) throw new Error('plan_ask requires the planTree session projection')
-      if (tree === null) {
-        throw new Error('plan_ask found no plan: declare one with plan_write first')
-      }
-      if (findNode(tree, id) !== undefined) {
-        throw new Error(`plan_ask found an existing node with id ${JSON.stringify(id)} in the current plan`)
-      }
-
-      // The question becomes a node BEFORE it is asked, so the plan records
-      // what the work is waiting on even if the user never answers (a
-      // disconnected UI, a cancelled turn). `blocked` is the honest status:
-      // this node is the reason the tree cannot advance.
-      const title = args.title?.trim()
-      const node: PlanNode = {
-        id,
-        title: title === undefined || title === '' ? question : title,
-        status: 'blocked',
-        detail: question,
-      }
-      // Appended as ONE new node rather than re-declaring the whole tree: see
-      // `appendNode` for why a `plan/declared` snapshot here would be wrong.
-      session.append('plan/declared', { plan: appendNode(tree, node) })
-
-      // Optional sibling service: plan-tree stays independently composable, so
-      // a missing answerer degrades the ASK only — the node above already
-      // records the question.
-      const asked = ctx.get('userQuestions')
-      if (asked === undefined) {
-        return {
-          id,
-          question,
-          status: 'blocked' as const,
-          delivered: false,
-          note: 'No user-questions service is mounted in this composition, so the question '
-            + 'was never shown to the user. Ask it in your final response instead.',
+      output: {
+        schema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            id: { type: 'string', required: true },
+            question: { type: 'string', required: true },
+            status: { type: 'string', required: true, enum: [...STATUSES] },
+            answer: { type: 'string' },
+            delivered: { type: 'boolean', required: true },
+            note: { type: 'string' },
+          },
+        },
+        render: (_args, value) => [{
+          type: 'text',
+          text: value.delivered
+            ? `Asked ${JSON.stringify(value.id)}: ${value.question} — the user answered: `
+              + `${value.answer ?? '(no text)'}. The node is now ${value.status}.`
+            : `Could NOT ask the user ${JSON.stringify(value.id)}: ${value.question} `
+              + `The node ${JSON.stringify(value.id)} stays \`blocked\`. ${value.note ?? ''}`.trim(),
+        }],
+      },
+      async execute(args, exec) {
+        const id = args.id.trim()
+        if (id === '') throw new Error('invalid plan ask: `id` must be a non-empty string')
+        const question = args.question.trim()
+        if (question === '') throw new Error('invalid plan ask: `question` must be a non-empty string')
+        const sessionId = sessionIdOf(exec, 'plan_ask')
+        // Re-checked and captured once: the ask below happens after an await, and
+        // a narrowing of `exec.agent` does not survive into that continuation.
+        if (!exec.agent) throw new Error('plan_ask requires an owning agent session')
+        const agent = exec.agent
+        const tree = readTree(store, sessionId)
+        if (tree === null) {
+          throw new Error('plan_ask found no plan: declare one with plan_write first')
         }
-      }
+        if (findNode(tree, id) !== undefined) {
+          throw new Error(`plan_ask found an existing node with id ${JSON.stringify(id)} in the current plan`)
+        }
 
-      const labels = (args.options ?? []).map(label => label.trim()).filter(label => label !== '')
-      let answer: UserQuestionAnswerItem | undefined
-      try {
-        const replies = await asked.ask({
-          questions: [{
+        // The question becomes a node BEFORE it is asked, so the plan records
+        // what the work is waiting on even if the user never answers (a
+        // disconnected UI, a cancelled turn). `blocked` is the honest status:
+        // this node is the reason the tree cannot advance.
+        const title = args.title?.trim()
+        const node: PlanNode = {
+          id,
+          title: title === undefined || title === '' ? question : title,
+          status: 'blocked',
+          detail: question,
+        }
+        // Appended as ONE new node rather than restating the whole tree: see
+        // `appendNode` for why a whole-tree replacement here would be wrong.
+        await writeTree(store, sessionId, appendNode(tree, node))
+
+        // Optional sibling service: plan-tree stays independently composable, so
+        // a missing answerer degrades the ASK only — the node above already
+        // records the question.
+        const asked = ctx.get('userQuestions')
+        if (asked === undefined) {
+          return {
             id,
             question,
-            ...(labels.length === 0 ? {} : { options: labels.map(label => ({ label })) }),
-          }],
-          agent: exec.agent,
-          signal: exec.signal,
-        })
-        answer = replies.answers.find(entry => entry.id === id)
-      } catch (cause) {
-        // A question that reached no human is NOT an answered one. The node
-        // stays `blocked` and the failure is reported, because silently
-        // returning a status the caller reads as success would let the model
-        // proceed on an answer that does not exist.
-        return {
-          id,
-          question,
-          status: 'blocked' as const,
-          delivered: false,
-          note: `The question could not be delivered to the user (${describeAskFailure(cause)}). `
-            + 'It is recorded as a blocked node; ask it in your final response instead.',
+            status: 'blocked' as const,
+            delivered: false,
+            note: 'No user-questions service is mounted in this composition, so the question '
+              + 'was never shown to the user. Ask it in your final response instead.',
+          }
         }
-      }
 
-      if (answer === undefined) {
-        return {
-          id,
-          question,
-          status: 'blocked' as const,
-          delivered: false,
-          note: `The answerer returned no entry for question ${JSON.stringify(id)}. `
-            + 'The node stays `blocked`; the question was not answered.',
+        const labels = (args.options ?? []).map(label => label.trim()).filter(label => label !== '')
+        let answer: UserQuestionAnswerItem | undefined
+        try {
+          const replies = await asked.ask({
+            questions: [{
+              id,
+              question,
+              ...(labels.length === 0 ? {} : { options: labels.map(label => ({ label })) }),
+            }],
+            agent,
+            signal: exec.signal,
+          })
+          answer = replies.answers.find(entry => entry.id === id)
+        } catch (cause) {
+          // A question that reached no human is NOT an answered one. The node
+          // stays `blocked` and the failure is reported, because silently
+          // returning a status the caller reads as success would let the model
+          // proceed on an answer that does not exist.
+          return {
+            id,
+            question,
+            status: 'blocked' as const,
+            delivered: false,
+            note: `The question could not be delivered to the user (${describeAskFailure(cause)}). `
+              + 'It is recorded as a blocked node; ask it in your final response instead.',
+          }
         }
-      }
 
-      const text = formatAnswer(answer)
-      // The answer rides the SAME step event as the status change, so the
-      // panel never shows a completed question node with its answer missing.
-      session.append('plan/step', { id, status: 'completed', answer: text })
-      return { id, question, status: 'completed' as const, answer: text, delivered: true }
-    },
-    presentCall: args => ({ card: 'generic', title: `Ask: ${args.id}`, kind: 'other', rawInput: args }),
-  }))
+        if (answer === undefined) {
+          return {
+            id,
+            question,
+            status: 'blocked' as const,
+            delivered: false,
+            note: `The answerer returned no entry for question ${JSON.stringify(id)}. `
+              + 'The node stays `blocked`; the question was not answered.',
+          }
+        }
+
+        const text = formatAnswer(answer)
+        // The answer rides the SAME step as the status change, so the panel never
+        // shows a completed question node with its answer missing. The tree is
+        // re-read inside the write so a node appended while the human was
+        // answering is not dropped by this write.
+        const closed = await store.updateStored(
+          sessionId,
+          current => setStatus(current, id, { status: 'completed', answer: text }) ?? current,
+        )
+        if (closed === undefined) {
+          throw new Error('plan_ask lost the plan tree of session ' + JSON.stringify(sessionId) + ' before the answer could be written')
+        }
+        return { id, question, status: 'completed' as const, answer: text, delivered: true }
+      },
+      presentCall: args => ({ card: 'generic', title: `Ask: ${args.id}`, kind: 'other', rawInput: args }),
+    }))
+  // ---- end of the four model-facing tools ----
+
 }
 
 /**

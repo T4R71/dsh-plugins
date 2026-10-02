@@ -19,3 +19,6 @@ Thumbs.db
 # 编辑器
 .vscode/
 .idea/
+
+# 子代理的一次性工作目录（临时脚本与备份，不属于产品）
+scratch/

@@ -1,13 +1,13 @@
 /**
  * 第一阶段注册：task-tree 这个标签页类型是什么。
  *
- * 它是个页，不是查看器：不认领地址。面板自己读 planTree 投影，
- * ui-sidebar-right 完全不知道本包存在。
+ * 它是个页，不是查看器：不认领地址。面板自己读宿主那份设置文档里的 `plan-tree-sessions`
+ * 命名空间（经 `ctx.configForms` 的镜像），ui-sidebar-right 完全不知道本包存在。
  */
 import type { SidebarRightTabDefinition } from '@deepseek-ai/dsh-client-ui-sidebar-right/client'
 import type { TranslateNS } from '@deepseek-ai/dsh-client-locale/client'
 import type {} from './locales.ts'
-import { IconPlanOutline14, type IconProps } from '@deepseek-ai/dsh-client-ui-primitives'
+import { IconPlanOutlineRegular, type IconProps } from '@deepseek-ai/dsh-client-ui-primitives'
 
 /** 本包拥有的标签页种类。 */
 export const TASK_TREE_KIND = 'task-tree'
@@ -17,7 +17,7 @@ export const TASK_TREE_ID = '@t4r71/dsh-ui-task-tree'
 
 /** 引导胶囊上的图形。 */
 function TaskTreeGlyph({ size, className }: IconProps) {
-  return <IconPlanOutline14 size={size} className={className} />
+  return <IconPlanOutlineRegular size={size} className={className} />
 }
 
 /**

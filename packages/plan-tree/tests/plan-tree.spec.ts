@@ -1,26 +1,90 @@
-import { describe, expect, it } from 'vitest'
+import assert from 'node:assert/strict'
+import { describe, it } from 'node:test'
 import { Context } from '@deepseek-ai/cordis'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import { renderPrompt } from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
 import { validateJsonSchemaValue } from '@deepseek-ai/dsh-tools'
-import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import { Session, SessionId } from '@deepseek-ai/dsh-session'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { PlanNode } from '../src/types.ts'
+import { PLAN_TREE_FIELD, PLAN_TREE_NAMESPACE, parsePlanTreesField, planTreeStore } from '../src/session-store.ts'
 
 import * as planTree from '../src/index.ts'
 
 /**
  * Drives the REAL plugin body: mounts `dsh-plan-tree` on a real `ToolRuntime`
- * and a real projection registry, then invokes the registered tools through
- * `ctx.tools.execute` with a fake parent Agent carrying a real `Session` — so
- * the events the tools append are observable on a genuine session log and the
- * `planTree` projection folds them exactly as it does in production.
+ * and a STAND-IN settings service carrying the same `plan-tree-sessions`
+ * namespace a real composition mounts, then invokes the registered tools through
+ * `ctx.tools.execute` with a fake parent Agent carrying a real `Session`.
+ *
+ * The tree is read back out of that document, which is what the panel reads too:
+ * nothing is folded from the session log any more, and the log assertions below
+ * pin that — a plan written by these tools must leave NO event behind.
  */
 
 const testToolSignal = new AbortController().signal
+
+/**
+ * An in-memory stand-in for the host settings service, narrowed to the two
+ * members this package calls.
+ *
+ * It ENFORCES the revision CAS (`plan-tree`'s store retries on it) and it counts
+ * replacement attempts, so a test can prove a write really went through the
+ * document instead of merely through plugin memory.
+ */
+class FakeSettings {
+  /** The whole document: namespace id -> section. */
+  readonly sections: Record<string, Record<string, unknown>> = { [PLAN_TREE_NAMESPACE]: { [PLAN_TREE_FIELD]: {} } }
+  /** Revision per namespace, bumped on every accepted write. */
+  private readonly revisions: Record<string, number> = { [PLAN_TREE_NAMESPACE]: 0 }
+  /** How many replacements were attempted, refusals included. */
+  attempts = 0
+  /** Revisions a write was offered, in order. */
+  readonly seenRevisions: (number | undefined)[] = []
+  /** How many of the next replacements to refuse with a conflict. */
+  conflicts = 0
+
+  /** @returns one descriptor per namespace, with its revision and value. */
+  describe(): { ns: string; value: unknown; revision: number }[] {
+    return Object.entries(this.sections).map(([ns, value]) => ({ ns, value, revision: this.revisions[ns] ?? 0 }))
+  }
+
+  /**
+   * Replace one namespace's section under the revision CAS.
+   * @param ns - the namespace to write.
+   * @param section - the complete next section.
+   * @param expectedRevision - the revision the caller read.
+   * @returns nothing; rejects with `code: 'SETTINGS_CONFLICT'` on a stale write.
+   */
+  replace(ns: string, section: object, expectedRevision?: number): Promise<void> {
+    this.attempts += 1
+    this.seenRevisions.push(expectedRevision)
+    const actual = this.revisions[ns] ?? 0
+    // One conflict forced by a test models the other writer that landed between
+    // this writer's read and its write, with the outcome pinned instead of
+    // raced.
+    if (this.conflicts > 0) {
+      this.conflicts -= 1
+      return Promise.reject(Object.assign(new Error('settings: conflict'), { code: 'SETTINGS_CONFLICT' }))
+    }
+    if (expectedRevision !== undefined && expectedRevision !== actual) {
+      return Promise.reject(Object.assign(
+        new Error('settings: the document moved under this writer'),
+        { code: 'SETTINGS_CONFLICT', expected: expectedRevision, actual },
+      ))
+    }
+    this.sections[ns] = section as Record<string, unknown>
+    this.revisions[ns] = actual + 1
+    return Promise.resolve()
+  }
+
+  /** One session's tree exactly as the document stores it. */
+  stored(sessionId: string): unknown {
+    return (this.sections[PLAN_TREE_NAMESPACE]?.[PLAN_TREE_FIELD] as Record<string, unknown> | undefined)?.[sessionId]
+  }
+}
 
 /** A parent Agent backed by a real Session — the tools read `agent.session`. */
 function agentWithSession(id = 'planner'): Agent & { session: Session } {
@@ -28,11 +92,15 @@ function agentWithSession(id = 'planner'): Agent & { session: Session } {
   return { id: SessionId(id), session } as unknown as Agent & { session: Session }
 }
 
+/** The stand-in every `setup` mounts, so a test can read the document back. */
+let settings = new FakeSettings()
+
 async function setup(): Promise<Context> {
   const ctx = new Context()
   await ctx.plugin(SystemPrompt)
   await ctx.plugin(ToolRuntime)
-  await ctx.plugin(SessionProjectionRegistry)
+  settings = new FakeSettings()
+  ctx.provide('settings' as never, settings as never)
   await ctx.plugin(planTree)
   return ctx
 }
@@ -41,16 +109,22 @@ let callCounter = 0
 function call(ctx: Context, name: string, args: unknown, agent: Agent) {
   return ctx.tools.execute({
     signal: testToolSignal,
-    callId: ToolCallId(`call-${++callCounter}`),
+    callId: ToolCallId(`call-${String(++callCounter)}`),
     name,
     arguments: args,
     agent,
   })
 }
 
-/** The folded plan tree for one agent's session, as the panel would receive it. */
+/**
+ * The plan tree of one agent's session, read out of the settings document and
+ * validated the same way the tool surface validates it — the value the panel
+ * receives through its describe mirror.
+ */
 function treeOf(ctx: Context, agent: Agent & { session: Session }): PlanNode[] | null {
-  return ctx.sessionProjections.stateOf(agent.session, 'planTree') ?? null
+  const stored = planTreeStore(ctx).get(String(agent.session.header.id))
+  if (stored === undefined) return null
+  return stored as PlanNode[]
 }
 
 /** Walk the tree for one id, depth-first. */
@@ -64,7 +138,7 @@ function nodeById(nodes: readonly PlanNode[] | null, id: string): PlanNode | und
 }
 
 describe('plan_write', () => {
-  it('(a) accepts a three-level nested tree, and the projection folds all three levels', async () => {
+  it('(a) accepts a three-level nested tree, and the document folds all three levels', async () => {
     const ctx = await setup()
     const agent = agentWithSession()
     const result = await call(ctx, 'plan_write', {
@@ -76,14 +150,57 @@ describe('plan_write', () => {
         }],
       }],
     }, agent)
-    expect(result.isError).toBe(false)
+    assert.strictEqual(result.isError, false)
     if (result.isError) throw new Error('expected plan_write success')
-    expect(result.value).toMatchObject({ total: 3 })
+    assert.partialDeepStrictEqual(result.value, { total: 3 })
 
     const tree = treeOf(ctx, agent)!
-    expect(nodeById(tree, 'leaf')?.title).toBe('Leaf')
-    expect(nodeById(tree, 'leaf')?.status).toBe('pending')
-    expect(nodeById(tree, 'mid')?.children).toHaveLength(1)
+    assert.strictEqual(nodeById(tree, 'leaf')?.title, 'Leaf')
+    assert.strictEqual(nodeById(tree, 'leaf')?.status, 'pending')
+    assert.strictEqual(nodeById(tree, 'mid')?.children?.length, 1)
+  })
+
+  it('writes the plan into the settings document and appends NO session event', async () => {
+    const ctx = await setup()
+    const agent = agentWithSession('store-not-log')
+    await call(ctx, 'plan_write', { nodes: [{ id: 'a', title: 'A', status: 'pending' }] }, agent)
+    // The document carries it, under THIS session's key.
+    assert.deepStrictEqual(settings.stored('store-not-log'), [{ id: 'a', title: 'A', status: 'pending' }])
+    // And the session log does not: the two event types this package used to
+    // append are outside 0.1.7's KNOWN_SESSION_EVENT_TYPES, so a log carrying
+    // one cannot be reopened at all.
+    assert.deepStrictEqual(agent.session.snapshotEvents(), [])
+  })
+
+  it('reports a plan write as a failure when no settings namespace is composed', async () => {
+    const ctx = new Context()
+    await ctx.plugin(SystemPrompt)
+    await ctx.plugin(ToolRuntime)
+    await ctx.plugin(planTree)
+    const agent = agentWithSession('no-store')
+    const result = await call(ctx, 'plan_write', { nodes: [{ id: 'a', title: 'A', status: 'pending' }] }, agent)
+    assert.strictEqual(result.isError, true)
+    if (!result.isError) throw new Error('expected a rejection')
+    assert.ok(JSON.stringify(result).includes('plan-tree-sessions'))
+  })
+
+  it('carries a tree through the stored document (parsed, not stripped)', async () => {
+    const ctx = await setup()
+    // Written straight into the document, the way another writer or a human
+    // editing settings.yaml would: the read path must parse it rather than
+    // assume it was written by this process.
+    settings.sections[PLAN_TREE_NAMESPACE] = {
+      [PLAN_TREE_FIELD]: {
+        wire: [{ id: 'a', title: 'A', status: 'pending', task: 'run it', assignedTo: 'worker-a', answer: 'yes', dependsOn: [] }],
+      },
+    }
+    const parsed = parsePlanTreesField(settings.sections[PLAN_TREE_NAMESPACE]![PLAN_TREE_FIELD])
+    assert.strictEqual(parsed['wire']?.[0]?.task, 'run it')
+    assert.strictEqual(parsed['wire']?.[0]?.assignedTo, 'worker-a')
+    assert.strictEqual(parsed['wire']?.[0]?.answer, 'yes')
+    // The plugin's OWN reader agrees with the pure parser.
+    const tree = planTreeStore(ctx).get('wire')
+    assert.strictEqual(tree?.[0]?.assignedTo, 'worker-a')
   })
 
   it('rejects a fourth-level property the schema does not declare', async () => {
@@ -92,7 +209,7 @@ describe('plan_write', () => {
     const result = await call(ctx, 'plan_write', {
       nodes: [{ id: 'a', title: 'A', status: 'pending', bogus: true }],
     }, agent)
-    expect(result.isError).toBe(true)
+    assert.strictEqual(result.isError, true)
   })
 
   it('declares `children` three levels down, and refuses to go past its own depth', async () => {
@@ -103,21 +220,21 @@ describe('plan_write', () => {
     const level3 = level2.items.properties.children as { items: { properties: Record<string, unknown> } }
     // The whole node repeats inline at every level, so the model can declare
     // `task`/`assignedTo`/`dependsOn` on a third-level node too.
-    expect(level3.items.properties).toHaveProperty('children')
-    expect(level3.items.properties).toHaveProperty('task')
-    expect(level3.items.properties).toHaveProperty('assignedTo')
-    expect(level3.items.properties).toHaveProperty('dependsOn')
+    assert.ok('children' in level3.items.properties)
+    assert.ok('task' in level3.items.properties)
+    assert.ok('assignedTo' in level3.items.properties)
+    assert.ok('dependsOn' in level3.items.properties)
 
     // Bounded literal nesting, not unbounded recursion: one level past the
     // declared floor is an unknown property, like any other typo.
     const deep = { id: 'x', title: 'X', status: 'pending', children: [] as unknown[] }
     let cursor = deep
     for (let depth = 0; depth < 8; depth += 1) {
-      const child = { id: `x${depth}`, title: 'X', status: 'pending', children: [] as unknown[] }
+      const child = { id: `x\${depth}`, title: 'X', status: 'pending', children: [] as unknown[] }
       cursor.children.push(child)
       cursor = child
     }
-    expect(validateJsonSchemaValue(parameters, { nodes: [deep] }, '')).not.toEqual([])
+    assert.notDeepStrictEqual(validateJsonSchemaValue(parameters, { nodes: [deep] }, ''), [])
   })
 
   it('(b) accepts `dependsOn` and rejects a dependency on an unknown id', async () => {
@@ -130,18 +247,18 @@ describe('plan_write', () => {
         { id: 'second', title: 'Second', status: 'pending', dependsOn: ['first'] },
       ],
     }, agent)
-    expect(ok.isError).toBe(false)
+    assert.strictEqual(ok.isError, false)
     if (ok.isError) throw new Error('expected plan_write success')
     // The dependency survives normalization and is readable back, which is
     // what makes the panel draw a real edge instead of nothing.
-    expect(nodeById(treeOf(ctx, agent), 'second')?.dependsOn).toEqual(['first'])
+    assert.deepStrictEqual(nodeById(treeOf(ctx, agent), 'second')?.dependsOn, ['first'])
 
     const bad = await call(ctx, 'plan_write', {
       nodes: [{ id: 'only', title: 'Only', status: 'pending', dependsOn: ['ghost'] }],
     }, agent)
-    expect(bad.isError).toBe(true)
+    assert.strictEqual(bad.isError, true)
     if (!bad.isError) throw new Error('expected a rejection')
-    expect(JSON.stringify(bad)).toContain('ghost')
+    assert.ok(JSON.stringify(bad).includes('ghost'))
   })
 
   it('(c) normalizes `task` (trim, drop blank) and reads it back', async () => {
@@ -154,23 +271,44 @@ describe('plan_write', () => {
         { id: 'assigned', title: 'Assigned', status: 'pending', assignedTo: '  worker-a  ' },
       ],
     }, agent)
-    expect(result.isError).toBe(false)
+    assert.strictEqual(result.isError, false)
 
     const tree = treeOf(ctx, agent)
-    expect(nodeById(tree, 'with-task')?.task).toBe('do the thing')
+    assert.strictEqual(nodeById(tree, 'with-task')?.task, 'do the thing')
     // A blank prompt is the ABSENCE of one, so plan_dispatch still refuses it.
-    expect(nodeById(tree, 'blank-task')?.task).toBeUndefined()
-    expect(nodeById(tree, 'assigned')?.assignedTo).toBe('worker-a')
+    assert.strictEqual(nodeById(tree, 'blank-task')?.task, undefined)
+    assert.strictEqual(nodeById(tree, 'assigned')?.assignedTo, 'worker-a')
   })
 
-  it('carries `task` and `assignedTo` through the wire schema (narrowed, not stripped)', async () => {
+  it('carries `task` and `assignedTo` through the stored document (narrowed, not stripped)', async () => {
     const ctx = await setup()
     const agent = agentWithSession('wire')
     const declared: PlanNode[] = [{ id: 'a', title: 'A', status: 'pending', task: 'run it', assignedTo: 'worker-a' }]
-    agent.session.append('plan/declared', { plan: declared })
-    const state = ctx.sessionProjections.stateOf(agent.session, 'planTree')
-    expect(state?.[0]?.task).toBe('run it')
-    expect(state?.[0]?.assignedTo).toBe('worker-a')
+    await planTreeStore(ctx).replace(String(agent.session.header.id), declared)
+    const tree = treeOf(ctx, agent)
+    assert.strictEqual(tree?.[0]?.task, 'run it')
+    assert.strictEqual(tree?.[0]?.assignedTo, 'worker-a')
+  })
+
+  it('reports what a re-declaration dropped and regressed', async () => {
+    const ctx = await setup()
+    const agent = agentWithSession('overwrite')
+    await call(ctx, 'plan_write', {
+      nodes: [
+        { id: 'keep', title: 'Keep', status: 'pending' },
+        { id: 'gone', title: 'Gone', status: 'pending' },
+        { id: 'done', title: 'Done', status: 'completed' },
+      ],
+    }, agent)
+    const second = await call(ctx, 'plan_write', {
+      nodes: [
+        { id: 'keep', title: 'Keep', status: 'pending' },
+        { id: 'done', title: 'Done', status: 'pending' },
+      ],
+    }, agent)
+    assert.strictEqual(second.isError, false)
+    if (second.isError) throw new Error('expected plan_write success')
+    assert.partialDeepStrictEqual(second.value, { dropped: ['gone'], regressed: ['done'] })
   })
 })
 
@@ -183,11 +321,11 @@ describe('plan_step', () => {
     }, agent)
 
     const result = await call(ctx, 'plan_step', { id: 'step', status: 'in_progress' }, agent)
-    expect(result.isError).toBe(false)
+    assert.strictEqual(result.isError, false)
     const node = nodeById(treeOf(ctx, agent), 'step')
-    expect(node?.status).toBe('in_progress')
+    assert.strictEqual(node?.status, 'in_progress')
     // A plain step says nothing about assignment, so it must not erase one.
-    expect(node?.assignedTo).toBe('worker-b')
+    assert.strictEqual(node?.assignedTo, 'worker-b')
   })
 
   it('rejects an id the current plan does not carry', async () => {
@@ -195,7 +333,27 @@ describe('plan_step', () => {
     const agent = agentWithSession('unknown-step')
     await call(ctx, 'plan_write', { nodes: [{ id: 'real', title: 'Real', status: 'pending' }] }, agent)
     const result = await call(ctx, 'plan_step', { id: 'ghost', status: 'completed' }, agent)
-    expect(result.isError).toBe(true)
+    assert.strictEqual(result.isError, true)
+    // A rejected step writes NOTHING: the document still carries the plan as it
+    // was, not a half-applied fold.
+    assert.deepStrictEqual(settings.stored('unknown-step'), [{ id: 'real', title: 'Real', status: 'pending' }])
+  })
+
+  it('rejects a step naming an unknown id WITHOUT appending an event', async () => {
+    const ctx = await setup()
+    const agent = agentWithSession('no-event-step')
+    await call(ctx, 'plan_write', { nodes: [{ id: 'real', title: 'Real', status: 'pending' }] }, agent)
+    await call(ctx, 'plan_step', { id: 'real', status: 'completed' }, agent)
+    assert.deepStrictEqual(agent.session.snapshotEvents(), [])
+  })
+
+  it('writes the step into the settings document, not into the session log', async () => {
+    const ctx = await setup()
+    const agent = agentWithSession('step-doc')
+    await call(ctx, 'plan_write', { nodes: [{ id: 's', title: 'S', status: 'pending' }] }, agent)
+    await call(ctx, 'plan_step', { id: 's', status: 'in_progress', assignedTo: 'worker-a' }, agent)
+    assert.deepStrictEqual(settings.stored('step-doc'), [{ id: 's', title: 'S', status: 'in_progress', assignedTo: 'worker-a' }])
+    assert.deepStrictEqual(agent.session.snapshotEvents(), [])
   })
 })
 
@@ -208,16 +366,16 @@ describe('plan_dispatch', () => {
     }, agent)
 
     // No Team service is mounted in this composition.
-    expect(ctx.get('agentTeams')).toBeUndefined()
+    assert.strictEqual(ctx.get('agentTeams'), undefined)
 
     const result = await call(ctx, 'plan_dispatch', { id: 'work', teammate: 'worker-a' }, agent)
-    expect(result.isError).toBe(false)
+    assert.strictEqual(result.isError, false)
     if (result.isError) throw new Error('expected a degraded dispatch, not a failure')
-    expect(result.value).toMatchObject({ id: 'work', status: 'in_progress' })
+    assert.partialDeepStrictEqual(result.value, { id: 'work', status: 'in_progress' })
     // Nothing was dispatched, so nothing is claimed about who is doing it.
-    expect((result.value as { dispatchedTo?: string }).dispatchedTo).toBeUndefined()
-    expect(nodeById(treeOf(ctx, agent), 'work')?.assignedTo).toBeUndefined()
-    expect(nodeById(treeOf(ctx, agent), 'work')?.status).toBe('in_progress')
+    assert.strictEqual((result.value as { dispatchedTo?: string }).dispatchedTo, undefined)
+    assert.strictEqual(nodeById(treeOf(ctx, agent), 'work')?.assignedTo, undefined)
+    assert.strictEqual(nodeById(treeOf(ctx, agent), 'work')?.status, 'in_progress')
   })
 
   it('(e) throws when the id is not in the current plan', async () => {
@@ -227,9 +385,9 @@ describe('plan_dispatch', () => {
       nodes: [{ id: 'present', title: 'Present', status: 'pending', task: 'p' }],
     }, agent)
     const result = await call(ctx, 'plan_dispatch', { id: 'absent' }, agent)
-    expect(result.isError).toBe(true)
+    assert.strictEqual(result.isError, true)
     if (!result.isError) throw new Error('expected a rejection')
-    expect(JSON.stringify(result)).toContain('absent')
+    assert.ok(JSON.stringify(result).includes('absent'))
   })
 
   it('throws when the node has no task and none was passed', async () => {
@@ -237,7 +395,7 @@ describe('plan_dispatch', () => {
     const agent = agentWithSession('no-task')
     await call(ctx, 'plan_write', { nodes: [{ id: 'bare', title: 'Bare', status: 'pending' }] }, agent)
     const result = await call(ctx, 'plan_dispatch', { id: 'bare' }, agent)
-    expect(result.isError).toBe(true)
+    assert.strictEqual(result.isError, true)
   })
 
   it('uses the `task` override when the node declares none', async () => {
@@ -245,8 +403,8 @@ describe('plan_dispatch', () => {
     const agent = agentWithSession('override')
     await call(ctx, 'plan_write', { nodes: [{ id: 'o', title: 'O', status: 'pending' }] }, agent)
     const result = await call(ctx, 'plan_dispatch', { id: 'o', task: '  overridden  ' }, agent)
-    expect(result.isError).toBe(false)
-    expect(nodeById(treeOf(ctx, agent), 'o')?.status).toBe('in_progress')
+    assert.strictEqual(result.isError, false)
+    assert.strictEqual(nodeById(treeOf(ctx, agent), 'o')?.status, 'in_progress')
   })
 
   it('throws without an owning agent session', async () => {
@@ -257,7 +415,7 @@ describe('plan_dispatch', () => {
       name: 'plan_dispatch',
       arguments: { id: 'x' },
     })
-    expect(result.isError).toBe(true)
+    assert.strictEqual(result.isError, true)
   })
 })
 
@@ -285,9 +443,9 @@ describe('plan_dispatch with a Team service', () => {
     }, agent)
 
     const result = await call(ctx, 'plan_dispatch', { id: 'ship', teammate: 'worker-a' }, agent)
-    expect(result.isError).toBe(false)
+    assert.strictEqual(result.isError, false)
     if (result.isError) throw new Error('expected a successful dispatch')
-    expect(result.value).toMatchObject({
+    assert.partialDeepStrictEqual(result.value, {
       id: 'ship',
       status: 'in_progress',
       taskId: 'task-7',
@@ -295,25 +453,28 @@ describe('plan_dispatch with a Team service', () => {
     })
 
     // The Team side: one task with the node's title and the prompt.
-    expect(created).toEqual([{ subject: 'Ship it', description: 'ship the feature' }])
+    assert.deepStrictEqual(created, [{ subject: 'Ship it', description: 'ship the feature' }])
     // And the prompt actually delivered to that teammate.
-    expect(sent).toEqual([{ target: 'worker-a', text: 'ship the feature' }])
+    assert.deepStrictEqual(sent, [{ target: 'worker-a', text: 'ship the feature' }])
 
-    // The plan side, read back through the projection: the panel now knows who
-    // is doing this node, from the SAME step event as the status change.
+    // The plan side, read back out of the document the panel mirrors: the panel
+    // now knows who is doing this node, from the SAME store write as the status.
     const node = nodeById(treeOf(ctx, agent), 'ship')
-    expect(node?.assignedTo).toBe('worker-a')
-    expect(node?.status).toBe('in_progress')
+    assert.strictEqual(node?.assignedTo, 'worker-a')
+    assert.strictEqual(node?.status, 'in_progress')
 
-    // The assignment must be visible on the durable log, not merely in memory:
-    // a client rebuilding from events has to see it.
-    const step = agent.session.snapshotEvents().findLast(e => e.type === 'plan/step')
-    expect(step?.data).toMatchObject({ id: 'ship', status: 'in_progress', assignedTo: 'worker-a' })
+    // The assignment must be DURABLE in the settings document, not merely in
+    // memory: a client rebuilding from the document has to see it.
+    assert.deepStrictEqual(settings.stored('lead'), [
+      { id: 'ship', title: 'Ship it', status: 'in_progress', task: 'ship the feature', assignedTo: 'worker-a' },
+    ])
+    // And nothing at all on the session log.
+    assert.deepStrictEqual(agent.session.snapshotEvents(), [])
   })
 })
 
 describe('plan_ask', () => {
-  it('(a) inserts the question as a blocked node, visible in the folded tree', async () => {
+  it('(a) inserts the question as a blocked node, visible in the stored tree', async () => {
     const ctx = await setup()
     const agent = agentWithSession('asker')
     await call(ctx, 'plan_write', {
@@ -322,7 +483,7 @@ describe('plan_ask', () => {
 
     // No answerer is mounted, so this exercises the node-insertion half on its
     // own: the question must be recorded even though nobody was asked.
-    expect(ctx.get('userQuestions')).toBeUndefined()
+    assert.strictEqual(ctx.get('userQuestions'), undefined)
 
     const result = await call(ctx, 'plan_ask', {
       id: 'q-color',
@@ -330,18 +491,18 @@ describe('plan_ask', () => {
       options: ['red', 'blue'],
     }, agent)
 
-    expect(result.isError).toBe(false)
+    assert.strictEqual(result.isError, false)
     if (result.isError) throw new Error('expected plan_ask to record the question')
 
     const node = nodeById(treeOf(ctx, agent), 'q-color')
-    expect(node).toBeDefined()
-    expect(node?.status).toBe('blocked')
-    expect(node?.detail).toBe('Which colour should the header be?')
+    assert.notStrictEqual(node, undefined)
+    assert.strictEqual(node?.status, 'blocked')
+    assert.strictEqual(node?.detail, 'Which colour should the header be?')
     // `title` defaults to the question when none was passed.
-    expect(node?.title).toBe('Which colour should the header be?')
+    assert.strictEqual(node?.title, 'Which colour should the header be?')
 
     // The pre-existing node is untouched by the insertion.
-    expect(nodeById(treeOf(ctx, agent), 'work')?.status).toBe('in_progress')
+    assert.strictEqual(nodeById(treeOf(ctx, agent), 'work')?.status, 'in_progress')
   })
 
   it('accepts an explicit `title` distinct from the question', async () => {
@@ -351,8 +512,8 @@ describe('plan_ask', () => {
 
     await call(ctx, 'plan_ask', { id: 'q1', question: 'Which database?', title: 'Pick a database' }, agent)
     const node = nodeById(treeOf(ctx, agent), 'q1')
-    expect(node?.title).toBe('Pick a database')
-    expect(node?.detail).toBe('Which database?')
+    assert.strictEqual(node?.title, 'Pick a database')
+    assert.strictEqual(node?.detail, 'Which database?')
   })
 
   it('(b) throws when the id already exists in the current plan', async () => {
@@ -361,33 +522,33 @@ describe('plan_ask', () => {
     await call(ctx, 'plan_write', { nodes: [{ id: 'taken', title: 'Taken', status: 'pending' }] }, agent)
 
     const result = await call(ctx, 'plan_ask', { id: 'taken', question: 'Anything?' }, agent)
-    expect(result.isError).toBe(true)
+    assert.strictEqual(result.isError, true)
     if (!result.isError) throw new Error('expected a duplicate-id rejection')
-    expect(JSON.stringify(result)).toContain('taken')
+    assert.ok(JSON.stringify(result).includes('taken'))
 
     // The rejected call must not have disturbed the existing node.
-    expect(nodeById(treeOf(ctx, agent), 'taken')?.status).toBe('pending')
+    assert.strictEqual(nodeById(treeOf(ctx, agent), 'taken')?.status, 'pending')
   })
 
   it('(c) degrades without a user-questions service: node stays blocked, nothing claimed as answered', async () => {
     const ctx = await setup()
     const agent = agentWithSession('no-asker')
     await call(ctx, 'plan_write', { nodes: [{ id: 'root', title: 'Root', status: 'in_progress' }] }, agent)
-    expect(ctx.get('userQuestions')).toBeUndefined()
+    assert.strictEqual(ctx.get('userQuestions'), undefined)
 
     const result = await call(ctx, 'plan_ask', { id: 'q-degrade', question: 'Proceed?' }, agent)
-    expect(result.isError).toBe(false)
+    assert.strictEqual(result.isError, false)
     if (result.isError) throw new Error('expected a degraded ask, not a failure')
 
     // The degradation is EXPLICIT: it does not silently look like an answer.
-    expect(result.value).toMatchObject({ id: 'q-degrade', status: 'blocked', delivered: false })
-    expect((result.value as { answer?: string }).answer).toBeUndefined()
-    expect(JSON.stringify(result.value)).toContain('never shown')
+    assert.partialDeepStrictEqual(result.value, { id: 'q-degrade', status: 'blocked', delivered: false })
+    assert.strictEqual((result.value as { answer?: string }).answer, undefined)
+    assert.ok(JSON.stringify(result.value).includes('never shown'))
 
     // And the plan says the same thing: blocked, with no answer on the node.
     const node = nodeById(treeOf(ctx, agent), 'q-degrade')
-    expect(node?.status).toBe('blocked')
-    expect(node?.answer).toBeUndefined()
+    assert.strictEqual(node?.status, 'blocked')
+    assert.strictEqual(node?.answer, undefined)
   })
 
   it('(c2) degrades when the answerer itself fails with NO_PROVIDER', async () => {
@@ -402,11 +563,11 @@ describe('plan_ask', () => {
     })
 
     const result = await call(ctx, 'plan_ask', { id: 'q-np', question: 'Anyone there?' }, agent)
-    expect(result.isError).toBe(false)
+    assert.strictEqual(result.isError, false)
     if (result.isError) throw new Error('expected a degraded ask, not a failure')
-    expect(result.value).toMatchObject({ id: 'q-np', status: 'blocked', delivered: false })
-    expect(nodeById(treeOf(ctx, agent), 'q-np')?.status).toBe('blocked')
-    expect(nodeById(treeOf(ctx, agent), 'q-np')?.answer).toBeUndefined()
+    assert.partialDeepStrictEqual(result.value, { id: 'q-np', status: 'blocked', delivered: false })
+    assert.strictEqual(nodeById(treeOf(ctx, agent), 'q-np')?.status, 'blocked')
+    assert.strictEqual(nodeById(treeOf(ctx, agent), 'q-np')?.answer, undefined)
   })
 
   it('(d) writes the answer onto the node and completes it', async () => {
@@ -430,9 +591,9 @@ describe('plan_ask', () => {
       options: ['red', 'blue'],
     }, agent)
 
-    expect(result.isError).toBe(false)
+    assert.strictEqual(result.isError, false)
     if (result.isError) throw new Error('expected a successful ask')
-    expect(result.value).toMatchObject({
+    assert.partialDeepStrictEqual(result.value, {
       id: 'q-colour',
       status: 'completed',
       answer: 'blue',
@@ -440,16 +601,19 @@ describe('plan_ask', () => {
     })
 
     // The options reached the answerer as labelled choices.
-    expect(seen).toEqual([{ id: 'q-colour', question: 'Which colour?', options: [{ label: 'red' }, { label: 'blue' }] }])
+    assert.deepStrictEqual(seen, [{ id: 'q-colour', question: 'Which colour?', options: [{ label: 'red' }, { label: 'blue' }] }])
 
     // The plan side: completed, with the answer readable back off the node.
     const node = nodeById(treeOf(ctx, agent), 'q-colour')
-    expect(node?.status).toBe('completed')
-    expect(node?.answer).toBe('blue')
+    assert.strictEqual(node?.status, 'completed')
+    assert.strictEqual(node?.answer, 'blue')
 
-    // Durable on the log, not merely in memory.
-    const step = agent.session.snapshotEvents().findLast(e => e.type === 'plan/step')
-    expect(step?.data).toMatchObject({ id: 'q-colour', status: 'completed', answer: 'blue' })
+    // Durable in the settings document, not merely in memory.
+    assert.deepStrictEqual(settings.stored('answered'), [
+      { id: 'root', title: 'Root', status: 'in_progress' },
+      { id: 'q-colour', title: 'Which colour?', status: 'completed', detail: 'Which colour?', answer: 'blue' },
+    ])
+    assert.deepStrictEqual(agent.session.snapshotEvents(), [])
   })
 
   it('joins selected labels with the free-text "Other" answer', async () => {
@@ -464,19 +628,40 @@ describe('plan_ask', () => {
     })
 
     const result = await call(ctx, 'plan_ask', { id: 'q-c', question: 'Which colour?', options: ['blue'] }, agent)
-    expect(result.isError).toBe(false)
+    assert.strictEqual(result.isError, false)
     if (result.isError) throw new Error('expected a successful ask')
-    expect((result.value as { answer?: string }).answer).toBe('blue — but darker')
-    expect(nodeById(treeOf(ctx, agent), 'q-c')?.answer).toBe('blue — but darker')
+    assert.strictEqual((result.value as { answer?: string }).answer, 'blue — but darker')
+    assert.strictEqual(nodeById(treeOf(ctx, agent), 'q-c')?.answer, 'blue — but darker')
   })
 
-  it('carries `answer` through the wire schema (narrowed, not stripped)', async () => {
+  it('keeps a node appended while the human was answering', async () => {
+    const ctx = await setup()
+    const agent = agentWithSession('concurrent-append')
+    await call(ctx, 'plan_write', { nodes: [{ id: 'root', title: 'Root', status: 'pending' }] }, agent)
+    ctx.provide('userQuestions', {
+      ask: () => {
+        // Another writer appends a node while the question is on screen. The
+        // answer write re-reads the document, so that node must survive.
+        return planTreeStore(ctx)
+          .update('concurrent-append', nodes => [...nodes, { id: 'other', title: 'Other', status: 'pending' }])
+          .then(() => ({ answers: [{ id: 'q-race', selected: ['yes'] }] }))
+      },
+    })
+    const result = await call(ctx, 'plan_ask', { id: 'q-race', question: 'Ship it?' }, agent)
+    assert.strictEqual(result.isError, false)
+    const tree = treeOf(ctx, agent)!
+    assert.strictEqual(nodeById(tree, 'other')?.title, 'Other')
+    assert.strictEqual(nodeById(tree, 'q-race')?.answer, 'yes')
+    assert.strictEqual(nodeById(tree, 'q-race')?.status, 'completed')
+  })
+
+  it('carries `answer` through the stored document (parsed, not stripped)', async () => {
     const ctx = await setup()
     const agent = agentWithSession('wire-answer')
     const declared: PlanNode[] = [{ id: 'a', title: 'A', status: 'completed', answer: 'yes' }]
-    agent.session.append('plan/declared', { plan: declared })
-    const state = ctx.sessionProjections.stateOf(agent.session, 'planTree')
-    expect(state?.[0]?.answer).toBe('yes')
+    await planTreeStore(ctx).replace(String(agent.session.header.id), declared)
+    const tree = treeOf(ctx, agent)
+    assert.strictEqual(tree?.[0]?.answer, 'yes')
   })
 
   it('a later plain plan_step does not erase the recorded answer', async () => {
@@ -490,14 +675,14 @@ describe('plan_ask', () => {
       }),
     })
     await call(ctx, 'plan_ask', { id: 'q-s', question: 'Ship it?', options: ['yes'] }, agent)
-    expect(nodeById(treeOf(ctx, agent), 'q-s')?.answer).toBe('yes')
+    assert.strictEqual(nodeById(treeOf(ctx, agent), 'q-s')?.answer, 'yes')
 
     // A status-only step says nothing about the answer, so it must leave it
     // standing — the same rule task-5 established for `assignedTo`.
     await call(ctx, 'plan_step', { id: 'q-s', status: 'in_progress' }, agent)
     const node = nodeById(treeOf(ctx, agent), 'q-s')
-    expect(node?.status).toBe('in_progress')
-    expect(node?.answer).toBe('yes')
+    assert.strictEqual(node?.status, 'in_progress')
+    assert.strictEqual(node?.answer, 'yes')
   })
 
   it('throws without an owning agent session', async () => {
@@ -508,7 +693,56 @@ describe('plan_ask', () => {
       name: 'plan_ask',
       arguments: { id: 'x', question: 'q' },
     })
-    expect(result.isError).toBe(true)
+    assert.strictEqual(result.isError, true)
+  })
+})
+
+describe('the stored document', () => {
+  it('keeps one tree per session, independently', async () => {
+    const ctx = await setup()
+    const one = agentWithSession('session-one')
+    const two = agentWithSession('session-two')
+    await call(ctx, 'plan_write', { nodes: [{ id: 'a', title: 'A', status: 'pending' }] }, one)
+    await call(ctx, 'plan_write', { nodes: [{ id: 'b', title: 'B', status: 'pending' }] }, two)
+    assert.deepStrictEqual(treeOf(ctx, one)?.map(node => node.id), ['a'])
+    assert.deepStrictEqual(treeOf(ctx, two)?.map(node => node.id), ['b'])
+  })
+
+  it('reports no plan for a session the document does not carry', async () => {
+    const ctx = await setup()
+    const agent = agentWithSession('never-written')
+    assert.strictEqual(treeOf(ctx, agent), null)
+    const result = await call(ctx, 'plan_step', { id: 'anything', status: 'completed' }, agent)
+    assert.strictEqual(result.isError, true)
+  })
+
+  it('retries a write the revision fence refused, and stores the tree', async () => {
+    const ctx = await setup()
+    const agent = agentWithSession('contended')
+    await call(ctx, 'plan_write', { nodes: [{ id: 'a', title: 'A', status: 'pending' }] }, agent)
+    // A second writer lands between this writer's read and its write: the store
+    // must re-read the revision and retry rather than report a lost write.
+    const before = settings.attempts
+    settings.conflicts = 1
+    const step = await call(ctx, 'plan_step', { id: 'a', status: 'completed' }, agent)
+    assert.strictEqual(step.isError, false)
+    // Two attempts: the refused one and the one that landed.
+    assert.strictEqual(settings.attempts, before + 2)
+    assert.deepStrictEqual(settings.stored('contended'), [{ id: 'a', title: 'A', status: 'completed' }])
+  })
+
+  it('drops an unreadable session entry instead of failing the whole document', () => {
+    const parsed = parsePlanTreesField({
+      good: [{ id: 'a', title: 'A', status: 'pending' }],
+      broken: [{ id: 'b', title: 'B', status: 'not-a-status' }],
+      alsoBroken: 'not an array',
+    })
+    assert.deepStrictEqual(Object.keys(parsed), ['good'])
+  })
+
+  it('reads an absent or non-object field as no trees at all', () => {
+    assert.deepStrictEqual(parsePlanTreesField(undefined), {})
+    assert.deepStrictEqual(parsePlanTreesField('nope'), {})
   })
 })
 
@@ -523,14 +757,14 @@ describe('plan tree usage policy', () => {
   it('ships a prompt section that names all four tools and when to use them', async () => {
     const ctx = await setup()
     const prompt = renderPrompt(await ctx.systemPrompt.assemble())
-    expect(prompt).toContain('plan_write')
-    expect(prompt).toContain('plan_step')
-    expect(prompt).toContain('plan_dispatch')
-    expect(prompt).toContain('plan_ask')
+    assert.ok(prompt.includes('plan_write'))
+    assert.ok(prompt.includes('plan_step'))
+    assert.ok(prompt.includes('plan_dispatch'))
+    assert.ok(prompt.includes('plan_ask'))
     // The load-bearing instruction is not "these tools exist" but "declare the
     // plan BEFORE starting work", plus the dispatch-over-subagent preference.
-    expect(prompt).toContain('BEFORE starting work')
-    expect(prompt).toMatch(/Prefer `plan_dispatch`/)
+    assert.ok(prompt.includes('BEFORE starting work'))
+    assert.match(prompt, /Prefer `plan_dispatch`/)
   })
 
   it('SENSITIVITY: the section is absent when the plugin is not mounted', async () => {
@@ -539,10 +773,9 @@ describe('plan tree usage policy', () => {
     const ctx = new Context()
     await ctx.plugin(SystemPrompt)
     await ctx.plugin(ToolRuntime)
-    await ctx.plugin(SessionProjectionRegistry)
     const prompt = renderPrompt(await ctx.systemPrompt.assemble())
-    expect(prompt).not.toContain('plan_dispatch')
-    expect(prompt).not.toContain('BEFORE starting work')
+    assert.ok(!prompt.includes('plan_dispatch'))
+    assert.ok(!prompt.includes('BEFORE starting work'))
   })
 
   it('orders the policy at the PLAN_POLICY position, ahead of the tool positions', async () => {
@@ -553,11 +786,144 @@ describe('plan tree usage policy', () => {
     // framework keeps "when is a plan required" rules, and it must precede the
     // per-tool positions (1000+) so the model weighs the workflow rule before
     // it picks a tool.
-    expect(policyOrder).toBeLessThan(subagentOrder)
+    assert.ok(policyOrder < subagentOrder)
     // And the section is really registered at that order, not merely present:
     // registering twice at one name throws, so a successful second mount at the
     // same name proves this exact section occupies `plan:tree`.
     const names = (await ctx.systemPrompt.assemble()).sections.map(candidate => candidate.name)
-    expect(names.filter(candidate => candidate === 'plan:tree')).toHaveLength(1)
+    assert.strictEqual(names.filter(candidate => candidate === 'plan:tree').length, 1)
+  })
+})
+/**
+ * The composition switch that lets a deployment mount the sibling `task` tool in
+ * place of these four.
+ *
+ * The default matters more than the off position: a row that predates this key
+ * carries no value for it, so `true` is what keeps an upgrade from silently
+ * removing four tools a model was already calling.
+ */
+describe('the exposeTools switch', () => {
+  /** A composition identical to the one above except for the row's config. */
+  async function setupWith(config: { exposeTools?: boolean }): Promise<Context> {
+    const ctx = new Context()
+    await ctx.plugin(SystemPrompt)
+    await ctx.plugin(ToolRuntime)
+    settings = new FakeSettings()
+    ctx.provide('settings' as never, settings as never)
+    await ctx.plugin(planTree, config)
+    return ctx
+  }
+
+  /** The four tool names this package registers. */
+  const FOUR = ['plan_write', 'plan_step', 'plan_dispatch', 'plan_ask']
+
+  /** @returns the registered global tool names that belong to this package. */
+  function planToolNames(ctx: Context): string[] {
+    return ctx.tools.schemas().map(schema => schema.name).filter(name => name.startsWith('plan_')).sort()
+  }
+
+  it('registers all four tools when exposeTools is TRUE', async () => {
+    const ctx = await setupWith({ exposeTools: true })
+    assert.deepStrictEqual(planToolNames(ctx), [...FOUR].sort())
+  })
+
+  it('registers NONE of them when exposeTools is FALSE', async () => {
+    const ctx = await setupWith({ exposeTools: false })
+    assert.deepStrictEqual(planToolNames(ctx), [])
+    // SENSITIVITY: the registry itself is live in this composition, so the empty
+    // list above means "not registered" and not "no tool service mounted".
+    assert.ok(Array.isArray(ctx.tools.schemas()))
+  })
+
+  it('DEFAULT: a config that never mentions the key keeps all four tools', async () => {
+    // The upgrade path, pinned as a test: an empty config is what a row written
+    // before this key existed carries.
+    const ctx = await setupWith({})
+    assert.deepStrictEqual(planToolNames(ctx), [...FOUR].sort())
+    // And the fully omitted config -- `ctx.plugin(planTree)` -- is the same case.
+    const bare = await setup()
+    assert.deepStrictEqual(planToolNames(bare), [...FOUR].sort())
+  })
+
+  it('the usage policy is NOT shipped when the tools are off', async () => {
+    const ctx = await setupWith({ exposeTools: false })
+    const prompt = renderPrompt(await ctx.systemPrompt.assemble())
+    // A policy section that names tools the model cannot call is worse than no
+    // section at all, so one value switches both.
+    assert.ok(!prompt.includes('plan_dispatch'))
+    assert.ok(!prompt.includes('BEFORE starting work'))
+    const names = (await ctx.systemPrompt.assemble()).sections.map(candidate => candidate.name)
+    assert.strictEqual(names.filter(candidate => candidate === 'plan:tree').length, 0)
+  })
+
+  it('with the tools off, the plan store is still served under the taskTree service', async () => {
+    // The sibling `task` tool reaches the tree through `ctx.get('taskTree')`.
+    // A deployment that turned the four tools off is exactly the deployment that
+    // mounted `task`, so this service must survive the switch: otherwise
+    // collapsing the surface would take the tree down with it.
+    const ctx = await setupWith({ exposeTools: false })
+    const port = ctx.get('taskTree') as { read(sessionId: string): readonly PlanNode[] } | undefined
+    assert.ok(port !== undefined)
+    assert.deepStrictEqual(port.read('planner'), [])
+  })
+
+  it('readMerged 顺着 assignedTo 把子代理自己写的树拼进来——子代理对此一无所知', async () => {
+    // 这就是「子代理只负责自己那一部分，程序自动合并」的全部机制：
+    // 子代理照常写自己的 sessionId 那棵树，连接点只是 bind 已经记下的 assignedTo。
+    const ctx = await setupWith({ exposeTools: false })
+    const port = ctx.get('taskTree') as {
+      write(s: string, n: readonly unknown[], r: boolean): Promise<void>
+      bind(s: string, nodeId: string, childId: string): Promise<void>
+      read(s: string): readonly unknown[]
+      readMerged(s: string, depth?: number): readonly any[]
+    }
+    // 父会话：一个大阶段，派活给 child-1
+    await port.write('planner', [{ id: 'stage', title: '阶段一' }], true)
+    await port.bind('planner', 'stage', 'child-1')
+    // 子代理在自己的会话里写自己的阶段——它不知道父是谁
+    await port.write('child-1', [
+      { id: 'c1', title: '子代理的工作阶段' },
+      { id: 'c2', title: '子代理的第二阶段', parent: 'c1' },
+    ], true)
+
+    // 不合并：父树只有自己那一个节点
+    assert.deepStrictEqual(port.read('planner').map((n: any) => n.id), ['stage'])
+    // 合并一层：子代理那棵树挂在 stage 下面
+    const merged = port.readMerged('planner', 1)
+    assert.strictEqual(merged.length, 1)
+    assert.strictEqual(merged[0].id, 'stage')
+    const kids = merged[0].children ?? []
+    // stage 的【直接】孩子只有子代理那棵树的根 c1；c2 是 c1 的孩子，
+    // 绝不能因为"合并"就被提到 stage 下面——第一版实现正是这么铺平的。
+    assert.deepStrictEqual(kids.map((n: any) => n.id), ['c1'])
+    assert.deepStrictEqual(kids[0].children?.map((n: any) => n.id), ['c2'])
+  })
+
+  it('readMerged 只读不写：合并过的树不会污染父会话的存储', async () => {
+    const ctx = await setupWith({ exposeTools: false })
+    const port = ctx.get('taskTree') as any
+    await port.write('planner', [{ id: 'stage', title: '阶段一' }], true)
+    await port.bind('planner', 'stage', 'child-1')
+    await port.write('child-1', [{ id: 'c1', title: '子阶段' }], true)
+    port.readMerged('planner', 1)
+    // 读过之后父树原样，子节点没有被真的写进去
+    assert.deepStrictEqual(port.read('planner').map((n: any) => n.id), ['stage'])
+    assert.strictEqual(port.read('planner')[0].children, undefined)
+  })
+
+  it('readMerged：子代理没留下树、没派过活、或深度用尽时，一律保持原样而不是报错', async () => {
+    const ctx = await setupWith({ exposeTools: false })
+    const port = ctx.get('taskTree') as any
+    await port.write('planner', [
+      { id: 'a', title: '派了活但孩子没写树' },
+      { id: 'b', title: '没派过活' },
+    ], true)
+    await port.bind('planner', 'a', 'child-never-wrote')
+    const one = port.readMerged('planner', 1)
+    assert.deepStrictEqual(one.map((n: any) => n.id), ['a', 'b'])
+    assert.strictEqual(one[0].children, undefined)
+    assert.strictEqual(one[1].children, undefined)
+    // 深度 0 等价于 read
+    assert.deepStrictEqual(port.readMerged('planner', 0).map((n: any) => n.id), ['a', 'b'])
   })
 })

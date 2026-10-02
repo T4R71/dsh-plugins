@@ -1,0 +1,679 @@
+/**
+ * 每条会话一份的 run 账本：`task` 的后端那一半，存在本包自己的一个 JSON 文件里。
+ *
+ * **它不是设置命名空间，也**不是**任何 Loader 行。**历史上这里试过两条路，都不行：
+ *   - 放在 `task` 行自己的 volatile 字段上 —— 宿主的设置服务会 `describe()` **已装载**行的
+ *     schema 到设置页，而 `.volatile()` 的意思是「列出可热改字段」而不是「藏起来」，于是整份
+ *     账本 JSON 会被投影成设置页上一个可以手滑清空的输入框；
+ *   - 放在**另一行** `task-runs` 上 —— 那一行在本宿主里**从来没有装载成功**，而 Loader 只把
+ *     失败写进没人读得到的 logger，表现出来就是「账本静默地记不住」。
+ *
+ * 于是它就是一个文件：没有行、没有 schema 投影、写路径上没有第三方。
+ * **那条 `task-runs` 行连同它的 `Config`、`exports["./session-store"]` 与第二个构建入口
+ * 都已经删掉了**（2026-10-01 收尾清理）—— 那些是为一个不存在的行留的遗迹。
+ *
+ * 整份账本**整体**原子写回（临时文件 + rename），所以写到一半崩掉也不会留下半份账本；
+ * 宿主重启之后它还在，因为它就是磁盘上的一个文件。
+ *
+ * 读写这个文件的代码路径只有一条（`createTaskRuns`），所以 `task` 工具与自动放行不可能
+ * 对「哪些节点被放行了」各说各话。
+ *
+ * 文件位置的决议顺序见 {@link ledgerPathFor}：配置 `runsFile` → 环境变量
+ * `DSH_TASK_RUNS_FILE` → `ctx.baseUrl` 指向的目录 → `DSH_PROFILE_DIR`/`DSH_HOME` → cwd。
+ *
+ * @module @t4r71/dsh-task/session-store
+ */
+
+import { readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { fileURLToPath } from 'node:url'
+import type { Context } from '@deepseek-ai/cordis'
+/**
+ * 账本文件名。它住在插件自己的数据文件里，**不是**任何设置命名空间。
+ *
+ * 它是相对路径，基准目录由 {@link ledgerPathFor} 决定；整个文件路径也可以由
+ * `task` 那一行的 `runsFile` 配置覆盖（那正是测试用的入口）。
+ */
+export const TASK_RUNS_FILE_NAME = 'task-runs.json'
+
+/** 覆盖账本文件位置的环境变量。只给测试与排障用，正常路径不依赖它。 */
+export const TASK_RUNS_FILE_ENV = 'DSH_TASK_RUNS_FILE'
+
+/**
+ * 账本里一个节点的状态机。与树上的 `TaskNodeStatus` 刻意不同：多了 `dispatched`。
+ *
+ * 树上的状态是**给人看的**（面板画那一行），账本上的状态是**给放行判断用的**
+ * （「已经派出去了、正等它回来」这一态在树上没有对应物）。
+ */
+export type RunNodeStatus = 'pending' | 'dispatched' | 'completed' | 'failed'
+
+/**
+ * 账本里的一个节点：这一步要干的活、它的依赖、以及它被派给了谁。
+ *
+ * `needs` 是**后端语义**，只用于「什么时候可以派发」这一个判断，
+ * 绝不写进树，也绝不写进派发简报。
+ */
+export interface RunNodeRecord {
+  /** 节点 id，与树上的节点 id 逐字相同（那是这两半唯一的对号点）。 */
+  readonly id: string
+  /** 这个节点要干的活，原样交给子代理。 */
+  readonly prompt: string
+  /** 身份名；省略时与 `dispatch` 动作同语义（走默认身份）。 */
+  readonly preset?: string
+  /** 短标签（面板上显示的活名）。 */
+  readonly label?: string
+  /** 前置节点 id：全部 `completed` 之后本节点才可以被派发。 */
+  readonly needs: readonly string[]
+  /** 当刻状态。 */
+  readonly status: RunNodeStatus
+  /** 派给谁了；只有 `dispatched` 之后才有。 */
+  readonly childId?: string
+  /**
+   * 上一次**没做成**的原因：派发失败，或者放行被阻塞（取不到上游结论）。
+   *
+   * 为什么必须落账本而不只写树：树上的 detail 是给人看的**当下**状态，下一次结算
+   * 就会把它覆盖掉；而「这一步为什么没动」必须与「依赖还没满足」分得开 —— 这两者
+   * 在账本上长得一模一样（都是 `pending`），只有这一格能把它们分开。
+   *
+   * 派发成功时这个键**整个省掉**（{@link runNodeWith} 不传就是清空），
+   * 绝不让一条陈旧的原因留在已经跑起来的那一步上。
+   */
+  readonly note?: string
+  /**
+   * 这个节点**结算时回传的结论文本**（上限 20000 字，与注入侧同一套截断记号）。
+   *
+   * 为什么要把结论从会话历史搬进账本：注入侧原先只能从父会话的派生历史里倒着扫那条
+   * 结算通知（`settledNotice`），而历史会被压缩/裁剪 —— 一旦扫不到，下游就**永久阻塞**
+   * （fail-closed 本身是对的，但它把「上下文被压缩」这件与依赖无关的事也变成了阻塞）。
+   * 账本不会被压缩，所以结论落在这里之后，注入不再依赖历史。
+   *
+   * 只在**结算那一刻**写（`dispatched` → `completed`/`failed` 的那次迁移里），
+   * 与「已判终态的节点不许被晚到的结算改写」是同一条纪律。省略即没有 ——
+   * 本次改动之前完成的旧节点就是这种，注入侧会退回历史那一条路。
+   */
+  readonly conclusion?: string
+}
+
+/** 一条 run：一次声明出来的节点图。 */
+export interface RunRecord {
+  /** run id，会话内唯一。 */
+  readonly id: string
+  /** 声明时刻（毫秒）。 */
+  readonly createdAt: number
+  /** 这条 run 的节点。 */
+  readonly nodes: readonly RunNodeRecord[]
+}
+
+/** 整份账本：会话 id → 这条会话声明的 run 列表。与树一样按会话分区。 */
+export type RunsField = Record<string, readonly RunRecord[]>
+
+/**
+ * 账本文件的位置。
+ *
+ * 决议顺序（前者优先）：
+ *   1. \`runsFile\`（\`task\` 行的配置，绝对路径）；
+ *   2. 环境变量 {@link TASK_RUNS_FILE_ENV}（测试与排障）；
+ *   3. \`baseUrl\`（宿主的 \`ctx.baseUrl\`，形如
+ *      \`file:///M:/DSH-T4/home/profiles/desktop/\` 的**目录** URL）指向的那个目录；
+ *   4. \`DSH_PROFILE_DIR\` / \`DSH_HOME\` 下的 {@link TASK_RUNS_FILE_NAME}；
+ *   5. 兜底：\`process.cwd()\` 下同名文件。
+ *
+ * 第 3 条为什么排在环境变量之后、又在 \`DSH_PROFILE_DIR\` 之前：插件装载它的那份配置
+ * 在哪个目录，账本就落在哪个目录 —— 那正是「同一个 profile 的数据住在一起」的意思，
+ * 而 \`DSH_PROFILE_DIR\` 在宿主里**并不总是被设置**（它缺席时账本会落到 \`process.cwd()\`，
+ * 那是个随启动方式变的位置）。前两条是显式覆盖，仍然优先。
+ *
+ * 只做纯字符串/URL 运算，不碰文件系统，**绝不抛**：\`baseUrl\` 不是合法 \`file:\` URL
+ * （或根本不是 URL）时当场退回下一条，而不是把调用方炸在装配期。
+ * @param configured - \`task\` 行配置里的 \`runsFile\`（可为空串）。
+ * @param baseUrl - \`ctx.baseUrl\`；省略或解析不出时走后面的基准目录。
+ * @returns 账本文件的绝对或相对路径。
+ */
+export function ledgerPathFor(configured: string, baseUrl?: string): string {
+  const explicit = configured.trim()
+  if (explicit !== '') return explicit
+  const env = (process.env[TASK_RUNS_FILE_ENV] ?? '').trim()
+  if (env !== '') return env
+  const fromBase = baseUrlDirectory(baseUrl)
+  if (fromBase !== '') return fromBase + separatorOf(fromBase) + TASK_RUNS_FILE_NAME
+  const base = (process.env.DSH_PROFILE_DIR ?? process.env.DSH_HOME ?? '').trim()
+  return base === '' ? TASK_RUNS_FILE_NAME : base + separatorOf(base) + TASK_RUNS_FILE_NAME
+}
+
+/**
+ * \`ctx.baseUrl\` 指向的那个目录；解析不出时返回空串。
+ *
+ * 只认 \`file:\` URL：宿主给的就是这个形状 —— \`cordis-plugin-include\` 把它设成被包含的
+ * 配置文件的**目录 URL**（\`new URL('.', pathToFileURL(filename)).href\`，见该包
+ * \`lib/index.js\`），末尾一定带 \`/\`；不带 \`/\` 时也按同一个目录处理（\`ctx.baseUrl\`
+ * 的语义就是目录，不是文件）。末尾分隔符统一去掉，于是两种写法拼出同一个路径。
+ *
+ * 不是 URL、协议不是 \`file:\`、或 \`fileURLToPath\` 认不出来时一律空串 —— 由调用方
+ * 退回环境变量那条路，绝不抛。
+ * @param baseUrl - \`ctx.baseUrl\`（可为 undefined）。
+ * @returns 目录路径（无尾分隔符），或空串。
+ */
+function baseUrlDirectory(baseUrl: string | undefined): string {
+  const raw = (baseUrl ?? '').trim()
+  if (raw === '') return ''
+  try {
+    const url = new URL(raw)
+    if (url.protocol !== 'file:') return ''
+    return stripTrailingSeparators(fileURLToPath(url))
+  } catch {
+    return ''
+  }
+}
+
+/** 去掉路径尾部的分隔符（\`M:\\a\\b\\\` → \`M:\\a\\b\`）；整条都是分隔符时原样返回。 */
+function stripTrailingSeparators(path: string): string {
+  let end = path.length
+  while (end > 1 && (path[end - 1] === '\\' || path[end - 1] === '/')) end -= 1
+  return path.slice(0, end)
+}
+
+/** 拼基准目录与文件名时用的分隔符：目录里是反斜杠就用反斜杠。 */
+function separatorOf(directory: string): string {
+  return directory.includes('\\') ? '\\' : '/'
+}
+
+/**
+ * 写账本的重试次数与退避。
+ *
+ * 文件写入没有 revision CAS 了，但**并发写**仍然可能撞车：同一进程里两次派发可能
+ * 交错，别的进程也可能碰同一个文件。所以保留这套「读-改-写 + 有限重试」的形状，
+ * 让一次抢输的写入还有机会落地，而不是静默丢掉一条 run。
+ */
+export const TASK_RUNS_WRITE_ATTEMPTS = 4
+
+/** 第 N 次尝试前的退避（毫秒），N 从零数。 */
+export const TASK_RUNS_WRITE_BACKOFF_MS: readonly number[] = [0, 25, 75, 200]
+
+/** 一个值是不是纯数据对象。 */
+export function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/** 一个值是不是账本认的节点状态。 */
+export function isRunNodeStatus(value: unknown): value is RunNodeStatus {
+  return value === 'pending' || value === 'dispatched' || value === 'completed' || value === 'failed'
+}
+
+/**
+ * 读一个存储里的节点，形状读不动就 `undefined`。
+ *
+ * 输入是**不可信**的：人可以手编设置文档。所以少了 id / prompt、或状态不认识的一律丢掉，
+ * 而不是把一条没有活的节点带进自动放行 —— 后者会派出一个提示词为空的子代理。
+ * @param value - 不可信的节点。
+ * @returns 校验后的节点，或 undefined。
+ */
+function parseRunNode(value: unknown): RunNodeRecord | undefined {
+  if (!isRecord(value)) return undefined
+  if (typeof value.id !== 'string' || value.id === '') return undefined
+  if (typeof value.prompt !== 'string') return undefined
+  if (!isRunNodeStatus(value.status)) return undefined
+  const needs = Array.isArray(value.needs) && value.needs.every(need => typeof need === 'string')
+    ? [...value.needs as string[]]
+    : []
+  const node: {
+    id: string
+    prompt: string
+    needs: string[]
+    status: RunNodeStatus
+    preset?: string
+    label?: string
+    childId?: string
+    note?: string
+    conclusion?: string
+  } = { id: value.id, prompt: value.prompt, needs, status: value.status }
+  if (typeof value.preset === 'string') node.preset = value.preset
+  if (typeof value.label === 'string') node.label = value.label
+  if (typeof value.childId === 'string') node.childId = value.childId
+  // note 必须**读回来**：整份账本是读完-改-写回去的，不认这一格的话，下一次任何一条
+  // 记账（比如隔壁节点被派出去）都会顺手把已经写下的原因抹掉。
+  if (typeof value.note === 'string') node.note = value.note
+  // conclusion 同样必须读回来：读-改-写是**整份**重写的，不认这一格的话，
+  // 隔壁节点随便一条记账都会把已经存下的结论抹掉 —— 那正好会让「抗压缩」这件事失效。
+  if (typeof value.conclusion === 'string') node.conclusion = value.conclusion
+}
+
+/**
+ * 读一条存储里的 run，形状读不动就 `undefined`。
+ * @param value - 不可信的 run。
+ * @returns 校验后的 run，或 undefined。
+ */
+function parseRunRecord(value: unknown): RunRecord | undefined {
+  if (!isRecord(value)) return undefined
+  if (typeof value.id !== 'string' || value.id === '') return undefined
+  if (!Array.isArray(value.nodes)) return undefined
+  const nodes: RunNodeRecord[] = []
+  for (const item of value.nodes) {
+    const node = parseRunNode(item)
+    if (node === undefined) return undefined
+    nodes.push(node)
+  }
+  const createdAt = typeof value.createdAt === 'number' && Number.isFinite(value.createdAt) ? value.createdAt : 0
+  return { id: value.id, createdAt, nodes }
+}
+
+/**
+ * 读整份账本。**坏条目丢掉、好条目留下**，绝不因为一条读不动就整份作废 ——
+ * 少一条 run 最多是那一条不动，整份作废会让所有已声明的 run 一起停摆。
+ * @param value - 不可信的字段值。
+ * @returns 账本；读不动时是空账本。
+ */
+export function parseRunsField(value: unknown): RunsField {
+  if (!isRecord(value)) return {}
+  const field: Record<string, readonly RunRecord[]> = {}
+  for (const [sid, runs] of Object.entries(value)) {
+    if (!Array.isArray(runs)) continue
+    const parsed: RunRecord[] = []
+    for (const item of runs) {
+      const run = parseRunRecord(item)
+      if (run !== undefined) parsed.push(run)
+    }
+    if (parsed.length > 0) field[sid] = parsed
+  }
+  return field
+}
+
+/**
+ * run 节点 prompt 里的**槽位**：\`{{<nodeId>}}\`。
+ *
+ * 只认括号内**不含花括号与空白**的一段文本：\`{{chain-a}}\` 是槽位，
+ * \`{{ a }}\`、\`{{}}\`、\`{{a{b}}\` 都不是 —— 后者原样留在简报里（人写的是框架，
+ * 插件不该替他去猜哪一段是「本来就想写成两个花括号」的）。
+ *
+ * 每次求值都是一个新的正则对象（字面量在函数体内），所以没有 \`lastIndex\` 残留。
+ */
+const RUN_SLOT = /\{\{([^{}\s]+)\}\}/gu
+
+/**
+ * 一段 prompt 里被槽位点名的节点 id，按**出现顺序**去重。
+ * @param prompt - 节点自己的提示词（框架）。
+ * @returns 槽位里的 id；没有槽位时是空数组。
+ */
+export function runPromptSlots(prompt: string): readonly string[] {
+  const seen: string[] = []
+  for (const matched of prompt.matchAll(RUN_SLOT)) {
+    const id = matched[1]
+    if (id !== undefined && !seen.includes(id)) seen.push(id)
+  }
+  return seen
+}
+
+/**
+ * 把槽位**就地**换成对应依赖的结论文本。
+ *
+ * 三条语义：同一个依赖出现多次就每一处都换；没有对应正文的槽位**原样留着**
+ * （绝不换成空串 —— 那等于悄悄删掉调用方写的东西）；替换文本不再被二次扫描
+ * （用替换函数而不是模板字符串，\`$&\` 之类也不会被解释）。
+ * @param prompt - 节点自己的提示词（框架）。
+ * @param bodies - 节点 id → 结论文本。
+ * @returns 替换后的 prompt，与**真的被填上**的 id（按出现顺序去重）。
+ */
+export function fillRunPrompt(prompt: string, bodies: ReadonlyMap<string, string>): { readonly prompt: string; readonly filled: readonly string[] } {
+  const filled: string[] = []
+  const next = prompt.replace(RUN_SLOT, (whole, id: string) => {
+    const body = bodies.get(id)
+    if (body === undefined) return whole
+    if (!filled.includes(id)) filled.push(id)
+    return body
+  })
+  return { prompt: next, filled }
+}
+
+/** \`run\` 动作收到的节点（模型输入形态）。 */
+export interface RunSpecNode {
+  readonly id: string
+  readonly prompt: string
+  readonly needs: readonly string[]
+  readonly preset?: string
+  readonly label?: string
+}
+
+/**
+ * 校验一次 `run` 的节点表，并归一出每项的依赖。
+ *
+ * 三件事，缺一不可：
+ *   - 每个 `needs` 点名的 id **必须**在本 run 里（打错一个字符就永远等不到，静默接受等于埋雷）；
+ *   - id 不许重复（重复的话「哪个节点完成了」这句话就没有唯一所指）；
+ *   - **不许成环**（成环的图里没有一个节点是起点，永远不会动；必须报错，不许悄悄跑）。
+ *
+ * 归一出的是**账本形态**（{@link RunNodeRecord}，状态一律 `pending`）：调用方拿到就能
+ * 直接写树、直接落账本，两处不可能对不上号。
+ * @param raw - 模型给的节点列表。
+ * @param runId - 这条 run 的 id，只用于把报错说清是**哪一条**流水线。
+ * @returns 归一后的节点表（状态全是 `pending`）。
+ * @throws 当 needs 点名了不存在的节点、id 重复、或依赖成环。
+ */
+export function normalizeRunNodes(raw: readonly Record<string, unknown>[], runId: string): readonly RunNodeRecord[] {
+  const spec: RunSpecNode[] = []
+  for (const item of raw) {
+    const id = typeof item.id === 'string' ? item.id : undefined
+    if (id === undefined || id === '') throw new Error('task run: every node needs a non-empty `id`')
+    if (typeof item.prompt !== 'string') throw new Error('task run: node "' + id + '" needs a `prompt` — nothing to hand to a subagent otherwise')
+    const needs = Array.isArray(item.needs) ? item.needs as readonly unknown[] : []
+    for (const need of needs) {
+      if (typeof need !== 'string' || need === '') throw new Error('task run: node "' + id + '" has a `needs` entry that is not a node id')
+    }
+    spec.push({
+      id,
+      prompt: item.prompt,
+      needs: [...needs as string[]],
+      ...typeof item.preset === 'string' ? { preset: item.preset } : {},
+      ...typeof item.label === 'string' ? { label: item.label } : {},
+    })
+  }
+  const ids = new Set<string>()
+  for (const node of spec) {
+    if (ids.has(node.id)) throw new Error('task run: duplicate node id "' + node.id + '"')
+    ids.add(node.id)
+  }
+  for (const node of spec) {
+    for (const need of node.needs) {
+      if (!ids.has(need)) {
+        throw new Error('task run: node "' + node.id + '" needs "' + need + '", which is not a node of this run (known: ' + [...ids].join(', ') + ')')
+      }
+    }
+  }
+  // 槽位必须在**声明期**就校验：填不上的槽位留到派发时只会变成一句没人看的日志，
+  // 而调用方以为自己写的框架已经生效了。两条拒法各说各的：
+  //   - 不在本次 run 里（打错一个字符，永远填不上）；
+  //   - 在本 run 里、但不是**本节点**的 needs 成员（顺序/层级写错了，同样永远填不上）。
+  for (const node of spec) {
+    for (const slot of runPromptSlots(node.prompt)) {
+      if (!ids.has(slot)) {
+        throw new Error('task run: node "' + node.id + '" 的 prompt 引用了 {{' + slot + '}}，但 ' + slot
+          + ' 不在本次 run 里（已知节点: ' + [...ids].join(', ') + '）')
+      }
+      if (!node.needs.includes(slot)) {
+        throw new Error('task run: node "' + node.id + '" 的 prompt 引用了 {{' + slot + '}}，但 ' + slot
+          + ' 不是它的 needs 成员（本节点 needs: ' + node.needs.join(', ') + '）')
+      }
+    }
+  }
+  assertAcyclic(spec, runId)
+  return spec.map(node => ({
+    id: node.id,
+    prompt: node.prompt,
+    needs: node.needs,
+    status: 'pending',
+    ...node.preset === undefined ? {} : { preset: node.preset },
+    ...node.label === undefined ? {} : { label: node.label },
+  }))
+}
+
+/**
+ * 依赖图必须无环。用深度优先的三色标记找**一条**环并把路径报出来 ——
+ * 只报「有环」的话调用方还得自己找是哪一条。
+ * @param nodes - 已归一、id 已唯一的节点表。
+ * @param runId - 这条 run 的 id，只用于报错。
+ * @throws 当图上存在环。
+ */
+function assertAcyclic(nodes: readonly RunSpecNode[], runId: string): void {
+  const byId = new Map(nodes.map(node => [node.id, node]))
+  const state = new Map<string, 'visiting' | 'done'>()
+  const path: string[] = []
+  const walk = (id: string): void => {
+    const seen = state.get(id)
+    if (seen === 'done') return
+    if (seen === 'visiting') {
+      const at = path.indexOf(id)
+      const cycle = [...path.slice(at < 0 ? 0 : at), id]
+      throw new Error('task run "' + runId + '": the dependency graph has a cycle: ' + cycle.join(' → ') + ' — no node in it could ever start')
+    }
+    state.set(id, 'visiting')
+    path.push(id)
+    for (const need of byId.get(id)?.needs ?? []) walk(need)
+    path.pop()
+    state.set(id, 'done')
+  }
+  for (const node of nodes) walk(node.id)
+}
+
+/**
+ * 账本 `note` 的上限。与树 detail 的 200 一样是**给人读**的上限，只是这一格
+ * 靠后一步才被看到（排障时直接翻账本文件），所以给得宽一些 —— 报错原文和
+ * 一句「哪个依赖的结论取不到」都装得下。
+ */
+export const RUN_NOTE_MAX = 300
+
+/**
+ * 把一个账本节点换成另一个状态。
+ *
+ * `childId` 只在**真派出去**之后才有，所以回滚时必须把那个键**整个省掉**而不是写成
+ * undefined —— 与工具返回值同一条纪律：键缺省与键为 undefined 在无损 JSON 里是两种东西。
+ *
+ * `note` 同理，而且更硬：**省略就是清空**。派发成功时调用方不传它，于是那一步上
+ * 不会留下一条「上次为什么没做成」的陈旧原因 —— 一条过期的原因比没有原因更坏。
+ *
+ * `conclusion` 走同一套「省略即清空」的写法，但语义相反：它只在**结算那一刻**被填上
+ * （`advanceRuns` 把 `dispatched` 推进成终态时），其余每一条记账都不带它，于是键被省掉。
+ * 换句话说：它**不会**跨状态存活 —— 一个节点只有「刚结算」这一种情形下带着结论。
+ * @param node - 原节点。
+ * @param status - 新状态。
+ * @param childId - 派给谁了；省略即没有孩子。
+ * @param note - 没做成的原因（单行，截到 {@link RUN_NOTE_MAX} 字）；省略即清空。
+ * @param conclusion - 结算正文（调用方已截断到 20000 字）；省略即清空。
+ * @returns 新节点。
+ */
+export function runNodeWith(node: RunNodeRecord, status: RunNodeStatus, childId?: string, note?: string, conclusion?: string): RunNodeRecord {
+  const reason = note === undefined ? '' : truncate(singleLine(note), RUN_NOTE_MAX)
+  return {
+    id: node.id,
+    prompt: node.prompt,
+    needs: node.needs,
+    status,
+    ...node.preset === undefined ? {} : { preset: node.preset },
+    ...node.label === undefined ? {} : { label: node.label },
+    ...childId === undefined ? {} : { childId },
+    ...reason === '' ? {} : { note: reason },
+    ...conclusion === undefined || conclusion === '' ? {} : { conclusion },
+  }
+}
+
+/**
+ * 把任意文本压成**一行**：换行与连续空白折叠成一个空格，两端去白。
+ * @param text - 任意文本。
+ * @returns 单行文本。
+ */
+function singleLine(text: string): string {
+  return text.replace(/\s+/gu, ' ').trim()
+}
+
+/**
+ * 截到上限。超出时末位换成省略号，于是返回值长度**一定** ≤ 上限。
+ * @param text - 原文本。
+ * @param max - 上限（字符数）。
+ * @returns 截断后的文本。
+ */
+function truncate(text: string, max: number): string {
+  return text.length <= max ? text : text.slice(0, Math.max(0, max - 1)) + '…'
+}
+
+/**
+ * 在账本里换掉某条 run 的某个节点。
+ *
+ * 作用于**一条会话的 run 列表**（服务按会话分区），不是整份账本：调用方给出的变更函数
+ * 收到的就是这条会话当刻的那一份，写回去也只动这一份。
+ * @param list - 当刻这条会话的 run 列表。
+ * @param runId - run id。
+ * @param nodeId - 节点 id。
+ * @param patch - 施加在命中的节点上。
+ * @returns 下一份列表；没命中（run 或节点不存在）时 undefined，调用方据此不写。
+ */
+export function patchRunNode(
+  list: readonly RunRecord[],
+  runId: string,
+  nodeId: string,
+  patch: (node: RunNodeRecord) => RunNodeRecord,
+): readonly RunRecord[] | undefined {
+  let changed = false
+  const next = list.map((run) => {
+    if (run.id !== runId) return run
+    let touched = false
+    const nodes = run.nodes.map((node) => {
+      if (node.id !== nodeId) return node
+      touched = true
+      return patch(node)
+    })
+    if (!touched) return run
+    changed = true
+    return { ...run, nodes }
+  })
+  return changed ? next : undefined
+}
+
+/**
+ * 账本的读写面：`task` 工具与自动放行都只经过它，绝不各自去够设置服务。
+ *
+ * 三条语义上的硬约束：
+ *   - `list` **降级不抛**：读不动时返回空表并记日志。调用点在 `session/event` 监听器里，
+ *     把异常抛出去会把整条事件分发炸掉 —— 那是本插件明确不许做的事。
+ *   - `commit` **绝不抛**：每一次尝试都被拒时记录日志并返回 false，由调用方决定怎么办。
+ *   - `store` **写不进去就抛**：`run` 的语义全部建立在「后端记得住这条依赖图」之上，
+ *     报成功等于骗调用方。
+ */
+export interface TaskRunsService {
+  /**
+   * 账本文件的位置。报错文案里带上它，排障时不必再去猜写到了哪。
+   */
+  readonly path: string
+  /**
+   * 这条会话声明的 run 列表。
+   * @param sessionId - 会话 id。
+   * @returns run 列表；没有账本、或读不动时是空表。
+   */
+  list(sessionId: string): Promise<readonly RunRecord[]>
+  /**
+   * 追加一条 run 并落盘。
+   * @param sessionId - 会话 id。
+   * @param run - 要记的 run。
+   * @throws 当账本文件所在目录不可写、或每一次写入尝试都失败。
+   */
+  store(sessionId: string, run: RunRecord): Promise<void>
+  /**
+   * 在这条会话的 run 列表上做一次**重读-改-写**，每一次尝试都整份原子写回。
+   *
+   * 变更函数跑在写循环**里面**、对着当刻那份列表求值：这就是无锁也不丢更新的原因 ——
+   * 两个写者各自算、输的那个下一轮重读重算，而不是拿陈旧快照盖掉别人。
+   * @param sessionId - 会话 id。
+   * @param mutate - 求出这条会话的下一份列表；返回 undefined 表示「这次没有要写的东西」。
+   * @returns 真的写进去了为 true；没得写、服务缺席、或全部尝试都被拒时为 false。
+   */
+  commit(
+    sessionId: string,
+    mutate: (runs: readonly RunRecord[]) => readonly RunRecord[] | undefined,
+  ): Promise<boolean>
+}
+
+/**
+ * 睡一会儿。**只用于写账本被 revision 冲突拒掉之后的退避**，不用于任何等待语义。
+ * @param ms - 毫秒。
+ * @returns 睡完即 resolve。
+ */
+function sleepMs(ms: number): Promise<void> {
+  return new Promise(resolve => { setTimeout(resolve, ms) })
+}
+
+export function createTaskRuns(ctx: Context, filePath: string): TaskRunsService {
+  /**
+   * 读整份账本。**降级，不抛**：文件不存在就是空账本；读不动或不是合法 JSON 时同样
+   * 退化成空账本并记一条日志。「读不到」的后果只是**这一次不放行**，不是把流程炸掉。
+   * @returns 账本；任何一处读不动都退化成空账本。
+   */
+  const field = async (): Promise<RunsField> => {
+    let raw: string
+    try {
+      raw = await readFile(filePath, 'utf8')
+    } catch (error) {
+      const code = (error as { code?: string } | undefined)?.code
+      if (code !== 'ENOENT') {
+        ctx.logger?.warn?.('task-run-ledger: ' + filePath + ' is unreadable; this pass dispatches nothing: ' + String(error))
+      }
+      return {}
+    }
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(raw)
+    } catch (error) {
+      ctx.logger?.warn?.('task-run-ledger: ' + filePath + ' is not valid JSON; this pass dispatches nothing: ' + String(error))
+      return {}
+    }
+    // 文件里是**带信封**的形状 `{ version, sessions }`，而解析器要的是信封里面那一层
+    // （会话 id → run 列表）。把整份文档直接喂给它的话，`version` 那一条不是数组会被跳过、
+    // `sessions` 那一条（对象）整块被当成一个会话丢进 parseRunRecord —— 结果是**空账本**，
+    // 而现场表现是「明明写进去了却读不回来」。这个错我实测踩过一次。
+    const sessions = isRecord(parsed) ? parsed.sessions : undefined
+    return parseRunsField(sessions)
+  }
+
+  /**
+   * 整份写回，**原子**：先写同目录的临时文件再 rename 覆盖。
+   *
+   * 直接写目标文件的话，一次崩在写一半会让账本变成非法 JSON —— 那等于**所有**已声明的
+   * run 一起作废。rename 覆盖是原子的，所以要么是旧值，要么是新值，没有第三种。
+   * @param value - 要落盘的整份账本。
+   */
+  const writeWhole = async (value: RunsField): Promise<void> => {
+    const body = JSON.stringify({ version: 1, sessions: value }, null, 1)
+    const temporary = filePath + '.' + String(process.pid) + '.' + String(Date.now()) + '.tmp'
+    await writeFile(temporary, body, 'utf8')
+    await rename(temporary, filePath)
+  }
+
+  /**
+   * 读-改-写一次，撞车就退避重试。
+   * @param sessionId - 这条会话。
+   * @param mutate - 拿到这条会话当刻的 run 列表，返回新列表；返回 undefined 表示无需改动。
+   * @returns 是否真的写成功。
+   */
+  const commit = async (
+    sessionId: string,
+    mutate: (runs: readonly RunRecord[]) => readonly RunRecord[] | undefined,
+  ): Promise<boolean> => {
+    let failure: unknown
+    for (let attempt = 0; attempt < TASK_RUNS_WRITE_ATTEMPTS; attempt += 1) {
+      const backoff = TASK_RUNS_WRITE_BACKOFF_MS[attempt]
+        ?? TASK_RUNS_WRITE_BACKOFF_MS[TASK_RUNS_WRITE_BACKOFF_MS.length - 1]
+        ?? 0
+      if (backoff > 0) await sleepMs(backoff)
+      const current = await field()
+      const next = mutate(current[sessionId] ?? [])
+      if (next === undefined) return false
+      try {
+        await writeWhole({ ...current, [sessionId]: next })
+        return true
+      } catch (error) {
+        failure = error
+      }
+    }
+    ctx.logger?.warn?.('task-run-ledger: ' + filePath + ' could not be written after '
+      + String(TASK_RUNS_WRITE_ATTEMPTS) + ' attempts; this pass gives up and dispatches nothing: ' + String(failure))
+    return false
+  }
+
+  return {
+    path: filePath,
+    list: async (sessionId: string) => (await field())[sessionId] ?? [],
+    store: async (sessionId: string, run: RunRecord): Promise<void> => {
+      // 先确认这个路径**能写**，再动手：写不进去时报出来的必须是「哪一步不成立」。
+      // 新建一个 0 字节的临时文件就是在问「这个目录存在吗、可写吗」，
+      // 比事后拿一句 ENOENT 去猜要清楚。
+      try {
+        await writeFile(filePath + '.probe', '', 'utf8')
+        await rm(filePath + '.probe', { force: true })
+      } catch (error) {
+        throw new Error('task run: the run ledger at ' + filePath + ' is not writable ('
+          + String(error) + ') — nothing was recorded, and none of its nodes would ever be released')
+      }
+      const stored = await commit(sessionId, runs => [...runs, run])
+      if (!stored) {
+        throw new Error('task run: the run ledger at ' + filePath
+          + ' could not be written — nothing was recorded, so none of its nodes would ever be released')
+      }
+    },
+    commit,
+  }
+}
+

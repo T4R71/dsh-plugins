@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Degeneration guard",
+    "description": "Stream brake, turn-completion continuation and automatic retry merged into one plugin that injects a single message per boundary."
+  }
+}

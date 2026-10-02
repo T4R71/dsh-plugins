@@ -13,7 +13,7 @@
  */
 import type { ReactNode } from 'react'
 import type { TreeNode } from './semantics.ts'
-import { buildOutline, countsLabel, tallyTree, type OutlineRow } from './list.ts'
+import { buildOutline, countsLabel, tallyTree, type OutlineRow, type OwnerIndex } from './list.ts'
 import { EntryGlyph } from './StatusGlyph.tsx'
 import type { TaskTreeKey } from './locales.ts'
 import css from './TaskListView.module.css'
@@ -30,6 +30,8 @@ export interface TaskListViewProps {
   collapsed: ReadonlySet<string>
   onToggle: (id: string) => void
   t: Translate
+  /** assignedTo → 队友标记；认不出成员的行照旧显示 `@childId`。 */
+  owners?: OwnerIndex | undefined
 }
 
 /** 取样式表里的类名，取不到就空串。 */
@@ -73,7 +75,9 @@ function Body({ row, t }: { row: OutlineRow; t: Translate }): ReactNode {
     <span className={css.body}>
       <span className={css.line}>
         <span className={css.title}>{row.title}</span>
-        {row.assignedTo !== undefined ? <span className={css.owner}>{'@' + row.assignedTo}</span> : null}
+        {row.owner !== undefined
+          ? <span className={css.owner}>{'(' + row.owner.name + ' · ' + row.owner.status + ')'}</span>
+          : row.assignedTo !== undefined ? <span className={css.owner}>{'@' + row.assignedTo}</span> : null}
       </span>
       {row.reason !== undefined
         ? <span className={css.sub}><span className={css.subKey}>{t('row.because')}</span>{row.reason}</span>
@@ -117,8 +121,8 @@ function Row({ row, onToggle, t }: { row: OutlineRow; onToggle: (id: string) => 
  * @param props - 根节点、折叠集合、切换回调与翻译函数
  * @returns 顶部总览 + 一路缩进下去的行
  */
-export function TaskListView({ roots, collapsed, onToggle, t }: TaskListViewProps): ReactNode {
-  const rows = buildOutline(roots, collapsed)
+export function TaskListView({ roots, collapsed, onToggle, t, owners }: TaskListViewProps): ReactNode {
+  const rows = buildOutline(roots, collapsed, owners)
   if (rows.length === 0) {
     return (
       <div className={css.empty}>

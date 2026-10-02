@@ -1,0 +1,74 @@
+/* 大纲：一行一个节点，层级靠缩进，同层靠淡虚线。 */
+.outline { display: flex; flex-direction: column; padding-bottom: 8px; }
+
+/* 顶部总览：四种状态各多少，不看内容也知道进度 */
+.totals {
+  display: flex; align-items: baseline; gap: 8px;
+  padding: 7px 12px 6px;
+  margin-bottom: 4px;
+  border-bottom: 1px solid var(--dsw-alias-border-l1, rgba(128,128,128,.18));
+}
+.totalsLabel { font-size: 10px; letter-spacing: .04em; opacity: .5; }
+.totalsValue { font-size: 11.5px; font-variant-numeric: tabular-nums; opacity: .85; }
+
+.row {
+  /* 连线色：label-caption 是随主题翻转的中灰（浅色 173,178,184 / 暗色 129,133,140）。
+     border-l1（rgba(0,0,0,.04)）是发丝分割线的级别，画在暗底上等于看不见。 */
+  --dsh-tree-line: var(--dsw-alias-label-caption, #81858c);
+  display: flex; align-items: flex-start; gap: 5px;
+  padding: 2px 10px 2px 4px;
+  font-size: 12px; line-height: 1.45;
+  color: var(--dsw-alias-label-secondary, #61666b);
+}
+.row:hover { background: var(--dsh-surface, #7f7f7f1a); }
+
+/* 同层虚线：只连同级兄弟，不画父子拄角、不画贯穿树干 */
+.linkCell { width: 11px; flex: 0 0 11px; align-self: stretch; position: relative; }
+.linkOn::before {
+  content: '';
+  position: absolute;
+  left: 5px; top: -2px; bottom: -2px; width: 1px;
+  background-image: repeating-linear-gradient(
+    to bottom,
+    var(--dsh-tree-line) 0 2.5px,
+    transparent 2.5px 7px
+  );
+  /* 淡淡的：用户要求「淡淡的虚线」，所以压到四成 */
+  opacity: .4;
+}
+
+/* 展开箭头 */
+.caret, .caretSpace {
+  display: grid; flex: 0 0 12px; place-items: center;
+  width: 12px; height: 19px;
+}
+.caret {
+  padding: 0; border: none; background: transparent; cursor: pointer;
+  color: var(--dsw-alias-label-tertiary, #81858c);
+}
+.caret:hover { color: var(--dsw-alias-label-primary, #0f1114); }
+.caretIcon { transition: transform .12s ease; }
+.caretIconOpen { transform: rotate(90deg); transition: transform .12s ease; }
+
+/* 圆形状态符号（todo 那一套 14×14） */
+.glyphCell { display: grid; flex: 0 0 auto; place-items: center; width: 15px; height: 19px; }
+
+.body { display: flex; flex-direction: column; flex: 1 1 auto; min-width: 0; }
+.line { display: flex; align-items: baseline; gap: 6px; min-width: 0; }
+.title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.owner { flex: 0 0 auto; font-size: 10.5px; opacity: .68; }
+.sub {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: 11px; opacity: .72;
+}
+.subKey { opacity: .75; }
+
+/* 走不通：整行变淡，标题划掉 —— 状态符号只留四种，这一条信息走样式 */
+.life_dead .body, .life_orphan .body { opacity: .55; }
+.life_dead .title, .life_orphan .title { text-decoration: line-through; }
+/* 合流与结果：加粗，不再额外占符号位 */
+.kind_merge .title, .kind_result .title { font-weight: 600; }
+
+.empty { padding: 24px 16px; text-align: center; }
+.emptyTitle { margin: 0; font-size: 12.5px; opacity: .8; }
+.emptyHint { margin: 6px 0 0; font-size: 11px; opacity: .55; }

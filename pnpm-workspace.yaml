@@ -3,6 +3,12 @@
 packages:
   - 'packages/*'
 
+# 迁移期设置（2026-09-30，用户授权）：pnpm 12.5.1 的内建 minimumReleaseAge 默认 1440 分钟，
+# 会把刚发布的 @deepseek-ai/*@0.2.0-rc.2 判为「发布过新」而拒绝，并自动往本文件追加
+# 约 90 条 minimumReleaseAgeExclude 白名单；多个并发 install 互相覆盖会反复写脏工作区。
+# 关掉闸门（=0）后 pnpm 不再需要写白名单，install 可复现。
+minimumReleaseAge: 0
+
 # 依赖安装脚本的放行决定属于工作区根，且必须逐包显式记录：
 # 未记录的包会让 pnpm 以 ERR_PNPM_IGNORED_BUILDS 退出 1。
 allowBuilds:

@@ -1,0 +1,117 @@
+
+// ─────────────────────────────────────────────────────────────────────────────
+// stripDocComments — the second text-only lever over the same section
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Remove every JSDoc comment block inside the two `tools` declaration maps,
+ * keeping every type signature byte-for-byte.
+ *
+ * ## Why this is safe in exactly the same sense as `stripToolDeclarations`
+ *
+ * The sandbox's `tools` binding comes from the registry's VISIBLE-tool view; the
+ * `tools:sdk` section is a separate RENDERING of that view. Comments live only in
+ * the rendering. Nothing here consults or mutates the registry, so
+ * `await tools.<name>(args)` keeps working — measured after the change.
+ *
+ * ## The refusal discipline
+ *
+ * A partial comment strip would publish half a declaration, so every failure
+ * returns the input text UNCHANGED: structure (maps unlocatable, an unclosed
+ * block), accounting (blocks located but nothing disappeared), reread (no brace
+ * balance, or a changed member count).
+ *
+ * @module @t4r71/dsh-prompt-plan/strip-doc-comments
+ */
+
+/** What one comment strip measured and removed. */
+export interface DocStripReport {
+  /** Characters removed. */
+  readonly removedChars: number
+  /** Comment blocks removed. */
+  readonly blocks: number
+  /** True when the pass only measured. */
+  readonly dryRun: boolean
+}
+
+/** The outcome of one comment strip. */
+export type DocStripOutcome =
+  | { readonly ok: true; readonly text: string; readonly report: DocStripReport }
+  | { readonly ok: false; readonly refusal: StripRefusal }
+
+/**
+ * Measure — and, unless `dryRun`, remove — every comment block inside the maps.
+ * @param text - the `tools:sdk` section text.
+ * @param dryRun - measure only; the returned text is then the input text.
+ * @returns the outcome, or the refusal naming the failed check.
+ */
+export function stripDeclarationComments(text: string, dryRun: boolean): DocStripOutcome {
+  try {
+    const lines = text.split('\n')
+    const bodies: MapBody[] = []
+    for (const mapName of SDK_MAPS) {
+      const located = locateMap(lines, mapName)
+      if (typeof located === 'string') return { ok: false, refusal: { check: 'structure', problem: 'the ' + mapName + ' interface could not be located: ' + located } }
+      bodies.push(located)
+    }
+    const inside = new Set<number>()
+    for (const body of bodies) {
+      for (let index = body.bodyStart; index <= body.bodyEnd; index += 1) inside.add(index)
+    }
+    const drop = new Set<number>()
+    let blocks = 0
+    let index = 0
+    while (index < lines.length) {
+      const line = lines[index] ?? ''
+      if (!inside.has(index) || !line.includes('/*')) { index += 1; continue }
+      const start = line.indexOf('/*')
+      const onLine = line.indexOf('*/', start + 2)
+      if (onLine !== -1) {
+        const before = line.slice(0, start)
+        const after = line.slice(onLine + 2)
+        if (before.trim().length === 0 && after.trim().length === 0) {
+          drop.add(index)
+        } else {
+          lines[index] = (before + after).replace(/\s+$/, '')
+        }
+        blocks += 1
+        index += 1
+        continue
+      }
+      let end = index
+      while (end < lines.length && !(lines[end] ?? '').includes('*/')) end += 1
+      if (end >= lines.length) return { ok: false, refusal: { check: 'structure', problem: 'a comment block opened at line ' + (index + 1) + ' never closes' } }
+      for (let at = index; at <= end; at += 1) {
+        if (!inside.has(at)) return { ok: false, refusal: { check: 'structure', problem: 'comment block at line ' + (index + 1) + ' leaves the declaration maps' } }
+        drop.add(at)
+      }
+      blocks += 1
+      index = end + 1
+    }
+    if (dryRun) return { ok: true, text, report: { dryRun: true, removedChars: 0, blocks } }
+    const stripped = lines.filter((_line, at) => !drop.has(at)).join('\n')
+    const removedChars = text.length - stripped.length
+    if (removedChars <= 0 && blocks > 0) {
+      return { ok: false, refusal: { check: 'accounting', problem: blocks + ' comment block(s) were located but no characters disappeared' } }
+    }
+    if (!balanced(stripped)) {
+      return { ok: false, refusal: { check: 'reread', problem: 'the comment-stripped text no longer brace-balances' } }
+    }
+    const keptLines = stripped.split('\n')
+    for (const [position, mapName] of SDK_MAPS.entries()) {
+      const relocated = locateMap(keptLines, mapName)
+      if (typeof relocated === 'string') {
+        return { ok: false, refusal: { check: 'reread', problem: 'after stripping comments, the ' + mapName + ' interface could not be re-located: ' + relocated } }
+      }
+      const beforeCount = membersOf(lines, bodies[position] as MapBody).length
+      const afterCount = membersOf(keptLines, relocated).length
+      if (afterCount !== beforeCount) {
+        return { ok: false, refusal: { check: 'reread', problem: 'after stripping comments, ' + mapName + ' carries ' + afterCount + ' members where ' + beforeCount + ' were expected' } }
+      }
+    }
+    return { ok: true, text: stripped, report: { dryRun: false, removedChars, blocks } }
+  } catch (error: unknown) {
+    const reason = error instanceof Error ? error.message : String(error)
+    return { ok: false, refusal: { check: 'structure', problem: 'unexpected failure while stripping comments: ' + reason } }
+  }
+}

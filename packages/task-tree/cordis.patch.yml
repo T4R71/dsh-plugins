@@ -1,0 +1,98 @@
+# 任务生长树组合包层：把四行插进任何选中它的 profile。
+#
+# 组合包只贡献行，不贡献整个组合：启用时插入下面四行，停用时就地移除，
+# profile 的其余部分不受影响。四行由同一个组合包声明，所以插件页只出现一个条目。
+
+- insert:
+    # 真实宿主：plan_write / plan_step / plan_dispatch / plan_ask 四个工具。
+    #
+    # ⚠️ 这一行是**必须**的，缺它就整条链是断的：这四个工具都读写本包自有的设置
+    # 命名空间里那棵树，而那一行是下面的 `plan-tree-sessions`。
+    #
+    # 收口后这一行只提供那棵树与 `taskTree` 服务：把 `exposeTools` 设成 `false`
+    # 会摘掉四个工具与它们的用法策略段，但**不会**摘掉 `taskTree` 服务
+    # （`packages/plan-tree/src/index.ts` 的 `apply` 里 `ctx.provide('taskTree', ...)`
+    # 在开关之外），因为下面的 `task` 那一行正是靠这个服务读同一棵树。
+    # 2026-09-29 用户裁决：**本组合包默认收口**，所以下面这一行就带着 `exposeTools: false`。
+    # 依据：② 的目标是「把编排类工具**收成一个**一等 `task` 工具」；
+    # 而本组合包整包**未发布**、本机也没有任何 profile 挂它——
+    # 所以「默认 `false` 会静默剥夺已发货部署的能力」这个反对理由**前提不成立**。
+    # 另外这个键写的是**本组合包自己那一行**，碰不到 `dsh-base` 的五件。
+    # 想要那四个工具的人，在自己 profile 层写 `- id: plan-tree` + `config.exposeTools: true` 即可拿回。
+    - id: plan-tree
+      name: '@t4r71/dsh-plan-tree'
+      config:
+        exposeTools: false
+
+    # 树的权威存储：一条**独立**的 Loader entry，id 就是设置命名空间
+    # （`plan-tree-sessions`），字段只有 `trees`：会话 id → 树。
+    #
+    # 为什么不并进上面那一行：行的 ns 绑着设置页的行表单，多一个未声明字段会被投影进
+    # 那张表单；这一行的 Config 只声明 `trees`，设置页不渲染它。
+    #
+    # 2026-09-29 起，这条链**一个会话事件都不写**。此前树随会话日志下发
+    # （`plan/declared` / `plan/step`），那两个事件类型不在 0.1.7 的
+    # KNOWN_SESSION_EVENT_TYPES 里，持久化读路径会因此**拒绝解释整个 log**
+    # （dsh-session-persistence/lib/index.js:184）——一旦写过，那条会话就再也打不开。
+    - id: plan-tree-sessions
+      name: '@t4r71/dsh-plan-tree/session-store'
+
+    # 收口的那一件：一个一等 `task` 工具，取代编排五件 + 任务树四件。
+    #
+    # ⚠️ 这一行 2026-09-29 才挂上（此前本组合包**没有**它，所以
+    # `@t4r71/dsh-task` 从来没被任何组合包挂载过）。它必须排在 `plan-tree` **之后**：
+    # `task` 不自带存储，它经 `ctx.get('taskTree')` 取得上面两行建立的那一份，
+    # 行序倒了就没有服务可拿。
+    #
+    # `provider` 的取值来自真机：base profile 的 `subagent-spawn-in-process` 那一行
+    # 注册的 provider 名就是 `spawn`（`@deepseek-ai/dsh-base/cordis.patch.yml` 里
+    # `providerName: spawn`，全量 dump 见 M:\T4\out\stage2\collapse\runs\dump-A.txt）。
+    # 名字写错**不会在装载时报错**——只有真的派发时才在 `startContinuable` 里失败
+    # （`packages/task/src/index.ts:256`），所以这里按实测值写，不按猜测写。
+    #
+    # `presets` 只给 `deny`，不给 `allow`：`allow` 是白名单，写错一个名字就等于
+    # 悄悄收走子代理的工具；`deny` 写错一个名字只是白写一条，失败方向是安全的。
+    #
+    # 下面出现的每一个名字都取自**真机实测的工具面**，不是从文档抄的：
+    #   M:\T4\out\stage2\collapse\out-C-collapsed\tools-surface.json 的 `toolNames`
+    #   = create_goal, edit, exit_plan_mode, get_goal, glob, grep, job_kill, job_list,
+    #     job_output, pwsh, read, read_image, skill, task, todo_write, update_goal,
+    #     web_fetch, web_search, workflow, write
+    # 也就是说：这些名字在**收口后**的组合里确实存在。不在这份清单里的名字
+    # 一律不写——包括 `plan_write` 这一类收口后已经不在面上的名字。
+    - id: task
+      name: '@t4r71/dsh-task'
+      config:
+        provider: spawn
+        presets:
+          # 侦察：只读、只回报，不动任何东西。
+          # 三个写入面（edit / write / pwsh）与可写入的 todo_write 全摘，派发面全摘。
+          recon:
+            persona: 'You are a reconnaissance agent. Read, search and report. Change nothing.'
+            deny: ['edit', 'write', 'pwsh', 'todo_write', 'subagent', 'subagent_fork', 'task', 'workflow']
+            maxDepth: 1
+          # 实施：干活的那一支，所以写入面与 pwsh 留着，只摘派发面（不许再往下套娃）。
+          impl:
+            persona: 'You are an implementation agent. Make the change and prove it with a command.'
+            deny: ['subagent', 'subagent_fork', 'task']
+            maxDepth: 2
+          # 校验：读、找、跑命令都可以（要能自己复现结论），但不能改任何东西、
+          # 也不能再往下派。所以 pwsh 留着，三个写入面与 todo_write 摘掉。
+          verify:
+            persona: 'You are a verification agent. Reproduce the claim yourself and report evidence, not agreement.'
+            deny: ['edit', 'write', 'todo_write', 'subagent', 'subagent_fork', 'task', 'workflow']
+            maxDepth: 1
+
+    # 浏览器半边：右侧边栏的大纲面板。数据源是 `plan-tree-sessions` 那份配置文档的
+    # 共享镜像（`ctx.configForms.describe()`）。
+    # 需要挂在有浏览器表面的 profile 上；纯宿主 profile 停用这一行即可。
+    - id: task-tree-ui
+      name: '@t4r71/dsh-ui-task-tree'
+
+    # 2026-09-29：`task-tree-host` 行**连同整包一并删除**（用户裁决），故这里不再留开关。
+    # 理由：它提供的 `taskTree` 会话投影**零消费者**，而写入的 `taskTree/declared` 事件
+    # 不在 0.1.7 的 KNOWN_SESSION_EVENT_TYPES 白名单里
+    # （dsh-session/lib/types/known-event-types.js:21-81），持久化读路径对白名单外且
+    # 非 `ignorable` 的事件会**拒绝解释整个 log**（dsh-session-persistence/lib/index.js:184）。
+    # 该形态最险之处在于**写入侧毫无警告**：会话当时一切正常，直到某天重开时整份日志作废。
+    # 已由协调者一手复现，见 M:\T4\out\stage2\evidence\verify-log-safety\README.md。

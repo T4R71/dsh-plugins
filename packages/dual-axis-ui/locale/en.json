@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Dual-axis access UI",
+    "description": "The browser half of the dual-axis bundle: the General-settings row plus the read and write axis dropdowns above the composer."
+  }
+}

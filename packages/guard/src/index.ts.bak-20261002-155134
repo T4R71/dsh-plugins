@@ -1,0 +1,1282 @@
+/**
+ * @t4r71/dsh-guard — the two degeneration guards, merged, plus automatic retry.
+ *
+ * ## What this package is
+ *
+ * `@t4r71/dsh-stream-guard` and `@t4r71/dsh-idle-guard` were two plugins that
+ * watched the same boundary and did not know about each other. Mounted
+ * together they could inject two messages for one failure: a brake on the way
+ * out of the stream, and a continuation when the steered turn then ended on
+ * reasoning alone. Each message is a user turn in the transcript, so the
+ * duplication was not free.
+ *
+ * This package is both of them, in one `apply`, sharing one per-session state
+ * and one boundary token. Every trigger condition, every threshold and every
+ * budget is the one the source package shipped — the merge removes duplicate
+ * injection, it does not re-tune anything.
+ *
+ * ## The three seams it uses
+ *
+ * - `llm/stream` (**waterfall**) — the brake. The listener must *return* the
+ *   stream object; returning nothing swallows it.
+ * - `agent/turn-stopping` (**serial**, payload `{agent, turn, signal}`) — the
+ *   arbitration point. Steering here keeps the turn open, because the loop
+ *   re-reads its inbox after this boundary and only then decides to break
+ *   (`dsh-agent-loop/lib/index.js:983-990`).
+ * - `agent/request-error` (**waterfall**) — the automatic-retry fallback.
+ *   Returning `{kind:'retry'}` makes the loop re-run the same step
+ *   (`dsh-agent-loop/lib/index.js:1109-1119`).
+ *
+ * All three are event seams, so this guard works with the stock
+ * `@deepseek-ai/dsh-llm-pi-ai` access layer unchanged. It replaces nothing.
+ *
+ * ## Shared state
+ *
+ * One `SessionState` per session (both guards' counters, renamed apart where
+ * they collided) and one `injected` map holding the boundary token
+ * `turn:lastAssistantMessageId`. The first rule to claim a boundary injects;
+ * every later rule on that same boundary is skipped. See the arbitration
+ * listener at the bottom of this file.
+ *
+ * ## Automatic retry
+ *
+ * The shipped runtime already retries provider-request failures
+ * (`@deepseek-ai/dsh-llm-retry`, 5 attempts, 500 ms → 10 s backoff). This
+ * package adds only the tier that is missing: a bounded, delayed fallback for
+ * the failures that policy declines, and turn-level recovery for an empty or
+ * reasoning-only turn, which is not a request failure at all. Details in
+ * `src/retry.ts`; measurements in `M:/T4/out/guard/E-守卫插件.md`.
+ *
+ * @module @t4r71/dsh-guard
+ */
+
+import { appendFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import type { Context } from '@deepseek-ai/cordis'
+import z from '@deepseek-ai/schemastery'
+// Type-only, no runtime import: this pulls in dsh-agent's `Events` augmentation
+// (the `agent/turn-stopping` and `agent/request-error` signatures) without
+// depending on the package's runtime.
+import type {} from '@deepseek-ai/dsh-agent'
+// Pulls in the local declarations for `tools/post-execute`,
+// `tools/ptc-dispatch-log`, and `session/event`. Type-only, and the reason a
+// local declaration exists at all is in that module's header.
+import type {} from './interop.ts'
+import type { RequestErrorAction } from '@deepseek-ai/dsh-agent'
+import type { SessionId } from '@deepseek-ai/dsh-session'
+import type { Session } from '@deepseek-ai/dsh-session'
+import type { StreamChunk } from '@deepseek-ai/dsh-llm'
+import { boundContextSummary, createUserMessage } from '@deepseek-ai/dsh-llm'
+import type { ContextFormed } from '@deepseek-ai/dsh-llm'
+// 0.1.7 removed the shared catch-all `plugin` message source kind
+// (`dsh-llm/lib/types/message.d.ts:94-100`: "Merge-extensible sum type — each
+// producer declares its own `kind` in its own module; there is no shared
+// catch-all `plugin` kind"). Every shipped 0.1.7 producer declares one in its
+// own module the same way, so this package declares its own here. Type-only:
+// the block is erased at build time and changes nothing at runtime.
+//
+// The merge keeps ONE kind for both guards. The two sources had one each
+// (`stream-guard` / `idle-guard`), which cannot both survive a merge into one
+// plugin with one `name`; the rule that fired is named in the notice summary,
+// which is the durable record a reader actually greps for.
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    guard: { kind: 'guard' } & ContextFormed
+  }
+}
+import { AnnounceGuard } from './announce.ts'
+import { RepeatGuard } from './repeat.ts'
+import { EchoGuard } from './echo.ts'
+import { judgeHesitation } from './hesitation.ts'
+import { rebuildBrakedEnvelope } from './signature.ts'
+import { prefersCjk } from './language.ts'
+import { wordingFor } from './wording.ts'
+import type { Wording } from './wording.ts'
+import { isIdleCompletion, isEmptyCompletion } from './idle.ts'
+import { DEFAULT_RETRY_POLICY, RetryLedger, cancellableDelay } from './retry.ts'
+import { boundJobOutput } from './joblog.ts'
+import { appendLedger, ledgerLine } from './ledger.ts'
+import { dedupeInjections } from './dedup.ts'
+import { rereadKey, suppressRepeatRead } from './reread.ts'
+import type { ReadStamp } from './reread.ts'
+import { envelopeContent } from './envelope.ts'
+import type { ObservedSessionEvent } from './interop.ts'
+
+/** Plugin name, as registered with cordis. */
+export const name = 'guard'
+
+/**
+ * Services this plugin reads.
+ *
+ * `llm` supplies the stream hook and the `sessionId` every loop-built request
+ * carries; `sessions` is declared because both guards keep per-session budgets
+ * and the loop's own session registry is what those ids belong to.
+ */
+export const inject = ['llm', 'sessions']
+
+/** Which channel a delta belongs to. */
+export type Channel = 'text' | 'reasoning'
+
+export interface Config {
+  /** Run the guard at all (default `true`). */
+  enabled?: boolean
+  /**
+   * Run the streaming rules — brake, echo, recycling, announcement — at all
+   * (default `true`).
+   *
+   * New with the merge. Both source packages had their own `enabled`; that
+   * collapses to one switch when they become one plugin, which would also
+   * remove the ability to run one guard without the other. Each guard keeps
+   * its own switch here, and both default to the shipped behaviour.
+   */
+  streamGuard?: boolean
+  /**
+   * Run the turn-completion rule — a turn that ended on reasoning alone — at
+   * all (default `true`).
+   *
+   * New with the merge; see {@link streamGuard}.
+   */
+  idleGuard?: boolean
+  /**
+   * Let the bare filler vocabulary brake the reasoning channel (default `false`).
+   *
+   * Intent openings always may; this switch governs only the *filler* hits, whose
+   * reasoning evidence is weak. The default matters and is inherited from the
+   * design this rule replaced, for two measured reasons: reasoning blocks carry
+   * replay signatures upstream, and assembly discards the whole replay envelope
+   * when the block layout stops matching — so truncating reasoning costs the next
+   * request its passback state. A bare `Writing.` in a private trace is also much
+   * weaker evidence of collapse than the same word in the answer a person reads.
+   *
+   * Measured on the live corpus: with this off, 12 reasoning blocks brake on the
+   * rule, all of them on intent evidence. Allowing filler as well brakes 20 more,
+   * including a 109,217-character block.
+   */
+  brakeReasoning?: boolean
+  /**
+  * Longest clause that can still count as an announcement (default `18`).
+  *
+  * Load-bearing rather than cosmetic: a real planning sentence opens with
+  * `Let me` and then keeps going, so measuring only the opening brakes healthy
+  * work. Measured, tightening this to 12 loses half of the genuine filler and
+  * loosening it to 20 admits 14 samples of real planning.
+  */
+  announceMax?: number
+  /**
+  * Non-whitespace characters tolerated between two announcements (default `20`).
+  *
+  * The reference measured 0 false positives in 7,395 healthy samples at 20; 30
+  * produced 1.
+  */
+  announceGap?: number
+  /** Announcements required to prove a stall (default `5`). */
+  announceCount?: number
+  /**
+  * Fraction of the answer's lines that must already be reasoning lines before
+  * the echo rule brakes (default `0.9`).
+  *
+  * Every measured positive scores 1.000 because it copies verbatim, so raising
+  * this from 0.8 drops nothing while doubling the margin: the highest healthy
+  * streaming prefix observed is 0.714.
+  */
+  echoMin?: number
+  /** Continuations steered per turn (default 2). */
+  maxContinues?: number
+  /**
+   * Continuations after which the prompt starts carrying a warning (default 10).
+   *
+   * Not a cap: the session is steered indefinitely, because a silent stop is
+   * worse for the user than the degeneration it replaced. Crossing this
+   * threshold appends {@link Wording.continueWarning} to the continuation so the
+   * model learns that resuming has already failed repeatedly.
+   */
+  warnAfterContinues?: number
+  /** Inject a request-side nudge on hesitation churn (default `true`). */
+  hesitationNudge?: boolean
+  /** Hesitation nudges allowed per session (default 2). */
+  hesitationBudget?: number
+  /** Emit diagnostics through the logger (default `false`). */
+  verbose?: boolean
+  /**
+   * Continuations steered per session by the turn-completion rule (default
+   * `3`).
+   *
+   * Moved here verbatim from `@t4r71/dsh-idle-guard`: a budget rather than a
+   * single shot, because a model that idles once often idles again, and one
+   * nudge that is ignored would leave the turn dead. It stays small on
+   * purpose — this is a nudge, not a substitute for the model deciding to
+   * act, and an unbounded budget would let a pathological session spend
+   * forever re-prompting a model that has nothing to do.
+   */
+  idleBudget?: number
+  /**
+   * Minimum reasoning length, in characters, before the turn-completion rule
+   * considers a turn idle (default `0`).
+   *
+   * Moved here verbatim from `@t4r71/dsh-idle-guard`: zero by default, because
+   * a turn that produced no text and no action is wrong whether the thinking
+   * was long or short. Raising it narrows the rule to turns that clearly
+   * thought about something and then did not act.
+   *
+   * Read `isIdleCompletion` before relying on the default: the test is
+   * `text === 0 && reasoning >= minReasoningChars`, so at `0` this field is
+   * not a threshold at all — it admits every reasoning length, including
+   * none. The measured consequence is in
+   * `M:/T4/out/guard/E-守卫插件.md`.
+   */
+  minReasoningChars?: number
+  /** Offer the automatic-retry fallback tier (default `true`). */
+  retryEnabled?: boolean
+  /**
+  * Automatic retries and recovery continuations per session (default `3`).
+  *
+  * One budget for both tiers, deliberately. The number is the one the
+  * previous `ds-guard` proxy shipped (`MAX_CONTINUES = 3`), and a single
+  * counter is what stops a session whose failure keeps changing shape from
+  * spending a fresh allowance each time.
+  */
+  retryMax?: number
+  /**
+  * Delay before a fallback retry or a recovery continuation, in ms (default
+  * `500`, from the previous `ds-guard` proxy's `CONTINUE_DELAY_MS`).
+  */
+  retryDelayMs?: number
+  /**
+  * Failure codes the fallback tier retries (default `['STREAM_CLOSED',
+  * 'MALFORMED_RESPONSE', 'PI_AI_ERROR']`).
+  *
+  * Deliberately *not* the shipped policy's own list. `EMPTY_RESPONSE`,
+  * `RATE_LIMIT`, `SERVER`, `TIMEOUT` and `TRANSPORT` are already retried five
+  * times by `dsh-llm-retry`; listing them here would describe a second retry
+  * of the same failure rather than a gap being filled. Adding one extends
+  * that policy's exhausted budget by this tier's `retryMax` — a deliberate
+  * choice, not a default.
+  *
+  * `PI_AI_ERROR` is in the default set because it is the code the pi-ai route
+  * raises for a provider error it could not classify
+  * (`dsh-llm-pi-ai/lib/index.js:1424`, `:1431`) — the access layer the guard is
+  * required to work beside.
+  */
+  retryCodes?: string[]
+  /** Steer a recovery continuation for an assistant message with no blocks (default `true`). */
+  retryOnEmpty?: boolean
+  /** Steer a recovery continuation for a turn that ended on reasoning alone (default `true`). */
+  retryOnDegenerate?: boolean
+  /**
+   * Append one line to this file every time `apply` runs (default `''`, off).
+   *
+   * Exists so a deployment can prove the row was actually mounted. 0.1.7's
+   * compatibility preflight denies an incompatible row silently at the row level
+   * (it writes `dsh: disabling profile plugin …` on stderr and loads nothing), so
+   * \"the process started\" is not evidence that this plugin is in it, and a desktop
+   * copy's stderr is not always readable. A receipt file is evidence that does not
+   * depend on either. Never used by the guard's own logic.
+   */
+  receiptFile?: string
+  /**
+   * Bound the logged copy of an oversized `job_output` (default `true`).
+   *
+   * The defect this closes is in the shipped pair, not here:
+   * `dsh-tool-jobs` truncates a `job_output` result only by the producer's
+   * `job.outputLimitBytes` (`dsh-tool-jobs/lib/index.js:168`, `:240-255`), and
+   * `dsh-tool-pwsh` never sets that field when it registers a job
+   * (`dsh-tool-pwsh/lib/index.js:362-390`), so for the jobs this harness runs
+   * the bound is absent and every result is unbounded — measured at 438,502
+   * characters across 67 sub-dispatches, largest single 49,932.
+   *
+   * Applied on `tools/ptc-dispatch-log`, which owns exactly the copy that
+   * reaches the transcript (`dsh-tools/lib/index.js:706-714`); the value the
+   * calling program already received is untouched.
+   */
+  jobOutputBound?: boolean
+  /** Byte cap for {@link Config.jobOutputBound} (default `12000`). */
+  jobOutputMaxBytes?: number
+  /**
+   * Write the compaction cost ledger (default `true`).
+   *
+   * `dsh-compaction-basic` already records the summarization call's `usage` on
+   * its `compaction/summary` event (`lib/index.js:629-649`) and logs only the
+   * shadowed token count (`:837`). This writes the numbers that already exist.
+   */
+  costLedger?: boolean
+  /** Ledger file; empty selects the default under the user's temp directory. */
+  costLedgerFile?: string
+  /**
+   * Drop byte-identical repeat injections (default `true`).
+   *
+   * Only exact duplicates from one producer are dropped, on
+   * `agent/pre-step` before the message is ever committed. Measured on this
+   * deployment's parent session: `runtime-context` 5 copies of one 2,128-byte
+   * body; `time-context` 19 copies with 19 distinct bodies, so none of those
+   * are touched.
+   */
+  dedupeInjections?: boolean
+  /**
+   * Answer a repeated `read` with a pointer instead of the file (default
+   * `false` — the conservative value).
+   *
+   * Off by default because, unlike every other hook here, it changes what the
+   * model receives rather than only what is logged. Turn it on for a session
+   * that re-reads the same paths; the pointer names the path, the range, and
+   * the flags to re-read with, and is refused outright when the file's size or
+   * mtime has changed since the earlier read.
+   */
+  suppressRepeatReads?: boolean
+  /**
+   * Replace a settled child's closing message with a recoverable envelope
+   * (default `true`).
+   *
+   * The full closing text is spilled first and the envelope carries its path
+   * and `sha256`; if the spill cannot be written the message is left exactly as
+   * the harness built it. Measured on this deployment's parent session: 29
+   * settlements, 160,237 characters of closing text, largest single 15,562.
+   */
+  settleEnvelope?: boolean
+  /** Section-body lines the envelope shows (default `8`). */
+  settleEnvelopeHeadLines?: number
+}
+
+/** Validated plugin configuration. */
+export const Config: z<Config> = z.object({
+  /**
+  * Run the guard at all.
+  *
+  * One switch rather than one per rule: the rules answer different questions but
+  * share a remedy (stop the step, steer the turn), so a caller wanting the guard
+  * off wants it off, and a caller wanting to tune a rule has the thresholds
+  * below.
+  */
+  enabled: z.boolean().default(true),
+  /** Run the streaming rules; see {@link Config.streamGuard}. */
+  streamGuard: z.boolean().default(true),
+  /** Run the turn-completion rule; see {@link Config.idleGuard}. */
+  idleGuard: z.boolean().default(true),
+  /**
+   * Let the bare filler vocabulary brake the reasoning channel.
+   *
+   * Default `false`, and the default matters — see the interface documentation
+   * above for the measured reasoning.
+   */
+  brakeReasoning: z.boolean().default(false),
+  /**
+  * Longest clause that can still count as an announcement.
+  *
+  * The bound is what separates "Let me check." from "Let me walk through the
+  * three cases where the assembler could reorder frames."
+  */
+  announceMax: z.number().min(1).max(200).default(18),
+  /** Non-whitespace characters tolerated between two announcements. */
+  announceGap: z.number().min(0).max(500).default(20),
+  /** Announcements required to prove a stall. */
+  announceCount: z.number().min(1).max(50).default(5),
+  /**
+  * Fraction of the answer's lines that must already be reasoning lines.
+  *
+  * A quotation embedded in new prose does not reach this: measured over a sweep,
+  * quoting 80 of 90 reasoning lines and then writing ten new lines scores 0.889,
+  * and an interleaved CJK quotation scores lower still.
+  */
+  echoMin: z.number().min(0.1).max(1).default(0.9),
+  /**
+  * Continuation prompts issued per turn once a brake fires.
+  *
+  * The reference uses 3. A non-zero floor matters more than the exact number:
+  * without a continuation the turn ends mid-sentence, which is worse for the
+  * user than the filler it replaced.
+  */
+  maxContinues: z.number().min(0).max(10).default(2),
+  /**
+  * Continuations after which the prompt starts carrying a warning.
+  *
+  * Deliberately not a cap. A hard session budget turned the guard into a silent
+  * truncator once spent: the stream was still braked, but no continuation was
+  * steered and nothing durable was recorded, so the turn ended mid-thought with
+  * no evidence of why. Steering without limit and escalating the wording keeps
+  * the failure visible and recoverable.
+  */
+  warnAfterContinues: z.number().min(0).max(1000).default(10),
+  /**
+  * Inject a request-side nudge when the transcript shows hesitation churn (the
+  * model keeps contradicting itself with Hmm / Wait / Actually openers instead of
+  * making progress).
+  *
+  * Unlike a brake this never truncates: the churn has already finished writing by
+  * the time the pattern is visible, so cutting would discard real output.
+  */
+  hesitationNudge: z.boolean().default(true),
+  /**
+  * Hesitation nudges allowed per session.
+  *
+  * Measured on the reference: with the cap absent, one piece of churning content
+  * produced 61 consecutive nudged requests, because each nudge fed back into the
+  * transcript and re-armed the detector. The cap must live in process state —
+  * counting nudge markers in the transcript reported `already=0` on every one of
+  * those 61 turns.
+  */
+  hesitationBudget: z.number().min(0).max(64).default(2),
+  /**
+  * Emit brake and nudge diagnostics through the logger.
+  *
+  * Off by default: a working guard is silent, and the only reason to turn it on
+  * is to calibrate thresholds against real traffic.
+  */
+  verbose: z.boolean().default(false),
+  /** Continuations steered per session by the turn-completion rule. */
+  idleBudget: z.number().min(0).max(64).default(3),
+  /** Minimum reasoning length before a turn counts as idle. */
+  minReasoningChars: z.number().min(0).max(1000000).default(0),
+  /** Offer the automatic-retry fallback tier. */
+  retryEnabled: z.boolean().default(DEFAULT_RETRY_POLICY.enabled),
+  /** Automatic retries and recovery continuations per session. */
+  retryMax: z.number().min(0).max(64).default(DEFAULT_RETRY_POLICY.maxRetries),
+  /** Delay before a fallback retry or a recovery continuation, in ms. */
+  retryDelayMs: z.number().min(0).max(60000).default(DEFAULT_RETRY_POLICY.delayMs),
+  /** Failure codes the fallback tier retries. */
+  retryCodes: z.array(z.string()).default([...DEFAULT_RETRY_POLICY.codes]),
+  /** Steer a recovery continuation for an assistant message with no blocks. */
+  retryOnEmpty: z.boolean().default(DEFAULT_RETRY_POLICY.onEmptyResponse),
+  /** Steer a recovery continuation for a turn that ended on reasoning alone. */
+  retryOnDegenerate: z.boolean().default(DEFAULT_RETRY_POLICY.onDegenerateTurn),
+  /** Append one line to this file every time `apply` runs; empty means off. */
+  receiptFile: z.string().default(''),
+  /** Bound the logged copy of an oversized `job_output`; see {@link Config.jobOutputBound}. */
+  jobOutputBound: z.boolean().default(true),
+  /**
+   * Byte cap for the `job_output` bound.
+   *
+   * The same order of magnitude as the profile's already-effective
+   * `maxOutputBytes: 12000`, deliberately: two bounds on the same class of
+   * text that disagree by an order of magnitude would just move the surprise.
+   */
+  jobOutputMaxBytes: z.number().min(0).max(10_000_000).default(12_000),
+  /** Write the compaction cost ledger; see {@link Config.costLedger}. */
+  costLedger: z.boolean().default(true),
+  /** Ledger file; empty selects the default under the user's temp directory. */
+  costLedgerFile: z.string().default(''),
+  /** Drop byte-identical repeat injections; see {@link Config.dedupeInjections}. */
+  dedupeInjections: z.boolean().default(true),
+  /** Answer a repeated `read` with a pointer; see {@link Config.suppressRepeatReads}. */
+  suppressRepeatReads: z.boolean().default(false),
+  /** Envelope a settled child's closing message; see {@link Config.settleEnvelope}. */
+  settleEnvelope: z.boolean().default(true),
+  /** Section-body lines the envelope shows. */
+  settleEnvelopeHeadLines: z.number().min(0).max(200).default(8),
+})
+
+/** Resolved configuration. */
+export type ResolvedConfig = Config
+
+/** Per-session guard state. */
+interface SessionState {
+  /** Turn the counters below belong to; a new turn resets the per-turn one. */
+  lastTurn: number
+  /** Continuations steered during the current turn. */
+  turnContinues: number
+  /** Continuations steered over the session's lifetime. */
+  spentContinues: number
+  /** Hesitation nudges injected over the session's lifetime. */
+  spentNudges: number
+  /** Signature of the transcript already judged, so one churn is nudged once. */
+  judged: string
+  // -- fields added by the merge; see the arbitration listener at the bottom.
+  // `idle-guard` kept its own `judged` and `steered` counters, and both names
+  // collide with the stream guard's, so they are renamed apart rather than
+  // shared: sharing them would have changed when each guard fires.
+  /** Turn-completion continuations steered over the session's lifetime. */
+  idleSteered: number
+  /** Id of the last assistant message the turn-completion rule judged. */
+  idleJudged: string
+}
+
+/** Where a brake left the stream, recorded for the turn-stopping hook. */
+interface BrakeRecord {
+  /** The channel that collapsed. */
+  channel: Channel
+  /** Which rule fired. */
+  kind: 'announce' | 'repeat' | 'echo'
+  /** Hits or lines counted when the verdict fired. */
+  count: number
+  /** Distinct line labels, for the recycling rule; `0` otherwise. */
+  span: number
+  /** The clause that completed an announcement run; for the log only. */
+  opener: string
+}
+
+/**
+ * The wording to inject for one agent, matched to its conversation's language.
+ *
+ * Read at injection time rather than cached, because the first nudge of a
+ * session can precede any human turn the guard has seen, and a conversation can
+ * legitimately change language mid-session.
+ *
+ * @param session - the session whose transcript decides the language.
+ * @returns the wording set for that conversation.
+ */
+function wordingForAgent(session: Session): Wording {
+  return wordingFor(prefersCjk(session.deriveMessages()))
+}
+
+export function apply(ctx: Context, config: ResolvedConfig): void {
+  // The receipt, and the first statement in apply on purpose: it is the only
+  // evidence that this row was mounted rather than denied by the loader's
+  // compatibility preflight. Failure to write it is not a guard failure, so the
+  // error is swallowed.
+  if ((config.receiptFile ?? '') !== '') {
+    try {
+      appendFileSync(config.receiptFile as string, new Date().toISOString()
+        + ' pid=' + String(process.pid) + ' guard: apply\n')
+    } catch {
+      /* a receipt is diagnostics, never a reason to fail a plugin load */
+    }
+  }
+
+  // schemastery's `.default()` fills these in for a loader-validated config, but
+  // a direct caller may omit them; resolve once here so the hot path reads plain
+  // booleans and numbers.
+  const enabled = config.enabled ?? true
+  const brakeReasoning = config.brakeReasoning ?? false
+  const announceMax = config.announceMax ?? 18
+  const announceGap = config.announceGap ?? 20
+  const announceCount = config.announceCount ?? 5
+  const echoMin = config.echoMin ?? 0.9
+  const maxContinues = config.maxContinues ?? 2
+  const warnAfterContinues = config.warnAfterContinues ?? 10
+  const hesitationNudge = config.hesitationNudge ?? true
+  const hesitationBudget = config.hesitationBudget ?? 2
+  const verbose = config.verbose ?? false
+  // -- merged, and new.
+  const streamGuard = config.streamGuard ?? true
+  const idleGuard = config.idleGuard ?? true
+  const idleBudget = config.idleBudget ?? 3
+  const minReasoningChars = config.minReasoningChars ?? 0
+  // ---- the six profile-facing switches, resolved once ----------------------
+  const jobOutputBound = config.jobOutputBound ?? true
+  const jobOutputMaxBytes = config.jobOutputMaxBytes ?? 12_000
+  const costLedger = config.costLedger ?? true
+  const costLedgerFile = (config.costLedgerFile ?? '') !== ''
+    ? (config.costLedgerFile as string)
+    : join(tmpdir(), 'dsh-guard', 'compaction-cost.jsonl')
+  const dedupeInjectionsOn = config.dedupeInjections ?? true
+  const suppressRepeatReads = config.suppressRepeatReads ?? false
+  const settleEnvelope = config.settleEnvelope ?? true
+  const settleEnvelopeHeadLines = config.settleEnvelopeHeadLines ?? 8
+  /** `read` stamps per session, keyed by session then by {@link rereadKey}. */
+  const readStamps = new Map<SessionId, Map<string, ReadStamp>>()
+
+  const retry = new RetryLedger({
+    enabled: config.retryEnabled ?? DEFAULT_RETRY_POLICY.enabled,
+    maxRetries: config.retryMax ?? DEFAULT_RETRY_POLICY.maxRetries,
+    delayMs: config.retryDelayMs ?? DEFAULT_RETRY_POLICY.delayMs,
+    codes: config.retryCodes ?? DEFAULT_RETRY_POLICY.codes,
+    onEmptyResponse: config.retryOnEmpty ?? DEFAULT_RETRY_POLICY.onEmptyResponse,
+    onDegenerateTurn: config.retryOnDegenerate ?? DEFAULT_RETRY_POLICY.onDegenerateTurn,
+  })
+
+  /** Per-session budgets. Keyed by id: the stream hook carries no Session object. */
+  const states = new Map<SessionId, SessionState>()
+  /** Brake recorded during a stream, consumed by the turn-stopping hook. */
+  const brakes = new Map<SessionId, BrakeRecord>()
+  /**
+   * The boundary token last injected on, per session.
+   *
+   * This is the shared state that removes duplicate injection. A turn boundary
+   * is identified by `turn:lastAssistantMessageId`; when the two guards were
+   * separate packages each decided on its own and a boundary the brake had
+   * already claimed could be claimed again by the turn-completion rule. One
+   * map, checked once at the top of the arbitration listener, is the whole
+   * mechanism — see `injected.get(sessionId) === boundary` below.
+   */
+  const injected = new Map<SessionId, string>()
+
+  const stateOf = (id: SessionId): SessionState => {
+    let state = states.get(id)
+    if (state === undefined) {
+      state = {
+        lastTurn: 0,
+        turnContinues: 0,
+        spentContinues: 0,
+        spentNudges: 0,
+        judged: '',
+        idleSteered: 0,
+        idleJudged: '',
+      }
+      states.set(id, state)
+    }
+    return state
+  }
+
+  const log = (...args: unknown[]): void => {
+    if (verbose) ctx.logger.info('[guard]', ...args)
+  }
+
+  ctx.on('llm/stream', (options, next) => {
+    const sessionId = options.sessionId
+    // A hand-built one-shot call has no session, so there is no turn to
+    // continue and no transcript to judge. Leave it entirely alone.
+    if (sessionId === undefined || !enabled) return next()
+
+    return (async function* guarded(): AsyncIterable<StreamChunk> {
+      /** Layer one, one announcement counter per channel. */
+      const announces: Record<Channel, AnnounceGuard> = {
+        text: new AnnounceGuard(announceGap, announceCount, announceMax),
+        reasoning: new AnnounceGuard(announceGap, announceCount, announceMax),
+      }
+      /** Layer two R1, one recycling counter per channel. */
+      const repeats: Record<Channel, RepeatGuard> = {
+        text: new RepeatGuard(),
+        reasoning: new RepeatGuard(),
+      }
+      /** Layer two R2, shared: it compares the text channel against the reasoning one. */
+      const echoes = new EchoGuard(echoMin)
+      /**
+       * Open block indexes and their kind, so a brake knows exactly which blocks
+       * it must close and whether closing them is safe at all.
+       */
+      const open = new Map<number, Channel | 'tool-call' | 'other'>()
+      /**
+       * Block indexes in first-seen stream order.
+       *
+       * The replay envelope is aligned to this order, not to the indexes
+       * themselves (`llm/src/types.ts:407-415`), so a rebuilt envelope has to be
+       * assembled against it rather than against a sorted index list.
+       */
+      const blockOrder: number[] = []
+      /**
+       * Text the brake truncated, per block index.
+       *
+       * Only truncated *reasoning* blocks need this: their signatures are
+       * rewritten from it. A truncated text block keeps its signature, which is
+       * id-only and takes its text from the block.
+       */
+      const truncated = new Map<number, string>()
+      /**
+       * The upstream replay envelope, captured from the `finish` chunk.
+       *
+       * A braked stream discards the upstream tail, but the `finish` still
+       * arrives and still carries the envelope — the signature the provider
+       * would replay. Capturing it is what lets the brake rewrite it instead of
+       * forfeiting it.
+       */
+      let envelope: unknown
+      /**
+       * Text actually published per block index.
+       *
+       * A synthesized `block-end` must carry what the consumer already received:
+       * the assembler treats the payload as authoritative and ignores deltas
+       * after a close (`llm/src/assembler.ts:81`), so a payload disagreeing with
+       * the live stream would make the settled message differ from what the user
+       * watched arrive.
+       */
+      const streamed = new Map<number, string>()
+      /** Upstream usage, kept so a brake does not silently drop accounting. */
+      let usage: StreamChunk | null = null
+      /** Once a brake fires, the rest of the upstream stream is discarded. */
+      let braked = false
+      /** The brake produced by this stream, if any. */
+      let record: BrakeRecord | null = null
+
+      /** A delta chunk, the only kind the guard reads or rewrites. */
+      type DeltaChunk = Extract<StreamChunk, { type: 'text-delta' | 'reasoning-delta' }>
+
+      /** Append published text and hand the chunk to the consumer. */
+      function* publish(chunk: DeltaChunk, text: string): Generator<DeltaChunk> {
+        if (text === '') return
+        streamed.set(chunk.index, (streamed.get(chunk.index) ?? '') + text)
+        yield { ...chunk, text }
+      }
+
+      /**
+       * Whether a block that a brake must not disturb is open.
+       *
+       * A half-open tool call assembles to nothing
+       * (`llm/src/assembler.ts:113-118`) and an unknown block type throws outright
+       * (`:119`), so braking would corrupt the step rather than shorten the
+       * answer. Every rule defers while this is true; each is monotone, so the
+       * verdict is re-offered and nothing is lost by waiting.
+       *
+       * @returns true when a non-text block is open.
+       */
+      function blocking(): boolean {
+        for (const kind of open.values()) {
+          if (kind !== 'text' && kind !== 'reasoning') return true
+        }
+        return false
+      }
+
+      /**
+       * Judge all three rules over one delta.
+       *
+       * Fed the **raw** delta rather than published text: none of these rules
+       * holds anything back, so a verdict is about content the stream has already
+       * produced and is independent of what the consumer has been handed.
+       *
+       * @param target - the channel the delta belongs to.
+       * @param text - the delta itself.
+       * @returns the brake to apply, or `null` to keep streaming.
+       */
+      function judge(target: Channel, text: string): BrakeRecord | null {
+        if (blocking()) return null
+        // R2 first: it is the only rule that reads both channels, so it must see
+        // each delta before either per-channel rule can end the stream.
+        if (target === 'reasoning') echoes.feedReasoning(text)
+        else {
+          const ev = echoes.feedText(text)
+          if (ev !== null) {
+            return { channel: target, kind: 'echo', count: ev.lines, span: 0, opener: '' }
+          }
+        }
+        const rv = repeats[target].feed(text)
+        if (rv !== null) {
+          return { channel: target, kind: 'repeat', count: rv.lines, span: rv.distinct, opener: '' }
+        }
+        const av = announces[target].feed(text)
+        if (av !== null) {
+          // The verdict names which vocabulary completed the run, and the channel
+          // decides whether that vocabulary's evidence is strong enough here. The
+          // counter is deliberately not reset when a run is inadmissible: the run is
+          // real, it is the *remedy* that differs by channel, and a later intent hit
+          // completes the same run and brakes normally.
+          if (target === 'text' || brakeReasoning || av.kind === 'intent') {
+            return { channel: target, kind: 'announce', count: av.count, span: 0, opener: av.opener }
+          }
+        }
+        return null
+      }
+
+      for await (const chunk of next()) {
+        // After a brake the upstream tail is degenerate by construction, so it is
+        // discarded wholesale — but the terminal frames still have to be rebuilt
+        // here, because the grammar requires a `finish` and forbids leaving a
+        // block open (`llm/src/invariant.ts:75-83`).
+        if (braked) {
+          if (chunk.type === 'usage') usage = chunk
+          else if (chunk.type === 'finish') {
+            // The upstream finish still carries the provider's replay envelope,
+            // even though its text was discarded. Capture it before rebuilding:
+            // it is the only source of the per-block signatures.
+            if (chunk.replayState !== undefined) envelope = chunk.replayState
+            // Close exactly the blocks this brake cut, from their published text,
+            // in index order. Nothing was held back, so `streamed` is what the
+            // consumer received and the only faithful source for the payload.
+            for (const [index, kind] of [...open.entries()].sort((a, b) => a[0] - b[0])) {
+              // Unreachable backstop. `braked` implies every open block is text or
+              // reasoning: `judge()` refuses to brake while `blocking()` is true —
+              // while any open value is neither — and a braked stream discards
+              // block-starts instead of recording them, so `open` cannot gain such an
+              // entry afterwards. Kept because that invariant spans two functions.
+              /* v8 ignore next -- see the invariant above. */
+              if (kind !== 'text' && kind !== 'reasoning') continue
+              const text = streamed.get(index) ?? ''
+              if (kind === 'reasoning') truncated.set(index, text)
+              yield {
+                type: 'block-end',
+                index,
+                block: kind === 'text' ? { type: 'text', text } : { type: 'reasoning', text },
+              }
+            }
+            open.clear()
+            if (usage !== null) yield usage
+            // Emitted as a normal `stop`. It is not an error: the loop would treat
+            // `error` as a failed attempt and re-run its retry ladder over the
+            // same request. The turn continues through the steering below.
+            //
+            // The replay envelope is rebuilt rather than dropped, and the reason
+            // is the asymmetry between the two signature kinds:
+            //
+            // - A **text** signature is `{v:1, id}` — measured, 3570 of them, none
+            //   carrying text — so pi-ai takes the text from the block
+            //   (`openai-responses-shared.js:156-161`). The published text is
+            //   what reaches the wire, with the original item id intact.
+            // - A **reasoning** signature is replayed *verbatim*: pi-ai pushes the
+            //   stored item and ignores the block text entirely
+            //   (`openai-responses-shared.js:137-141`). Passing the original
+            //   through would re-send the very loop that was braked, so it is
+            //   rewritten to describe what was published — see `signature.ts`.
+            //
+            // `rebuildBrakedEnvelope` returns `undefined` for any signature shape
+            // this build does not recognise, and the envelope is then dropped
+            // entirely. That degrades this one assistant message to
+            // provider-neutral history (`llm-pi-ai/src/replay.ts:251`,
+            // `llm-deepseek/src/protocols/messages/replay.ts:49`), which keeps the
+            // recovered prefix in the transcript — verified: the next request
+            // carries it as an unsigned `thinking` block. Guessing at an unknown
+            // shape is never an option: a wrong signature silently ships the loop.
+            const rebuilt = rebuildBrakedEnvelope(envelope, blockOrder, truncated)
+            yield rebuilt === undefined
+              ? { type: 'finish', reason: { kind: 'stop' } }
+              : { type: 'finish', reason: { kind: 'stop' }, replayState: rebuilt as never }
+          }
+          continue
+        }
+
+        if (chunk.type === 'block-start') {
+          blockOrder.push(chunk.index)
+          open.set(chunk.index, chunk.blockType === 'text' || chunk.blockType === 'reasoning'
+            ? chunk.blockType
+            : chunk.blockType === 'tool-call' ? 'tool-call' : 'other')
+          yield chunk
+          continue
+        }
+
+        if (chunk.type === 'block-end') {
+          open.delete(chunk.index)
+          yield chunk
+          continue
+        }
+
+        if (chunk.type === 'text-delta' || chunk.type === 'reasoning-delta') {
+          const channel: Channel = chunk.type === 'text-delta' ? 'text' : 'reasoning'
+          const brake = judge(channel, chunk.text)
+          if (brake !== null) {
+            record = brake
+            braked = true
+            log('brake', channel, 'rule', brake.kind, brake.kind === 'announce'
+              ? `${brake.count} hits, last ${JSON.stringify(brake.opener)}`
+              : brake.kind === 'echo'
+                ? `${brake.count} lines restated`
+                : `${brake.count} lines, ${brake.span} distinct`)
+          }
+          // Nothing is withheld, so the delta that completed the pattern is
+          // published like any other: the brake stops the run growing, it does
+          // not retract what the user has already been shown.
+          yield* publish(chunk, chunk.text)
+          continue
+        }
+
+        if (chunk.type === 'usage') {
+          // Forwarded immediately, and deliberately *not* recorded as pending: a
+          // usage chunk that arrived before the brake was already emitted, and
+          // re-sending it at `finish` would trip the once-only rule
+          // (`llm/src/invariant.ts:71`).
+          yield chunk
+          continue
+        }
+
+        if (chunk.type === 'finish') {
+          // Only a stream that never braked reaches here; a braked one is
+          // terminated in the `braked` branch above.
+          yield chunk
+          continue
+        }
+
+        yield chunk
+      }
+
+      // Publish the brake once the stream has settled, so the turn boundary sees
+      // a record only for a stream that really was cut.
+      if (record !== null) brakes.set(sessionId, record)
+    })()
+  })
+
+  /**
+   * The automatic-retry fallback tier.
+   *
+   * `next()` runs first and unconditionally: the shipped policy
+   * (`@deepseek-ai/dsh-llm-retry`) owns every failure it already handles, and
+   * this tier speaks only when that chain comes back without a retry — either
+   * because the code is outside its `retryableCodes`, or because its own
+   * `maxRetries` is spent (`dsh-llm-retry/lib/index.js:215-223`).
+   *
+   * There is no interaction with `repeat-tool-reminder`: that guard watches
+   * `tools/post-execute` for a tool called the same way N times and injects a
+   * reminder into the transcript. It never retries a request and never sees
+   * this event. The two share no state and cannot double-fire.
+   *
+   * Ordering note: this listener is registered after the shipped policy, and a
+   * cordis waterfall runs outermost-first, so this one is *inner*. When the
+   * shipped policy decides to retry on its own it never calls `next()` and this
+   * listener is not reached at all — which is the intended delegation, not a
+   * bug. That is also why a failure recovered upstream leaves no line here.
+   */
+  ctx.on('agent/request-error', async (payload, next): Promise<RequestErrorAction> => {
+    if (!enabled) return next()
+    const downstream = await next()
+    if (downstream?.kind === 'retry') return downstream
+    const sessionId = payload.agent.session.id
+    const verdict = retry.decideRequestFailure(sessionId, payload.failure.code)
+    if (verdict.kind === 'decline') {
+      log('request-error: fallback declined on', payload.failure.code, '—', verdict.reason)
+      return downstream
+    }
+    if (!await cancellableDelay(verdict.delayMs, payload.signal)) return downstream
+    retry.spend(sessionId)
+    log('request-error: fallback retry', verdict.attempt, '/', retry.limit,
+      'on', payload.failure.code, 'after', verdict.delayMs, 'ms')
+    return { kind: 'retry' }
+  })
+
+  /**
+   * The arbitration point: one listener for four rules that used to live in two
+   * packages, and at most one injected message per turn boundary.
+   *
+   * Until the merge, `stream-guard` and `idle-guard` each registered their own
+   * listener here. Neither returns a value, so cordis's serial dispatch never
+   * bailed and both ran on every boundary — which is why the worst case was
+   * 2 + 3 = 5 injected messages for one failure: up to `maxContinues` brake
+   * continuations plus up to `idleBudget` idle continuations, and semantically
+   * the same instruction in each. Both listeners also read the same
+   * `deriveMessages().at(-1)`, so the waste was visible in the transcript.
+   *
+   * The rules are evaluated in a fixed order and the first admissible one
+   * claims the boundary:
+   *
+   * 1. brake continuation (the streaming guard's remedy),
+   * 2. empty-response recovery (the automatic-retry tier),
+   * 3. idle continuation (the turn-completion guard's remedy),
+   * 4. hesitation nudge.
+   *
+   * Every rule keeps its own trigger condition and its own budget. Nothing is
+   * loosened: `maxContinues` is still per turn and still 2, `idleBudget` is still
+   * per session and still 3, `hesitationBudget` is still per session and still 2.
+   * What changes is only that a rule which loses the boundary does not also
+   * inject, and does not spend its budget doing nothing.
+   *
+   * One deliberate non-deduplication: when the brake's per-turn allowance is
+   * already spent, rule 1 falls through rather than returning. With the two
+   * packages mounted side by side the turn-completion guard ran its own listener
+   * at that boundary and still had its say; the merge preserves that, and removes
+   * only the duplicate injection on a boundary the brake did claim.
+   */
+  ctx.on('agent/turn-stopping', async ({ agent, turn, signal }) => {
+    if (!enabled) return
+
+    const session = agent.session
+    const sessionId = session.id
+    const state = stateOf(sessionId)
+    // The per-turn allowance is keyed on the turn number, not reset on every
+    // step: a steered continuation re-enters `preStep` within the *same* turn
+    // (`agent-loop/src/agent.ts:316-322`), so a per-step reset would hand the
+    // turn an unlimited supply of continuations.
+    if (state.lastTurn !== turn) {
+      state.lastTurn = turn
+      state.turnContinues = 0
+    }
+
+    // ---- SHARED STATE: one boundary token, one injection -------------------
+    //
+    // The token is `turn:lastAssistantMessageId`. Steering produces a new
+    // assistant message, so the next boundary of the same turn has a different
+    // token and is free again; two rules evaluating the *same* boundary see the
+    // same token and the second one is skipped. That is the entire dedup
+    // mechanism, and it is why the merge is one map rather than one rule
+    // learning about another.
+    const messages = session.deriveMessages()
+    const last = messages.at(-1)
+    const assistant = last !== undefined && last.role === 'assistant' ? last : undefined
+    const boundary = String(turn) + ':' + (assistant?.id ?? 'none')
+    if (injected.get(sessionId) === boundary) {
+      log('boundary', boundary, 'already claimed; skipping a duplicate injection')
+      return
+    }
+    /** Claim this boundary, so no later rule on it may inject again. */
+    const claim = (): void => { injected.set(sessionId, boundary) }
+
+    // ---- candidate 1: the brake continuation -------------------------------
+    const record = brakes.get(sessionId)
+    if (record !== undefined) {
+      brakes.delete(sessionId)
+      // Only the per-turn allowance stops steering. There is deliberately no
+      // session-wide cap: when one existed, a session that spent it kept getting
+      // braked but was never steered again, and because the only durable record
+      // is the continuation message itself, that state was invisible in the
+      // transcript — the turn just ended mid-thought. Past
+      // `warnAfterContinues` the wording escalates instead of the guard giving up.
+      if (state.turnContinues >= maxContinues) {
+        log('continuation budget exhausted for turn', turn)
+        // Falls through to the rules below on purpose — see the note above.
+      } else if (streamGuard) {
+        state.turnContinues += 1
+        state.spentContinues += 1
+        const warn = state.spentContinues > warnAfterContinues
+
+        const wording = wordingForAgent(session)
+      // Steering here is what keeps the turn alive: the machine re-reads its
+      // inbox at this boundary and runs another step when fresh work is present
+      // (`agent-loop/src/agent.ts:316-322`).
+      //
+      // The summary carries the diagnosis, not just the fact, because it is the
+      // only durable evidence the guard leaves. `ctx.logger` output goes to a
+      // 1000-message in-memory ring buffer that no shipped profile persists
+      // (`vendor/cordis/src/logger.ts:213`), so a person screening a session
+      // afterwards can read this line and nothing else. Naming the rule and the
+      // channel here is what makes "why was my answer cut?" answerable without
+      // reproducing the episode.
+      //
+      // No resume hint is attached, and that is deliberate rather than an
+      // omission: nothing was held back, so there is no cut point to name. The
+      // text the model wrote is in the transcript verbatim, and the plain
+      // instruction to continue without repeating is what the measured wording
+      // already says.
+      agent.steer(
+        createUserMessage({
+          content: [{
+            type: 'text',
+            text: warn ? wording.continue + wording.continueWarning : wording.continue,
+          }],
+          source: {
+            kind: name,
+            form: 'notice',
+            // 0.1.7 made the notice bound a published contract
+            // (`dsh-llm/lib/types/message.d.ts:109-120`), and the brake summary
+            // is the one this package builds from measured counts, so it goes
+            // through the bound like every shipped 0.1.7 producer's does.
+            summary: boundContextSummary(`${name}: braked ${record.kind} on ${record.channel}`
+              + (record.kind === 'announce' ? ` (${record.count} announcements)`
+                : record.kind === 'echo' ? ` (${record.count} lines restated)`
+                  : ` (${record.count} lines, ${record.span} distinct)`)
+              + (warn ? ` [continuations ${state.spentContinues} > ${warnAfterContinues}]` : '')),
+          },
+        }),
+      )
+      claim()
+      log('continuation steered', state.turnContinues, '/', maxContinues,
+        warn ? `(warned, ${state.spentContinues} total)` : '', 'on', record.channel)
+      return
+      }
+    }
+
+    // ---- candidate 2: empty-response recovery (automatic retry) ------------
+    if (assistant !== undefined && isEmptyCompletion(assistant.content)) {
+      const verdict = retry.decideTurnRecovery(sessionId, 'empty')
+      if (verdict.kind === 'retry') {
+        if (!await cancellableDelay(verdict.delayMs, signal)) return
+        retry.spend(sessionId)
+        claim()
+        agent.steer(
+          createUserMessage({
+            content: [{ type: 'text', text: wordingForAgent(session).empty }],
+            source: {
+              kind: name,
+              form: 'notice',
+              summary: boundContextSummary(name + ': empty response ('
+                + verdict.attempt + '/' + retry.limit + ')'),
+            },
+          }),
+        )
+        log('empty-response recovery steered', verdict.attempt, '/', retry.limit)
+        return
+      }
+      log('empty-response recovery declined:', verdict.reason)
+    }
+
+    // ---- candidate 3: the turn-completion continuation ---------------------
+    //
+    // The conditions are `idle-guard`'s, unchanged: per-session budget first,
+    // then one nudge per distinct assistant message, then the rule itself. The
+    // only edit is that the budget test is in the condition rather than an early
+    // `return`, so a turn whose idle budget is spent still reaches the hesitation
+    // rule — which is what the two-package layout did.
+    if (idleGuard
+      && state.idleSteered < idleBudget
+      && assistant !== undefined
+      && state.idleJudged !== assistant.id
+      && isIdleCompletion(assistant.content, minReasoningChars)) {
+      state.idleJudged = assistant.id
+      state.idleSteered += 1
+      claim()
+    agent.steer(
+      createUserMessage({
+        content: [{ type: 'text', text: wordingForAgent(session).idle }],
+        source: {
+          kind: name,
+          form: 'notice',
+          summary: `${name}: turn ended on reasoning alone (`
+            + state.idleSteered + '/' + idleBudget + ')',
+        },
+      }),
+    )
+      log('steered an idle continuation', state.idleSteered, '/', idleBudget)
+      return
+    }
+
+    // ---- candidate 4: the hesitation nudge ---------------------------------
+    // Hesitation is judged here rather than in `preStep` because a turn that
+    // completed in one step never reaches another `preStep`: it ends. Steering
+    // at this boundary is what buys the nudge a request to ride on, which is the
+    // reference's "inject on the next request" semantics.
+    if (!hesitationNudge) return
+    if (state.spentNudges >= hesitationBudget) return
+
+    // The transcript tail is what the rule reads, and the last assistant message
+    // is what it judges. A turn with no assistant message has nothing to judge.
+    if (assistant === undefined) return
+    const verdict = judgeHesitation(
+      assistant.content.map(part => (part.type === 'text' ? part.text : '')).join(''),
+    )
+    if (verdict === null) return
+    // One nudge per distinct transcript: without this the nudge's own turn would
+    // be judged and nudged again, which is the 61-request feedback loop the
+    // reference hit.
+    if (state.judged === assistant.id) return
+    state.judged = assistant.id
+
+    state.spentNudges += 1
+    log('hesitation nudge', verdict.hits, '/', verdict.lines)
+    agent.steer(
+      createUserMessage({
+        content: [{ type: 'text', text: wordingForAgent(agent.session).hesitation }],
+        source: {
+          kind: name,
+          form: 'notice',
+          // Same reasoning as the brake summary: this is the durable evidence, so
+          // it carries the measurement that justified the nudge. Bounded for the
+          // same reason the brake summary is (`dsh-llm/lib/types/message.d.ts:109-120`).
+          summary: boundContextSummary(`${name}: hesitation churn (${verdict.hits}/${verdict.lines} lines, `
+            + `share ${verdict.share.toFixed(2)})`),
+        },
+      }),
+    )
+  })
+
+
+  // ---- item 1: bound the logged copy of an oversized job_output ------------
+  //
+  // Registered on the PTC dispatch log rather than on `tools/post-execute`:
+  // post-execute's decision is refolded into the result the model sees, and
+  // rewriting that would change the value `run_code` hands back to the calling
+  // program. This seam owns only the copy that reaches the transcript
+  // (`dsh-tools/lib/index.js:706-714`), so the bound costs the program nothing.
+  //
+  // The listener never throws. `shapeDispatchLog` contains a thrown listener and
+  // logs the original content instead (`:710-713`), so a throw here would
+  // silently disable the bound rather than fail the dispatch.
+  ctx.on('tools/ptc-dispatch-log', async (dispatch, next) => {
+    const content = await next()
+    if (!enabled || !jobOutputBound) return content
+    const outcome = boundJobOutput(
+      {
+        exec: {
+          callId: dispatch.subCallId,
+          ...dispatch.exec.agent === undefined
+            ? {}
+            : { agent: { id: dispatch.exec.agent.session.id } },
+        },
+        ...dispatch.agent === undefined ? {} : { agent: dispatch.agent },
+        subCallId: dispatch.subCallId,
+        name: dispatch.name,
+        isError: dispatch.isError,
+        content,
+      },
+      { enabled: true, maxBytes: jobOutputMaxBytes, spillRoot: '' },
+    )
+    if (!outcome.bounded) return content
+    log('job_output bounded:', outcome.totalBytes, '->', outcome.keptBytes, 'bytes;',
+      outcome.spillPath ?? '(spill unavailable)')
+    return [...outcome.content]
+  }, { prepend: true })
+
+  // ---- item 2: the compaction cost ledger ---------------------------------
+  //
+  // `session/event` is a post-commit observer (`dsh-tool-cordis/lib/types/api-
+  // catalog.js:4132-4137`: "callbacks run after it", no return value). That is
+  // all this needs: the numbers are already in the committed event, and an
+  // observer cannot fail the append it is reading.
+  ctx.on('session/event', (session, event: ObservedSessionEvent) => {
+    if (!enabled || !costLedger) return
+    if (event.type !== 'compaction/summary') return
+    const data = (event.data ?? {}) as Record<string, unknown>
+    const written = appendLedger(
+      { enabled: true, file: costLedgerFile },
+      ledgerLine(String(session.id), {
+        compactionId: data.compactionId,
+        shadowedTokenCount: data.shadowedTokenCount,
+        shadowedSeqs: data.shadowedSeqs,
+        provider: data.provider,
+        model: data.model,
+        maxTokens: data.maxTokens,
+        usage: data.usage,
+      }, new Date()),
+    )
+    if (!written) log('cost ledger not written; check the path for', costLedgerFile)
+  })
+
+  // ---- items 3, 5, 6: one listener on `agent/pre-step` ---------------------
+  //
+  // One registration for all three, deliberately. The contract says the
+  // waterfall's returned value is authoritative
+  // (`api-catalog.js:3764-3769`: "Reject a proposed step or replace the messages
+  // that enter it"), so two listeners on this seam would each rebuild the array
+  // from `next()` and the later one would silently undo the earlier one's edit.
+  // Items 3 and 5 therefore have to be the same edit, and item 6 rides along
+  // because it is the same rewrite of the same message.
+  //
+  // `{ prepend: true }` matches the shipped `disposeNotice` listener
+  // (`dsh-agent/lib/index.js:204`): ours runs outermost, so the messages it
+  // returns are the ones `disposeNotice` then appends to, and neither can
+  // discard the other's work.
+  ctx.on('agent/pre-step', async ({ messages }, next) => {
+    const decision = await next()
+    if (decision.kind === 'reject') return decision
+    const nextMessages = decision.kind === 'enter' ? decision.messages : messages
+    if (!enabled) return decision
+
+    let working = nextMessages
+
+    // item 5 + 6: envelope a settled child's closing message, before the first
+    // commit. Only the content changes; `id`, `role`, and `source` are kept
+    // verbatim, because the inbox's identity check is on the id
+    // (`dsh-agent-loop/lib/index.js:41-45`) and a rewritten source would make
+    // the same settlement look like a different event to every consumer.
+    if (settleEnvelope) {
+      let touched = 0
+      working = working.map(message => {
+        const replacement = envelopeContent(message, {
+          enabled: true, headLines: settleEnvelopeHeadLines,
+        })
+        if (replacement === undefined) return message
+        touched += 1
+        return { ...message, content: replacement }
+      })
+      if (touched > 0) log('settle envelope applied to', touched, 'message(s)')
+    }
+
+    // item 3: drop only byte-identical repeats of a body from the same producer.
+    if (dedupeInjectionsOn) {
+      const outcome = dedupeInjections(working, { enabled: true })
+      if (outcome.dropped.length > 0) {
+        log('dropped', outcome.dropped.length, 'byte-identical repeat injection(s)')
+        working = outcome.messages
+      }
+    }
+
+    if (working === nextMessages) return decision
+    return { ...decision, messages: working }
+  }, { prepend: true })
+
+  // ---- item 4: a second identical read answers with a pointer --------------
+  //
+  // Unlike every other bound in this package this one DOES change what the model
+  // sees: `dsh-tools` refolds an `accept` decision's content into the result.
+  // That is the point — the whole saving is not sending bytes the transcript
+  // already carries — and it is why the switch defaults to off.
+  //
+  // The listener runs `next()` first and only rewrites a successful result: a
+  // failed read keeps its error text, because a pointer is not a diagnosis.
+  ctx.on('tools/post-execute', async (exec, result, next) => {
+    const decision = await next()
+    if (!enabled || !suppressRepeatReads) return decision
+    if (exec.name !== 'read') return decision
+    if (decision.kind !== 'accept') return decision
+    if (result.isError) return decision
+    const sessionId = exec.agent?.session.id as SessionId | undefined
+    if (sessionId === undefined) return decision
+    let stamps = readStamps.get(sessionId)
+    if (stamps === undefined) {
+      stamps = new Map<string, ReadStamp>()
+      readStamps.set(sessionId, stamps)
+    }
+    const verdict = suppressRepeatRead(exec.name, exec.arguments, stamps, { enabled: true })
+    if (verdict.record !== undefined) {
+      const key = rereadKey(exec.arguments)
+      if (key !== undefined) stamps.set(key, verdict.record)
+    }
+    if (!verdict.suppress || verdict.text === undefined) {
+      if (verdict.reason !== undefined) log('repeat-read not suppressed:', verdict.reason)
+      return decision
+    }
+    const target = (exec.arguments as { file_path?: unknown } | null)?.file_path
+    log('repeat read answered with a pointer for', typeof target === 'string' ? target : '(unnamed)')
+    return { kind: 'accept', content: [{ type: 'text', text: verdict.text }] }
+  }, { prepend: true })
+}

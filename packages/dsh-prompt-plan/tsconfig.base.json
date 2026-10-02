@@ -1,0 +1,30 @@
+{
+  // This package builds standalone from node_modules: every `@deepseek-ai/*`
+  // import resolves through the package's own dependencies, so this file keeps
+  // the compiler options the package needs and declares no `paths`. A repo
+  // checkout replaces this with the workspace-wide resolution facade; a
+  // published or cloned copy must not depend on one.
+  "compilerOptions": {
+    "target": "es2024",
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "declaration": true,
+    "sourceMap": true,
+    "declarationMap": true,
+    "composite": true,
+    "incremental": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": true,
+    "verbatimModuleSyntax": false,
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "types": ["node"]
+  }
+}

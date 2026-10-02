@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Plan tree",
+    "description": "Model-facing plan-tree tools: declare the whole tree once, then walk one node at a time, with the right Sidebar drawing the live plan."
+  }
+}

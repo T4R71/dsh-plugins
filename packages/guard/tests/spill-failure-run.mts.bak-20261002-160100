@@ -1,0 +1,46 @@
+/**
+ * The real test of the un-writable-spill path: a run whose `tmpdir()` names a
+ * path nothing can be written under, so `writeSpill` fails on the filesystem and
+ * the fidelity rule has to hand the parent the child's closing message untouched.
+ *
+ * It is not part of `npm test` directly, and that is deliberate. `node:os` is a
+ * builtin: its `tmpdir` cannot be redefined from a test file, and `mock.module`
+ * refuses to redefine a builtin's exports. The only way in is source
+ * substitution, so `spill-failure-child.mts` copies this file and the two modules
+ * it exercises into a temporary directory, redirects their `node:os` import to a
+ * shim, and runs the copy with `node --test`. The failure that copy reaches is the
+ * production one — `mkdirSync` inside `writeSpill` refusing — not a stubbed
+ * return, and `hooks.spec.ts` asserts on that run.
+ *
+ * In the copied directory the imports below resolve to the copies, which is the
+ * point: the code under this test is the code that ships.
+ *
+ * @module @t4r71/dsh-guard/tests
+ */
+
+import assert from 'node:assert/strict'
+import { test } from 'node:test'
+
+import { envelopeContent } from './envelope.ts'
+import { spillDirectory, writeSpill } from './spill.ts'
+
+test('writeSpill reports the failure instead of throwing', () => {
+  assert.equal(writeSpill(spillDirectory('settle', 'child-1'), 'x.md', 'y'), undefined)
+})
+
+test('no spill, no envelope: the closing message is handed over whole', () => {
+  const closing = '## 结论\nshipped\n\n## 证据\nsrc/a.ts:12'
+  const message = {
+    id: 'm1',
+    role: 'user',
+    content: [
+      { type: 'text', text: 'Background subagent child-1 finished.' },
+      { type: 'text', text: 'Its closing message:' },
+      { type: 'text', text: closing },
+    ],
+    source: { kind: 'subagent-settled', form: 'notice', summary: 's', senderSessionId: 'child-1' },
+  }
+  assert.equal(envelopeContent(message as never, { enabled: true, headLines: 8, gistChars: 200 }), undefined)
+  assert.equal(envelopeContent(message as never, { enabled: true, headLines: 8 }), undefined)
+  assert.equal(message.content[2].text, closing, 'the child\'s words survive intact')
+})

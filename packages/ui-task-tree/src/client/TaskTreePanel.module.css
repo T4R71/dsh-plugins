@@ -17,4 +17,12 @@
 
 .scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden; }
 
+/* 取不到文档时的说明。与空态文案同一处位置，但说的是另一件事：
+   「这份 profile 没有把宿主的计划存储组合进来」，不是「还没有计划」。 */
+.message {
+  margin: 0; padding: 12px;
+  font-size: 12px; line-height: 18px;
+  color: var(--dsw-alias-label-secondary, #6b6f76);
+}
+
 .tabTitle { font-size: 12px; }

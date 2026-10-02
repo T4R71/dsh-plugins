@@ -1,0 +1,55 @@
+{
+  "name": "@t4r71/dsh-mermaid-ui",
+  "version": "0.1.0",
+  "publishConfig": {
+    "access": "public"
+  },
+  "description": "把 ```mermaid 围栏块在 DSH Web GUI 里渲染成 SVG 的客户端插件：核心渲染器没有 mermaid，这里用 DOM 后处理接管，自带 mermaid 运行体。",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./lib/types/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "types": "./lib/types/client/index.d.ts",
+      "default": "./lib/client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "inject": [],
+      "platform": "web"
+    }
+  },
+  "files": [
+    "lib/index.js",
+    "lib/client.js",
+    "lib/types/**/*.d.ts",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -b tsconfig.json && tsdown"
+  },
+  "license": "MIT",
+  "author": "T4R71 <T4R71@outlook.com>",
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "cordis",
+    "client-plugin",
+    "mermaid",
+    "diagram"
+  ],
+  "dependencies": {
+    "mermaid": "^11.17.2"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.4",
+    "tsdown": "^0.22.2",
+    "typescript": "^6.0.3"
+  },
+  "main": "lib/index.js",
+  "types": "lib/types/index.d.ts"
+}

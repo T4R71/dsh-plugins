@@ -31,7 +31,11 @@ packages/<plugin>-ui/     客户端半边（可选）
 ## 版本与 peer 锚
 
 - 每个包**独立 semver**，从 `0.1.0` 起。
-- 目标 DSH 版本写在该包自己的 `peerDependencies` 里，钉精确版本（例如 `"@deepseek-ai/dsh-tools": "0.1.7-rc.2"`），**不要用 `^` 或 `*`**。
+- 目标 DSH 版本写在该包自己的 `peerDependencies` 里，`@deepseek-ai/dsh-*` 必须写成**范围**（例如 `"^0.1.6-alpha.2"`），**不要钉精确版本**，也不要用 `*`。
+- 理由（0.1.7 新增的装载闸门，实测于 runtime `0.1.7-rc.2`）：`dsh-app-boot` 在把 profile 行交给 Loader 之前逐行做兼容性预检，判定是 `semver.satisfies(runtimeVersion, requirement, { includePrerelease: true })`，只对 `@deepseek-ai/dsh` 与 `@deepseek-ai/dsh-*` 生效；判 false 的行被**静默 `disabled`**，只在 stderr 留一行，插件不报错也不加载。**闸门按 profile 行触发，与包是否声明 `dsh.bundle.patch` 无关**（预检对每一行读 `package.json` 的 `peerDependencies`），所以「纯插件不受影响」这个旧假设不成立——精确版本号也是合法 semver range，但它只对那一个版本为真，别的运行版本一律判 false。实测（semver 7.8.5）：`0.1.7-rc.2` vs `0.1.6-alpha.2` → false；vs `^0.1.6-alpha.2` → true；vs `^0.1.7-rc.2` → true。
+  唯一豁免是 profile 目录下的 `compatibility.json`（`{ "<包名>@<精确版本>": ["<精确 runtime 版本>"] }`），它按**精确版本对**授权，不能表达范围，因此不能替代范围写法。
+- 范围下界取**该包实际适配过的 API 表面**，不是目标运行时版本：源码还是 0.1.6 的接口就先写 `^0.1.6-alpha.2`，等接口适配做完再抬到 `^0.1.7-rc.2`。写高了下界等于谎报适配完成。
+- 本仓当前的适配基准是 `0.1.7-rc.2`：接口适配完成、且 `build` + `typecheck` 对 0.1.7-rc.2 目标 0 的包，`@deepseek-ai/dsh-agent` / `dsh-llm` / `dsh-session` 三条下界写 `^0.1.7-rc.2`。**只声明实际验证过的版本**——没适配到 0.1.7 的包保留原下界，不得跟着抬（抬了就是谎报）。`packages/{stream-guard,idle-guard}` 已按此抬到 `^0.1.7-rc.2`。
 - 例外：`@deepseek-ai/cordis` 用 `^4.0.4`、`@deepseek-ai/schemastery` 用 `^3.18.4`——它们的版本线独立于 DSH。
 - **兄弟包之间用 `workspace:^`**，不要写死版本号。
 - `package.json` 必须有 `publishConfig: { access: "public" }` 与带 `directory` 的 `repository`。
