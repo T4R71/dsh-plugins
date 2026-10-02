@@ -114,6 +114,7 @@ import {
   readRepoLayout,
   worktreeMatches,
   worktreeWorkflowNote,
+  type RepoLayout,
   type WorkUnit,
 } from './worktree.ts'
 import {
@@ -823,6 +824,30 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
     + '。绝不降级成 `--no-frozen-lockfile`：那会装上与主线不同的版本。\n' + output
 
   /**
+   * 起线时「以哪个仓为底」这一格读不出来时的报错文案。
+   *
+   * 这一格是踩出来的教训：**会话 cwd 不等于仓**。会话 header 里的 cwd 是宿主建会话时写死的
+   * 那一份，从 GUI 起的会话完全可以落在一个根本不是 git 仓的目录里 —— 那时
+   * `git rev-parse --show-toplevel` 失败，只把 git 的原文丢回去，看的人根本不知道
+   * 还有 `worktreeRepo` 这一格可以给，于是「隔离线一次都开不起来」这件事
+   * 从报错里读不出来。所以这里**指名要传哪个参数**，并把**本会话 cwd 到底是什么**写出来。
+   *
+   * 声明的路径不是仓时，报错同样点名 `worktreeRepo`（那多半是路径写错了，不是没给）。
+   * 两种情况都把 `readRepoLayout` 的原文附在最后一行，**不吞**。
+   * @param declared - 调用方声明的仓路径；没声明时为 undefined（那就退回会话 cwd）。
+   * @param cwd - 这条会话的 cwd。
+   * @param error - `readRepoLayout` 抛出的原始错误。
+   * @returns 报错文本。
+   */
+  const repoBaseFailure = (declared: string | undefined, cwd: string, error: unknown): string => {
+    const reason = error instanceof Error ? error.message : String(error)
+    return 'task worktree: ' + (declared === undefined
+      ? '这条隔离线要以一个 git 仓为底，但**本会话的 cwd** `' + cwd + '` 不在任何 git 仓库里 —— 请在这条 run 的派发里补上 `worktreeRepo: "<仓库路径>"`（仓库根、或仓内任意一个目录都行；它就是这条线以哪个仓为底的显式声明），只做只读调研、确实不该隔离的派发则显式传 `worktree: "-"` 关掉。'
+      : '`worktreeRepo` 声明的 `' + declared + '` 不是一个 git 工作区 —— 请把 `worktreeRepo` 写成一个真实仓库里的路径（仓库根、或仓内任意一个目录都行）。')
+      + '\n' + reason
+  }
+
+  /**
    * 起一条隔离线（同名就接回同一条），并断言它的依赖与主线一致。
    *
    * 两条路，先认第一条：
@@ -830,12 +855,20 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
    *     不重建。重试、续跑、自动线名都会走这里；依赖断言过过的才跳过重装；
    *   - 否则新建；检出没了而分支还在时 {@link createWorktree} 会把那条分支接回来 ——
    *     于是「名字撞了」永远不会变成一个再也派不出去的永久结局。
-   * @param spec - 线名、验证命令、意图与分叉点。
-   * @param cwd - 会话的工作目录（仓库根的搜索起点）。
+   * @param spec - 线名、验证命令、意图、分叉点，以及**这条线以哪个仓为底**。
+   * @param cwd - 会话的工作目录（没声明 `spec.repo` 时，它就是仓库根的搜索起点）。
    * @returns 这条线的账本记录。
    */
-  const startLine = async (spec: { readonly name: string; readonly verify?: string; readonly mergeVerify?: string; readonly goal?: string; readonly base?: string }, cwd: string): Promise<WorktreeRecord> => {
-    const layout = await readRepoLayout(cwd)
+  const startLine = async (spec: { readonly name: string; readonly verify?: string; readonly mergeVerify?: string; readonly goal?: string; readonly base?: string; readonly repo?: string }, cwd: string): Promise<WorktreeRecord> => {
+    // **这条线以哪个仓为底**：显式声明的优先；没声明才退回会话 cwd（老行为，一个字都不改）。
+    const declared = (spec.repo ?? '').trim()
+    let layout: RepoLayout
+    try {
+      // 搜索起点是**目录**而不是仓根也认：readRepoLayout 自己会 --show-toplevel 归一。
+      layout = await readRepoLayout(declared === '' ? cwd : declared)
+    } catch (error) {
+      throw new Error(repoBaseFailure(declared === '' ? undefined : declared, cwd, error))
+    }
     const verify = verifyCommandFor(spec.verify)
     const mergeVerify = mergeVerifyFor(spec.mergeVerify)
     const goal = goalFor(spec.goal)
@@ -895,7 +928,8 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
    * 第 3 档起线失败时**当场抛**，并在报错里附上关闸的写法：「默认就在主检出上跑」
    * 是这套纪律唯一不能有的出口。
    * @param parent - 发起这次派发的 Agent（借它读会话 cwd 与会话 id）。
-   * @param spec - 中枢声明的线名、这次派发的身份键、验证命令、意图与分叉点。
+   * @param spec - 中枢声明的线名、这次派发的身份键、验证命令、意图、分叉点，
+   *   以及**这条线以哪个仓为底**（`repo`；省略即会话 cwd，与不加这一格之前逐字一致）。
    * @returns 线记录，或 undefined（这次不隔离）。
    */
   const lineFor = async (
@@ -907,6 +941,7 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
       readonly mergeVerify?: string
       readonly goal?: string
       readonly base?: string
+      readonly repo?: string
     },
   ): Promise<WorktreeRecord | undefined> => {
     const cwd = sessionCwd(parent)
@@ -916,6 +951,7 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
       ...spec.mergeVerify === undefined ? {} : { mergeVerify: spec.mergeVerify },
       ...spec.goal === undefined ? {} : { goal: spec.goal },
       ...spec.base === undefined ? {} : { base: spec.base },
+      ...spec.repo === undefined ? {} : { repo: spec.repo },
     }, cwd)
     const declared = (spec.declared ?? '').trim()
     if (declared !== '') {
@@ -2067,6 +2103,7 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
       worktreeMergeVerify: { type: 'string', description: 'dispatch/run：合回之后要跑的**整套检查**（一整行 shell，例如全套测试 + typecheck）。省略则回落配置。一条线没有它就不能合回（fail-closed）。' },
       worktreeGoal: { type: 'string', description: 'dispatch/run：一句话说明这条线在干什么、别碰哪些文件；写进简报。省略则回落配置的 worktreeGoal。' },
       worktreeBase: { type: 'string', description: 'dispatch/run：分叉点（commit-ish），省略即主检出的 HEAD。' },
+      worktreeRepo: { type: 'string', description: 'dispatch/run：这条隔离线**以哪个仓为底**（一个 git 工作区里的路径：仓库根、或仓内任意一个目录，绝对路径最好）。省略即**本会话的 cwd** —— 会话 cwd 不在任何 git 仓库里时**必须**给这一格，否则起线当场被拒；那条报错里会写明本会话的 cwd 到底是什么。' },
       units: { type: 'array', items: { type: 'string' }, description: 'commit：这次提交汇总的**工作单元**（一个或多个）。一次提交可以装多个单元——粒度自己判断，不是 1:1。' },
       feature: { type: 'string', description: 'commit：`units` 的单数简写（只给一个单元时用它）。两者都给则以 units 为准。' },
       verifiedBy: { type: 'string', description: 'commit：**判断档**验证——谁检查过这次改动（中枢，或某个验证代理的会话 id）。与机械验证并存也行，只有它也行。' },
@@ -2283,6 +2320,8 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
             ...args.worktreeMergeVerify === undefined ? {} : { mergeVerify: args.worktreeMergeVerify },
             ...args.worktreeGoal === undefined ? {} : { goal: args.worktreeGoal },
             ...args.worktreeBase === undefined ? {} : { base: args.worktreeBase },
+            // **这条线以哪个仓为底**：只认调用方显式给的那一格；不给就还是会话 cwd（老行为）。
+            ...args.worktreeRepo === undefined ? {} : { repo: args.worktreeRepo },
           })
           const run: RunRecord = { id: args.run, createdAt: Date.now(), nodes, ...line === undefined ? {} : { worktree: line.name } }
           await ledger.store(sid, run)

@@ -14,9 +14,9 @@ import assert from 'node:assert/strict'
 import { allowToolSectionFilter, decodeDropDirective, encodeDropDirective, toolSectionsForFilter } from '../src/presets.ts'
 import { it } from 'node:test'
 import { apply, Config as TaskRowConfig, inject, type ResolvedConfig } from '../src/index.ts'
-import { existsSync, mkdtempSync, readdirSync, readFileSync as readFileSyncNode, writeFileSync as writeFileSyncNode } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync as readFileSyncNode, writeFileSync as writeFileSyncNode } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { RUN_NOTE_MAX, TASK_RUNS_FILE_ENV, TASK_RUNS_FILE_NAME, ledgerPathFor, runNodeWith, type RunNodeRecord } from '../src/session-store.ts'
 import { defineTool, type InferArgs, type ParameterJsonSchema, type ParameterSchemaSpec } from '@deepseek-ai/dsh-tools'
 // 隔离那一半的测试要真的建 git 仓：起线/复用/写穿检测都是 git 层面的行为，
@@ -2751,6 +2751,51 @@ function lineNames(file: string): string[] {
 }
 
 /**
+ * worktree 账本里某条线的**完整记录**：线名之外的那些字段（比如它是以哪个仓为底）只能从这里读。
+ * @param file - 账本文件路径。
+ * @param name - 线名。
+ * @returns 记录；文件不存在、读不动、没有这条线时是空对象。
+ */
+function lineRecord(file: string, name: string): Record<string, unknown> {
+  try {
+    const parsed = JSON.parse(readFileSyncNode(file, 'utf8')) as { worktrees?: unknown }
+    const items = parsed.worktrees
+    const record = isPlainRecord(items) ? items[name] : undefined
+    return isPlainRecord(record) ? record : {}
+  } catch {
+    return {}
+  }
+}
+
+/**
+ * 一个**不在任何 git 仓里**的临时目录 —— 本会话 cwd 的真实处境就是它。
+ *
+ * 前提不成立时当场断言失败，而不是让用例悄悄测到别的东西：TMP 万一整个落在某个仓里，
+ * 这条用例测的就不再是「cwd 不是仓」了，那时候红掉比绿掉诚实。
+ * @returns 目录的绝对路径。
+ */
+async function nonRepoDir(): Promise<string> {
+  const dir = mkdtempSync(join(tmpdir(), 'task-outside-repo-'))
+  const top = await git(dir, ['rev-parse', '--show-toplevel'])
+  assert.notEqual(top.code, 0, 'precondition: ' + dir + ' 必须不在任何 git 仓里')
+  return dir
+}
+
+/**
+ * 一次**必须失败**的调用的报错对象。
+ * @param body - 要跑的调用。
+ * @returns 它抛出来的那个错误。
+ */
+async function failureOf(body: () => Promise<unknown>): Promise<Error> {
+  try {
+    await body()
+  } catch (error) {
+    return error instanceof Error ? error : new Error(String(error))
+  }
+  throw new Error('expected the call to fail, but it resolved')
+}
+
+/**
  * 一个把**会话 cwd** 指到某个仓里的假调用者。
  *
  * 会话 cwd 走的是会话 header（`childSessionMeta` 写的就是它），所以这里照真实形状给：
@@ -2836,6 +2881,67 @@ it('run：默认档给整条流水线开一条线，账本里记着这条 run �
   assert.match(names[0] as string, /^auto-r1-[0-9a-f]{8}$/)
   assert.equal(ledgerRuns(ledger)[0]?.worktree, names[0], 'run 必须自带线名：自动放行的后继靠它找回同一份代码')
   assert.ok(briefOf(h.starts[0]).includes('线名：`' + names[0] + '`'), briefOf(h.starts[0]))
+})
+
+it('worktreeRepo 没声明：仓根照旧从**本会话 cwd** 归一出来 —— 子目录也要归一到仓根', async () => {
+  const repo = await repoForLines()
+  // cwd 给的是仓里的**子目录**：这正好证明归一那一跳还在（--show-toplevel），
+  // 而不是把 cwd 原样当成仓根拿去建线。
+  const sub = join(repo, 'nested')
+  mkdirSync(sub)
+  const h = harness({ tree: true, runsFile: freshLedgerFile(), worktreeAuto: true, worktreePrepare: '' })
+  await run(h.tool, { action: 'run', run: 'a', nodes: [{ id: 'A', prompt: 'go' }] }, callerIn(sub))
+  const names = lineNames(h.worktreesFile)
+  assert.equal(names.length, 1, JSON.stringify(names))
+  const line = names[0] as string
+  assert.equal(await worktreeMatches(worktreePathFor(repo, line), 'wt/' + line), true,
+    '没声明 worktreeRepo 时，仓根照旧从会话 cwd 归一出来（老行为一个字都不改）')
+  assert.equal(resolve(String(lineRecord(h.worktreesFile, line).repo)), resolve(repo),
+    '账本里记的仓根必须就是会话 cwd 所在的那个仓')
+})
+
+it('worktreeRepo：显式声明以哪个仓为底 —— 会话 cwd 根本不在仓里时，这条线照样起得来', async () => {
+  const repo = await repoForLines()
+  const outside = await nonRepoDir()
+  const h = harness({ tree: true, runsFile: freshLedgerFile(), worktreeAuto: true, worktreePrepare: '' })
+  await run(h.tool, { action: 'run', run: 'a', nodes: [{ id: 'A', prompt: 'go' }], worktreeRepo: repo }, callerIn(outside))
+  const names = lineNames(h.worktreesFile)
+  assert.equal(names.length, 1, JSON.stringify(names))
+  const line = names[0] as string
+  assert.match(line, /^auto-a-[0-9a-f]{8}$/)
+  assert.equal(await worktreeMatches(worktreePathFor(repo, line), 'wt/' + line), true,
+    '这条线必须建在 worktreeRepo 声明的那个仓上')
+  assert.equal(existsSync(worktreePathFor(outside, line)), false,
+    '一条线只该建在声明的仓旁边，不许拿会话 cwd 再去算一份')
+  assert.equal(resolve(String(lineRecord(h.worktreesFile, line).repo)), resolve(repo),
+    '账本里记的仓根必须是声明的那个仓')
+  assert.ok(briefOf(h.starts[0]).includes(worktreePathFor(repo, line)), briefOf(h.starts[0]))
+})
+
+it('worktreeRepo 缺席、会话 cwd 又不在仓里：当场拒，报错点名这个参数并写出本会话 cwd 到底是什么', async () => {
+  const outside = await nonRepoDir()
+  const h = harness({ tree: true, runsFile: freshLedgerFile(), worktreeAuto: true, worktreePrepare: '' })
+  const failure = await failureOf(() => run(h.tool, { action: 'run', run: 'a', nodes: [{ id: 'A', prompt: 'go' }] }, callerIn(outside)))
+  assert.ok(failure.message.includes('请在这条 run 的派发里补上 `worktreeRepo: "<仓库路径>"`'),
+    '报错要指名道姓地说清该补哪一格：' + failure.message)
+  assert.ok(failure.message.includes('**本会话的 cwd** `' + outside + '` 不在任何 git 仓库里'),
+    '报错要把本会话的 cwd 到底是什么写出来：' + failure.message)
+  // git 的原文一个字都不许丢：这一条钉的是「没声明的老路径没被改坏」。
+  assert.ok(failure.message.includes(' is not inside a git worktree (git rev-parse --show-toplevel failed:'),
+    '原来那句就地保留：' + failure.message)
+  assert.equal(h.starts.length, 0, '线起不来 ⇒ 一个孩子都不许派出去')
+})
+
+it('worktreeRepo：声明的路径不是仓时当场拒，报错同样点名这个参数', async () => {
+  const repo = await repoForLines()
+  const outside = await nonRepoDir()
+  const h = harness({ tree: true, runsFile: freshLedgerFile(), worktreeAuto: true, worktreePrepare: '' })
+  const failure = await failureOf(() => run(h.tool,
+    { action: 'run', run: 'a', nodes: [{ id: 'A', prompt: 'go' }], worktreeRepo: outside }, callerIn(repo)))
+  assert.ok(failure.message.includes('`worktreeRepo` 声明的 `' + outside + '` 不是一个 git 工作区'),
+    '声明的仓不对时也要把参数名点出来，别只丢 git 原文：' + failure.message)
+  assert.deepStrictEqual(lineNames(h.worktreesFile), [], '起线没成功就不该留下任何线')
+  assert.equal(h.starts.length, 0, '线起不来 ⇒ 一个孩子都不许派出去')
 })
 
 it('commit：点名一条不存在的线当场抛，并把在飞的线列出来', async () => {
