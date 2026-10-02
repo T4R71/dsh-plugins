@@ -1426,11 +1426,11 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
       // 它读的是 `exec.agent.session.deriveMessages()`，所以这里把会话本身裹进那个形状，
       // 而不是重写第二份「从历史里找结算消息」的代码。
       const body = typeof session.deriveMessages === 'function'
-        ? settledNotice({ agent: { session } }, childId)
+        ? settledNotice({ agent: { session } }, childId)?.text
         : undefined
       if (body === undefined) {
         // 「读不到结算正文」**不是**「子代理没回报」：一次历史读失败不许被写成一条结论
-        // （与 `isKnownChild` 同一条纪律）。什么都不写，留一句日志。
+        // （与 `childPresence` 同一条纪律）。什么都不写，留一句日志。
         ctx.logger?.warn?.('task: the settlement notice of child ' + childId + ' is not readable in session ' + sid + '; its node keeps its status')
         return
       }
@@ -2055,7 +2055,7 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
       run: { type: 'string', description: 'run：这条流水线的 run id，会话内唯一。同一个 run 的起点（needs 为空的那些）会在本次调用里并行派出。三个词的分工：声明新流水线（默认）、`retry=true` 重评估**已存在**那条 run 的待办节点、`resume=<节点 id>` 把**已派出但没干成**的节点交回它原来那个孩子接着干。后两种都要求 run 已经存在。' },
       resume: { type: 'string', description: 'run：要**续跑**的节点 id —— 把这个节点交给它原来那个孩子接着干（不新派）。要求该 run 已存在、节点在该 run 里、账本上有 childId、且状态不是 completed。上游结论取不到时不发（fail-closed，原因写进 detail 与账本）。与 retry 互斥：retry 管还没派出去的，resume 管已派出没干成的。' },
       retry: { type: 'boolean', description: 'run：只重评估既有 run 的待办节点（pending 且依赖已满足者），把被阻塞或派发失败的节点再试一次。不写树、不重声明、不重置任何已派出/已完成的状态；没有待办时返回空 dispatched，不报错。省略即老行为（声明一条新 run）。' },
-      task_id: { type: 'string', description: 'send/interrupt/result：子会话 id。result 三种答复：结算通知已落进本会话 → completed；这个 id 不是你的孩子 → unknown；孩子存在但通知未到 → running。' },
+      task_id: { type: 'string', description: 'send/interrupt/result：子会话 id。result 四种答复：结算通知已到（已进本会话历史，或已投进当刻收件箱、还没被认领）→ completed；这个 id 不是你的孩子 → unknown；孩子还在本代宿主内存里、通知未到 → running；孩子已不在本代宿主内存里、也没有它的通知 → inactive（它不会再有任何结果，宿主重启之后上一代留下的孩子就是这一档）。每一次答复都带 evidence，写明这个 status 是凭什么下的。' },
       scope: { type: 'string', enum: ['tree', 'children', 'descendants'], description: 'list：tree（默认）读树，children 读直接子代理（默认最新 10 个），descendants 读下面所有子代理。' },
       limit: { type: 'number', description: 'list(scope=children)：最多返回几个孩子，默认 10，取最新的；返回值里带 total/truncated。' },
       merge: { type: 'number', description: 'list(scope=tree)：往下拼几层子代理自己写的树，拼在各自 bind 的节点下。0 或省略只读本会话自己的树。子代理始终写自己的树，拼接靠 bind 已记下的 assignedTo。' },
@@ -2086,8 +2086,9 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
         properties: {
           task_id: { type: 'string', description: '本次动到的子会话 id（若有）。' },
           node: { type: 'string', description: '本次动到的节点 id（若有）。' },
-          status: { type: 'string', required: true, description: 'pending | in_progress | completed | failed | running | inactive | unknown' },
+          status: { type: 'string', required: true, description: 'pending | in_progress | completed | failed | running | inactive | unknown。result 这一档的 inactive 是「这个孩子已经不在本代宿主里了」——它不在活动面里、本会话也没有它的结算通知，所以不会再有任何结果（running 的两种成因因此只剩一种：它还可能在跑，或者通知要等你下一轮）。' },
           result: { type: 'string', description: '子代理的结算通知：如何结束，加上它的收尾文本。' },
+          evidence: { type: 'string', description: 'result：这一次 status 是凭什么下的（读的是哪个落点、孩子还在不在本代宿主内存里）。' },
           tree: { type: 'string', description: '渲染成可读文本的任务树。' },
           run: { type: 'string', description: 'run：本次声明的 run id。' },
           dispatched: { type: 'array', items: { type: 'string' }, description: 'run：本次调用里已经派出去的节点 id（起点们）。后继由插件在前置完成时自动派出，不会出现在这个列表里。' },
@@ -2369,25 +2370,60 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
           // 运行时**没有** result(childId) 这个方法：结果是由运行时自己做成一条
           // `subagent-settled` 用户消息投进父会话的（`createSettlementMessage`，
           // dsh-subagent/lib/index.js:633-654；投递见同文件 :1254-1264 的 notifySettlement）。
-          // 所以本动作是**从父会话自己的历史里回读**，而不是向运行时索取。
+          // 所以本动作是**从自己这一侧回读**（会话历史 + 当刻收件箱），而不是向运行时索取。
           //
-          // 顺序是**先回读、再判存在**，两步合起来才分得清三件事：
-          // completed（结算通知已经落进本会话）、unknown（这个 id 根本不是本会话的孩子——
-          // 打错一个字符就是这种）、running（其余全部）。`running` 因此有两种成因，
-          // 而且在本工具的执行期里**分不开**：孩子还在跑，或者它已经结算、那条通知要等到
-          // 父代理的下一轮才出现。模型看到 `running` 应当去做别的事，而不是原地重问。
-          // 先回读是必须的：孩子结算之后可能已经离开活动目录面，从目录判存在会把它误判成 unknown。
-          const settled = settledNotice(exec, args.task_id)
-          if (settled !== undefined) return { task_id: args.task_id, status: 'completed', result: settled }
-          const parentId = sessionId(exec)
-          if (!await isKnownChild(ctx, parentId, args.task_id, exec.signal)) {
-            return { task_id: args.task_id, status: 'unknown' }
+          // 判据是三问，按序问，第一问命中就返回、绝不往下问：
+          //
+          // ① 结算通知到了没有 —— 到了就是 completed。**两个落点都算「到了」**：
+          //    已经认领进会话历史的（{@link settledNotice} 倒着扫的那条），和
+          //    **已经投进我的收件箱、还没被这一轮认领的**（`steer`/`inject` 进 next-step、
+          //    `followup` 进 next-turn，dsh-agent-loop/lib/index.js:806-814）。
+          //    落点二必须算数：孩子结算时会话就已经离开 sessions（宿主先 `dispose` 再通知，
+          //    dsh-subagent/lib/index.js:1239 → :1248），而通知要等下一次步界才认领进历史。
+          //    少了这一问，那段窗口里**正常结算的孩子**会被下一问说成「不在了」。
+          // ② 这个 id 是不是本会话的孩子 —— 不是就是 unknown（打错一个字符就是这种）。
+          //    ①必须先问：孩子结算之后可能已经离开活动目录面，从目录判存在会把它误判成 unknown。
+          // ③ 它此刻还在不在**本代宿主的内存里**。读数有两个来源，说的是同一件事（这条 id
+          //    在本进程里还有没有一条**活着的**会话）：目录行自带的 `activity`，以及行里
+          //    没有这一格时插件自己问的那一次会话存储 —— 运行时算 `activity` 用的正是后者
+          //    （dsh-subagent/lib/types/list-children.js:149：`sessions.get(id) === undefined
+          //    ? 'inactive' : 'running'`）。细节见 {@link childPresence}。
+          //    **不在 ⇒ inactive**：子代理只活在宿主内存里，本代宿主没它、本会话又没有它的
+          //    通知 ⇒ 它不会再有任何结果，此后也不会再有事件把这条答复推进到 completed。
+          //    宿主一重启，上一代留下的孩子正是这样 —— 在这之前这里一律回 running，那是个
+          //    **永远不会兑现的承诺**（真机实测：重启之后 19:36:20 与 19:37:46 两问两答都是
+          //    running，而那个孩子在重启前 86 秒就死了）。
+          //    在 ⇒ running（还可能是「通知要等我下一轮」）。
+          //    拿不到读数（服务缺席、目录读失败、行与目录都没给这一格）⇒ 也回 running，
+          //    理由写进 evidence：**绝不把一次「没读到」说成孩子死了**；同一条纪律之下，
+          //    也绝不说成读到了 —— 所以 evidence 由 {@link childPresence} 连带产出。
+          //
+          // 每一次答复都带 `evidence`：调用方要能只凭返回值看出这个 status 是**凭什么**下的。
+          const notice = settledNotice(exec, args.task_id)
+          if (notice !== undefined) {
+            return {
+              task_id: args.task_id,
+              status: 'completed',
+              result: notice.text,
+              evidence: notice.from === 'inbox'
+                ? 'settlement notice is already delivered to this agent and not yet claimed into the visible history'
+                : 'settlement notice read from this session history',
+            }
+          }
+          const presence = await childPresence(ctx, sessionId(exec), args.task_id, exec.signal)
+          if (presence.kind === 'absent') {
+            return { task_id: args.task_id, status: 'inactive', evidence: presence.evidence }
+          }
+          if (presence.kind === 'unknown') {
+            return { task_id: args.task_id, status: 'unknown', evidence: presence.evidence }
           }
           // 这里**没有等待**，而且不能有：结算在工具执行期内不可见（真机实测
           // `e2e\runs\verify-wait3` —— 轮询到 120000ms 执行期限仍是空手；另一路独立
           // 实测 1500 次 × 25ms = 37.5 秒同样拿不到，而那条消息在程序结束之后确实出现在
-          // 父上下文里）。所以 running 就是「现在看不到」，交回给模型，不替它等。
-          return { task_id: args.task_id, status: 'running' }
+          // 父上下文里）。所以上面每一问都是「现在看到什么就说什么」，交回给模型，不替它等。
+          // `resident` 与 `unreadable` 都回 running（结论一样），但**依据不是同一句话** ——
+          // 文案由 {@link childPresence} 跟着判定一起产出，这里原样转发，不在这里替它措辞。
+          return { task_id: args.task_id, status: 'running', evidence: presence.evidence }
         }
         case 'send': {
           const sender = requireAgent(exec)
@@ -2611,50 +2647,154 @@ function renderTree(nodes: readonly TaskNode[]): string {
 }
 
 /**
- * 这个 id 是不是**本会话的孩子**（直接子或更深的后代）。
+ * {@link childPresence} 的答案。四种互斥 —— **没有一种叫「死了」**：有的是「本代宿主的
+ * 内存里还有没有它」，那才是这条工具能诚实回答的事。
  *
- * 只用于把「孩子还在跑」与「根本没有这个 id」分开：`listChildren` / `listDescendants`
- * 读的是父会话自己的持久目录（`dsh-subagent/lib/types/index.d.ts:218`、`:234`），子代理
- * 离开活动面之后**仍在**目录里，所以结算过的孩子不会被它判成不存在。
+ * `evidence` 与 `kind` **一起产出**，不是一个查询、一个措辞：只有真正做过那次读的地方
+ * 才知道这次凭什么下这个判定 —— 拿不到读数时该说「拿不到」，绝不许写成读到过。
+ */
+type ChildPresence =
+  /** 目录里没有这个 id：打错一个字符、或它根本不是本会话的孩子。 */
+  | { readonly kind: 'unknown'; readonly evidence: string }
+  /** 目录里有，且**本代宿主的内存里还驻留着**它：可能还在跑（也可能只是在等下一次被唤醒）。 */
+  | { readonly kind: 'resident'; readonly evidence: string }
+  /** 目录里有，但**本代宿主的内存里已经没有**它：不会再有任何结果。 */
+  | { readonly kind: 'absent'; readonly evidence: string }
+  /** 拿不到判活依据（服务缺席 / 目录读失败 / 行与目录都没给这一格）：**什么都不说**。 */
+  | { readonly kind: 'unreadable'; readonly evidence: string }
+
+/**
+ * 每一种 {@link ChildPresence} 判定各自带的**判定依据**。放在这里，是因为只有真正做过那次
+ * 读的地方才说得出这句话：目录行的 `activity` 读到什么、会话存储问出什么、还是根本没有
+ * 读数 —— 三者不许共用一句文案。`(subagent catalog activity=running)` 这种句子一旦被
+ * 没读过 activity 的分支复用，工具就开始替一次**没发生的读数**作证。
+ */
+const PRESENCE_EVIDENCE = {
+  /** 目录里没有这个 id。 */
+  noCatalogRow: 'no subagent catalog row for this id under this session',
+  /** 目录行自带 activity，读到它还在。 */
+  residentByActivity: 'no settlement notice yet and the child is resident in this host (subagent catalog activity=running)',
+  /** 目录行不带 activity，改问会话存储：这条 id 还有一条活着的会话。 */
+  residentByStore: 'no settlement notice yet and the child is resident in this host (a live session for it is still present; this catalog row carries no activity of its own)',
+  /** 目录行自带 activity，读到它不在了。 */
+  absentByActivity: 'no settlement notice and the child is not resident in this host (subagent catalog activity=inactive): it will do no further work and no result will arrive on its own',
+  /** 会话存储里已经没有这条 id 的活会话 —— 僵尸那一格。 */
+  absentByStore: 'no settlement notice and the child is not resident in this host (no live session for it is left; this catalog row carries no activity of its own): it will do no further work and no result will arrive on its own',
+  /** 目录读失败（服务缺席 / 读抛）：**绝不把一次查询失败说成孩子死了**。 */
+  catalogUnreadable: 'no settlement notice yet and the child catalog could not be read, so whether the child is still resident is unknown',
+  /** 目录读到了，但没有任何一处给得出活性读数：同样什么都不说。 */
+  noLivenessReading: 'no settlement notice yet and no liveness reading for the child could be obtained, so whether it is still resident is unknown',
+} as const
+
+/**
+ * 这个 id **在本会话的目录里**吗，以及它**此刻还在不在本代宿主的内存里**吗。
  *
- * 任何失败都当**查询不可用**处理（返回 true），绝不把一次目录读失败说成「没有这个孩子」：
- * 后者会让模型以为自己派发失败，而真相是这次查询没做成。
+ * 判活的依据只有一条：`listDescendants` 的行自带 `activity`
+ * （`dsh-subagent/lib/types/list-children.js:149`：
+ * `sessions.get(entry.id) === undefined ? 'inactive' : 'running'`）—— 那就是进程内
+ * liveness，也是宿主自己判「这个孩子还在不在活动面里」用的同一个式子。而目录项本身
+ * **没有**这一格（`SubagentCatalogEntry`，`projection-types.d.ts:8-20`），`listChildren`
+ * 回的就是它，所以判活必须走 descendants 那一档。`listChildren` 留着是因为①它先答
+ * 「是不是直接孩子」，②它需要的服务比 descendants 少（后者还要 `sessions`，缺了会抛）。
+ *
+ * 任何失败都当**查询不可用**（`unreadable`）处理，绝不把一次目录读失败说成
+ * 「没有这个孩子」（那会让模型以为自己派发失败），也绝不把它说成「这个孩子已经死了」
+ * （那会让它把一个还活着的孩子丢掉）。两个方向都不许猜。
  * @param ctx - 宿主上下文（借 `ctx.subagents` 的目录面）。
  * @param parentId - 调用方那条会话的 id。
  * @param childId - 待判定的 id。
  * @param signal - 取消信号，原样转发给目录读。
- * @returns 孩子存在（或无法判定）时为 true。
+ * @returns 四种判定之一，见 {@link ChildPresence}。
  */
-async function isKnownChild(ctx: Context, parentId: SessionId, childId: string, signal: AbortSignal): Promise<boolean> {
+async function childPresence(ctx: Context, parentId: SessionId, childId: string, signal: AbortSignal): Promise<ChildPresence> {
   try {
     const children = await ctx.subagents.listChildren(parentId, signal)
-    if (children.some(entry => String(entry.id) === childId)) return true
+    const direct = children.some(entry => String(entry.id) === childId)
     const descendants = await ctx.subagents.listDescendants(parentId, signal)
-    return descendants.some(entry => String(entry.id) === childId)
+    const row = descendants.find(entry => String(entry.id) === childId)
+    // 目录行自带的 activity 是**正面证据**：只有真读到 `'inactive'` 才说它不在了；其余
+    // 一切（`'running'`、行里没给这一格的 `undefined`、将来新增的取值）都倒向「还可能在
+    // 跑」—— 与下面那个 catch 同一个方向。两次都不许把「没读到不在了」说成「它死了」。
+    if (row !== undefined && row.kind === 'child') {
+      return row.activity === 'inactive'
+        ? { kind: 'absent', evidence: PRESENCE_EVIDENCE.absentByActivity }
+        : { kind: 'resident', evidence: PRESENCE_EVIDENCE.residentByActivity }
+    }
+    if (row !== undefined) {
+      // 诊断行**不带** activity：要么这个孩子自己的目录读不动，要么目录里记的 mode 是
+      // `unknown`（`list-children.js:135-139` / `:142-143`）。这一格没有现成读数，但判活
+      // 还有一条**同源**的依据：这条 id 在本进程的会话存储里还有没有一条活着的会话 ——
+      // 运行时算 activity 用的就是它（同文件 `:149` 的 `sessions.get(id) === undefined`），
+      // 只是诊断行没走那一步（`SessionStore.get`：`dsh-session/lib/types/index.d.ts:443-447`，
+      // "the session, or undefined when no live session has that id"）。
+      // 问了才敢说：`mode:'unknown'` 的僵尸正是靠这一问才落进 absent —— 不问，它永远回 running。
+      // 服务缺席时什么都别说（倒向 running，见 {@link PRESENCE_EVIDENCE.noLivenessReading}）；
+      // 那条分支只是防御性的 —— `sessions` 真缺席时 `listDescendants` 自己就先抛了
+      // （`list-children.js:100-103`），走不到这里。
+      const store = ctx.get('sessions')
+      if (store === undefined) return { kind: 'unreadable', evidence: PRESENCE_EVIDENCE.noLivenessReading }
+      return store.get(childId as SessionId) === undefined
+        ? { kind: 'absent', evidence: PRESENCE_EVIDENCE.absentByStore }
+        : { kind: 'resident', evidence: PRESENCE_EVIDENCE.residentByStore }
+    }
+    // 目录里是直接孩子、descendants 里却没有它的行。目标版本（`dsh-subagent@0.2.0-rc.2`）
+    // 走不到这里：那一版对每个走过的目录项都必定落一行（`list-children.js:117-157`）。留着是
+    // 因为目录面的另一个修订会按 id 解析候选行、把解析不出的丢掉（同文件 `:102` 的
+    // `filter(row => row !== undefined)`）。这一格一处活性读数都没有，照上面的纪律什么都不说。
+    if (direct) return { kind: 'unreadable', evidence: PRESENCE_EVIDENCE.noLivenessReading }
+    return { kind: 'unknown', evidence: PRESENCE_EVIDENCE.noCatalogRow }
   } catch {
-    return true
+    return { kind: 'unreadable', evidence: PRESENCE_EVIDENCE.catalogUnreadable }
   }
 }
 
 /**
- * 从父会话自己的历史里回读某次结算的正文。
+ * 一条消息是不是某个孩子的结算通知，是的话把正文取出来。
  *
- * 结果不是「取」来的，是运行时**投**进来的：`createSettlementMessage`
- * （`dsh-subagent/lib/index.js:633-654`）把摘要与子代理的收尾文本做成一条
- * `source.kind === 'subagent-settled'` 的 user message，`senderSessionId` 就是子会话 id。
- * 因此本函数只做一件事：倒着扫父会话的派生历史，找出那条通知。
- * @param exec - 工具执行上下文（借 `exec.agent.session`）。
+ * 形状由 `createSettlementMessage` 定死：`source.kind === 'subagent-settled'`、
+ * `senderSessionId` 就是子会话 id（`dsh-subagent/lib/types/continuation-messages.js:85-105`）。
+ * **两个落点用的是同一条消息**（同一个对象换个地方排队），所以这条辨认只有一份。
+ * @param message - 待辨认的消息：历史里的一条，或收件箱里的一条。
  * @param childId - 派发时返回的子会话 id。
- * @returns 那条通知的正文，或 undefined（还没结算）。
+ * @returns 正文；不是这个孩子的结算通知、或正文为空时是 undefined。
  */
-function settledNotice(exec: { agent?: { session?: { deriveMessages(): readonly unknown[] } } }, childId: string): string | undefined {
+function noticeText(message: unknown, childId: string): string | undefined {
+  const candidate = message as { source?: { kind?: string; senderSessionId?: string }; content?: readonly { type?: string; text?: string }[] } | undefined
+  if (candidate?.source?.kind !== 'subagent-settled') return undefined
+  if (candidate.source.senderSessionId !== childId) return undefined
+  const text = (candidate.content ?? []).flatMap((block) => block.type === 'text' && typeof block.text === 'string' ? [block.text] : []).join('\n')
+  return text.length > 0 ? text : undefined
+}
+
+/**
+ * 从**自己这一侧**回读某次结算的正文 —— 两个落点，先看近的那个。
+ *
+ * 结果不是「取」来的，是运行时**投**进来的，而投递分两步：先落进父 Agent 的待认领列表
+ * （`steer`/`inject` 进 next-step、`followup` 进 next-turn，`dsh-agent-loop/lib/index.js:806-814`），
+ * 下一次步界才认领进会话历史。两步之间的那段窗口里，那条通知**已经在父代理手上了**，
+ * 只是 `deriveMessages()` 还看不见它 —— 而孩子的会话在结算那一刻就已经离开本代宿主
+ * （宿主先 `dispose` 再通知：`dsh-subagent/lib/index.js:1239` → `:1248`）。所以只看历史
+ * 会漏掉「刚结算」，只看收件箱会漏掉「早就结算」。两个落点都读，才既不看漏也不说错。
+ *
+ * 先收件箱、后历史，与「同一个孩子结算两次时取最新那条」同向：历史里的那条已经被认领过了，
+ * 收件箱里的必然更新。
+ * @param exec - 工具执行上下文（借 `exec.agent.session` 与 `exec.agent.inbox`）。
+ * @param childId - 派发时返回的子会话 id。
+ * @returns 正文与它从哪个落点读到；两处都没有时是 undefined（还没结算）。
+ */
+function settledNotice(
+  exec: { agent?: { session?: { deriveMessages(): readonly unknown[] }; inbox?: { readonly nextStep?: readonly unknown[]; readonly nextTurn?: readonly unknown[] } } },
+  childId: string,
+): { readonly text: string; readonly from: 'inbox' | 'history' } | undefined {
+  const pending = [...(exec.agent?.inbox?.nextStep ?? []), ...(exec.agent?.inbox?.nextTurn ?? [])]
+  for (const message of pending) {
+    const text = noticeText(message, childId)
+    if (text !== undefined) return { text, from: 'inbox' }
+  }
   const messages = exec.agent?.session?.deriveMessages() ?? []
   for (let index = messages.length - 1; index >= 0; index--) {
-    const message = messages[index] as { source?: { kind?: string; senderSessionId?: string }; content?: readonly { type?: string; text?: string }[] } | undefined
-    if (message?.source?.kind !== 'subagent-settled') continue
-    if (message.source.senderSessionId !== childId) continue
-    const text = (message.content ?? []).flatMap((block) => block.type === 'text' && typeof block.text === 'string' ? [block.text] : []).join('\n')
-    return text.length > 0 ? text : undefined
+    const text = noticeText(messages[index], childId)
+    if (text !== undefined) return { text, from: 'history' }
   }
   return undefined
 }
@@ -2998,19 +3138,22 @@ function capUpstream(body: string): string {
  *
  * 四个不可动摇的点：
  *   - **来源是结算正文**，优先取账本里那一份（节点结算时写下的 `conclusion`），账本没有
- *     才退回会话历史（{@link settledNotice} 倒着扫出来的那一条）—— 历史会被压缩，账本不会，
- *     所以「依赖完成了、下游却永久阻塞」不再由「上下文被压缩」这种无关的事触发。
+ *     才退回**回读**（{@link settledNotice}：先查调用方当刻的收件箱，再倒着扫会话历史 ——
+ *     两个落点都是「已经结算」的现场）—— 历史会被压缩，账本不会，所以「依赖完成了、下游
+ *     却永久阻塞」不再由「上下文被压缩」这种无关的事触发。
  *     两条路的正文是同一份（写入点就是监听器里已经取到的那份 body），都**不是**树 detail
  *     那 200 字 —— 摘要会丢掉下游要用的细节，而那正是这次要消掉的浪费。
  *   - **顺序就是 `node.needs` 的声明顺序**：这里不排序、不按 run 里的声明顺序、不去重，
  *     调用方写什么顺序就按什么顺序给。
- *   - **取不到就是取不到**：某个依赖没有 `childId`、或它的结算正文在历史里读不到，
+ *   - **取不到就是取不到**：某个依赖没有 `childId`、或它的结算正文在收件箱与会话历史里
+ *     都读不到，
  *     一律返回 `missing`，由调用方**拒绝派发**（fail-closed）。绝不退化成「这一段没了，
  *     照样派」—— 那会让下游在缺前提的情况下开工，而它自己不知道。**取齐之后才开始替换**：
  *     槽位绝不会拿到半份结论，也不会因为后面的依赖取不到而留下一个填了一半的框架。
  *   - **槽位优先、追加兜底**：`{{dep}}` 就地换成那一条的正文；没被任何槽位覆盖的依赖
  *     才进【上游结论】块。全被覆盖就没有块，一个 needs 都没有就一个字都不加。
- * @param exec - 读历史用的执行上下文（父 Agent 的会话历史）。
+ * @param exec - 回读结算正文用的执行上下文：**当刻活着的父 Agent**（{@link settledNotice}
+ *   要从它的收件箱与会话历史两个落点取数）。
  * @param byId - 同一条 run 的节点表（按 id），用来找每个依赖的 `childId`。
  * @param node - 要派的那个节点。
  * @returns 全部取到时是 `{ prompt, text }`：`prompt` 是槽位已填好的框架，`text` 是
@@ -3034,12 +3177,15 @@ function upstreamSection(
       bodies.set(need, stored)
       continue
     }
-    // 账本里没有这一格（本次改动之前完成的旧节点）才退回历史，口径与改动前完全一样。
+    // 账本里没有这一格（本次改动之前完成的旧节点）才退回**回读**：{@link settledNotice}
+    // 先查调用方当刻的收件箱、再倒着扫会话历史。这里的调用方（`index.ts:1813` / `:1896`）
+    // 传的是**真的父 Agent**，所以收件箱那一问是活的 —— 与改动前（只看历史）**口径不同**：
+    // 少了「通知还在收件箱里、账本里又没有结论」这一格的误判（结论缺失 → 阻塞派发）。
     const childId = dep?.childId
     if (childId === undefined || childId === '') {
       return { missing: '依赖 ' + need + ' 在账本里没有 childId，取不到它的结算正文' }
     }
-    const body = settledNotice(exec, childId)
+    const body = settledNotice(exec, childId)?.text
     if (body === undefined) {
       return { missing: '依赖 ' + need + '（child ' + childId + '）的结算正文在父会话历史里读不到' }
     }

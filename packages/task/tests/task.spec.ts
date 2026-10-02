@@ -164,7 +164,7 @@ function ledgerFileAbsent(file: string): boolean {
  *   （或直接给一个 `taskRuns` 服务）、父 Agent 是谁。
  * @returns 被注册的工具定义、调用记录、目录查询记录，以及可变的会话历史。
  */
-function harness(options: { tree?: boolean; children?: readonly (string | { readonly id: string; readonly createdAt: number; readonly mode: 'one-shot' | 'continuable' | 'unknown'; readonly label?: string })[]; answers?: { id: string; selected: string[] }[]; presets?: Record<string, { persona?: string; allow?: string[]; deny?: string[]; maxDepth?: number; drop?: string[]; agentOptions?: { provider?: string; model?: string; reasoningEffort?: string; maxTokens?: number } }>; defaultRules?: string; runsFile?: string; worktreesFile?: string; worktreeGoal?: string; worktreeVerify?: string; worktreeMergeVerify?: string; worktreePrepare?: string; worktreeAuto?: boolean; parentAgent?: Record<string, unknown>; beforeStart?: () => void } = {}): {
+function harness(options: { tree?: boolean; children?: readonly (string | { readonly id: string; readonly createdAt: number; readonly mode: 'one-shot' | 'continuable' | 'unknown'; readonly label?: string })[]; answers?: { id: string; selected: string[] }[]; presets?: Record<string, { persona?: string; allow?: string[]; deny?: string[]; maxDepth?: number; drop?: string[]; agentOptions?: { provider?: string; model?: string; reasoningEffort?: string; maxTokens?: number } }>; defaultRules?: string; runsFile?: string; worktreesFile?: string; worktreeGoal?: string; worktreeVerify?: string; worktreeMergeVerify?: string; worktreePrepare?: string; worktreeAuto?: boolean; parentAgent?: Record<string, unknown>; descendants?: readonly { readonly id: string; readonly activity?: 'running' | 'inactive'; readonly kind?: 'child' | 'diagnostic'; readonly reason?: 'corrupt' | 'unsupported' | 'unavailable' }[]; descendantsThrow?: boolean; sessionStore?: readonly string[]; sessionStoreService?: boolean; beforeStart?: () => void } = {}): {
   tool: Captured
   calls: string[]
   listed: string[]
@@ -269,6 +269,16 @@ function harness(options: { tree?: boolean; children?: readonly (string | { read
       if (key === 'userQuestions') {
         return { ask: async () => ({ answers: options.answers ?? [{ id: 'task-ask', selected: ['yes'] }] }) }
       }
+      // `sessions` 是诊断行那一格判活要用的：目录行**不带** activity 时（`mode:'unknown'` 的
+      // 僵尸、或这个孩子自己的目录读不动），`childPresence` 自己问一次会话存储
+      // （`SessionStore.get`：活着才有）。默认假件是「目录里的孩子都还活着」；要演
+      // `mode:'unknown'` 的僵尸（目录里有、存储里已经没有）显式给 `sessionStore: []`，
+      // 要演连这个服务都没有的组合给 `sessionStoreService: false`。
+      if (key === 'sessions') {
+        if (options.sessionStoreService === false) return undefined
+        const live = new Set(options.sessionStore ?? children.map(entry => typeof entry === 'string' ? entry : entry.id))
+        return { get: (id: string) => live.has(id) ? { id } : undefined }
+      }
       return undefined
     },
     // 自动放行要 `ctx.agents.get(sid)` 拿当刻活着的父 Agent；宿主自己也是这么拿的
@@ -303,9 +313,18 @@ function harness(options: { tree?: boolean; children?: readonly (string | { read
           ? { id: entry, createdAt: 0, mode: 'one-shot' as const }
           : entry)
       },
+      // 行形状照运行时（`dsh-subagent/lib/types/list-children.js:146-152`）：目录行 + kind +
+      // activity + hasChildren + parentId + depth。**默认 activity = running** —— 假件里的孩子
+      // 都是「刚派出去、还在内存里」这一档；要演宿主重启之后留下的僵尸，显式给 `descendants` 行。
       listDescendants: async (parentId: string, _signal?: AbortSignal) => {
         listed.push(`descendants:${parentId}`)
-        return []
+        // 判活那一格拿不到时（诊断行）不许被当成死 —— 这里也能演。
+        if (options.descendantsThrow === true) throw new Error('subagent listing requires the session store (load @deepseek-ai/dsh-session)')
+        const rows: readonly { readonly id: string; readonly activity?: 'running' | 'inactive'; readonly kind?: 'child' | 'diagnostic'; readonly reason?: 'corrupt' | 'unsupported' | 'unavailable' }[] = options.descendants
+          ?? children.map(entry => ({ id: typeof entry === 'string' ? entry : entry.id, activity: 'running' as const }))
+        return rows.map(row => row.kind === 'diagnostic'
+          ? { id: row.id, kind: 'diagnostic' as const, parentId, depth: 1, reason: row.reason ?? ('unavailable' as const) }
+          : { id: row.id, kind: 'child' as const, activity: row.activity ?? 'running', mode: 'one-shot' as const, parentId, depth: 1, hasChildren: false })
       },
     },
     userQuestions: { ask: async () => ({ answers: [{ id: 'task-ask', selected: ['yes'] }] }) },
@@ -346,13 +365,26 @@ function harness(options: { tree?: boolean; children?: readonly (string | { read
 }
 
 /**
- * 一个带 session 与取消信号的假调用者。
+ * 一个带 session、取消信号与（可选的）待认领列表的假调用者。
  * @param messages - 可变的会话历史；直接改这个数组等于运行时投了一条消息进来。
  * @param signal - 取消信号，省略即测试自带的 200ms 兜底。
+ * @param inbox - 待认领列表（`nextStep` / `nextTurn`）。结算通知在这一段里**已经在父代理手上了**，
+ *   只是 `deriveMessages()` 还看不见它 —— `steer`/`inject` 进 next-step、`followup` 进 next-turn
+ *   （`dsh-agent-loop/lib/index.js:806-814`），下一次步界才认领进历史。
  * @returns 假调用者。
  */
-function makeCaller(messages: FakeMessage[] = [], signal: AbortSignal = AbortSignal.timeout(200)): unknown {
-  return { agent: { session: { id: SESSION, deriveMessages: () => messages } }, signal }
+function makeCaller(
+  messages: FakeMessage[] = [],
+  signal: AbortSignal = AbortSignal.timeout(200),
+  inbox?: { readonly nextStep?: readonly FakeMessage[]; readonly nextTurn?: readonly FakeMessage[] },
+): unknown {
+  return {
+    agent: {
+      session: { id: SESSION, deriveMessages: () => messages },
+      ...inbox === undefined ? {} : { inbox },
+    },
+    signal,
+  }
 }
 
 /** 一个带 session 的假调用者。 */
@@ -768,10 +800,41 @@ function hasUndefined(value: unknown): boolean {
   return false
 }
 
+/**
+ * `result` 每一种答复各自带的**判定依据**，逐字钉在这里 —— 契约一改，这几行先红。
+ *
+ * 它是**工具契约的一部分**（不是日志）：调用方只看得见返回值，凭什么下这个 status 必须写在里面，
+ * 否则 «running»（还在跑）与 «inactive»（已经不在了）在模型眼里就是两个没有理由的字。
+ *
+ * **每一种依据各占一行**：目录行读到 activity 的、行里没有这一格而改问会话存储的、根本
+ * 一处读数都没有的 —— 三者不许共用一句文案（`(subagent catalog activity=running)` 这种
+ * 句子一旦被没读过 activity 的分支复用，工具就开始替一次**没发生的读数**作证）。
+ */
+const EVIDENCE = {
+  /** 通知已经认领进会话历史。 */
+  noticeInHistory: 'settlement notice read from this session history',
+  /** 通知已经投进父代理的收件箱、还没被这一轮认领。 */
+  noticeInInbox: 'settlement notice is already delivered to this agent and not yet claimed into the visible history',
+  /** 目录行自带 activity，读到孩子还在本代宿主的内存里。 */
+  residentByActivity: 'no settlement notice yet and the child is resident in this host (subagent catalog activity=running)',
+  /** 目录行不带 activity（诊断行），改问会话存储：这条 id 还有一条活着的会话。 */
+  residentByStore: 'no settlement notice yet and the child is resident in this host (a live session for it is still present; this catalog row carries no activity of its own)',
+  /** 目录行自带 activity，读到孩子已经不在本代宿主里了 —— 僵尸那一格。 */
+  absentByActivity: 'no settlement notice and the child is not resident in this host (subagent catalog activity=inactive): it will do no further work and no result will arrive on its own',
+  /** 诊断行 + 会话存储里已经没有它的活会话 —— `mode:'unknown'` 的僵尸走这一格。 */
+  absentByStore: 'no settlement notice and the child is not resident in this host (no live session for it is left; this catalog row carries no activity of its own): it will do no further work and no result will arrive on its own',
+  /** 目录查不动（fail-open：倒向「还可能在跑」，绝不说它死了）。 */
+  catalogUnreadable: 'no settlement notice yet and the child catalog could not be read, so whether the child is still resident is unknown',
+  /** 目录读到了，但一处活性读数都没有（会话存储服务缺席 / 行与目录都没给这一格）。 */
+  noLivenessReading: 'no settlement notice yet and no liveness reading for the child could be obtained, so whether it is still resident is unknown',
+  /** 这个 id 根本不是本会话的孩子。 */
+  noCatalogRow: 'no subagent catalog row for this id under this session',
+} as const
+
 it('result 对根本不存在的孩子返回 unknown，而不是 running', async () => {
   const { tool, listed } = harness({ children: [] })
   const result = await run(tool, { action: 'result', task_id: 'no-such-child-0000' }, makeCaller())
-  assert.deepStrictEqual(result, { task_id: 'no-such-child-0000', status: 'unknown' })
+  assert.deepStrictEqual(result, { task_id: 'no-such-child-0000', status: 'unknown', evidence: EVIDENCE.noCatalogRow })
   // 目录是**按调用方那条会话**查的：查错会话就等于没查。
   assert.strictEqual(listed[0], 'children:sess-1')
 })
@@ -779,7 +842,7 @@ it('result 对根本不存在的孩子返回 unknown，而不是 running', async
 it('result 对已知但还没结算的孩子仍返回 running', async () => {
   const { tool, listed } = harness({ children: ['child-1'] })
   const result = await run(tool, { action: 'result', task_id: 'child-1' }, makeCaller())
-  assert.deepStrictEqual(result, { task_id: 'child-1', status: 'running' })
+  assert.deepStrictEqual(result, { task_id: 'child-1', status: 'running', evidence: EVIDENCE.residentByActivity })
   assert.strictEqual(listed.includes('children:sess-1'), true, 'the catalog must actually be read')
 })
 
@@ -789,11 +852,11 @@ it('result 只回读，绝不等：结算已经落进会话就报 completed，�
   const never = new AbortController()
   const history: FakeMessage[] = []
   const started = await run(tool, { action: 'result', task_id: 'child-1' }, makeCaller(history, never.signal))
-  assert.deepStrictEqual(started, { task_id: 'child-1', status: 'running' })
+  assert.deepStrictEqual(started, { task_id: 'child-1', status: 'running', evidence: EVIDENCE.residentByActivity })
   // 把运行时本该投进来的那条通知放进历史，再问一次——这一次必须报 completed。
   history.push(fakeSettle('child-1', 'settled: done'))
   const settled = await run(tool, { action: 'result', task_id: 'child-1' }, makeCaller(history, never.signal))
-  assert.deepStrictEqual(settled, { task_id: 'child-1', status: 'completed', result: 'settled: done' })
+  assert.deepStrictEqual(settled, { task_id: 'child-1', status: 'completed', result: 'settled: done', evidence: EVIDENCE.noticeInHistory })
 })
 
 it('返回值里没有 `undefined` 字段，且无损往返不丢字段——真机炸点钉在这里（run 与 result 两条路都过）', async () => {
@@ -807,12 +870,124 @@ it('返回值里没有 `undefined` 字段，且无损往返不丢字段——真
   const launched = await run(tool, { action: 'run', run: 'r1', nodes: [{ id: 'n1', prompt: 'go' }] }, makeCaller())
   assert.deepStrictEqual(launched, { status: 'running', run: 'r1', dispatched: ['n1'] })
   const settled = await run(tool, { action: 'result', task_id: 'child-1' }, makeCaller())
-  assert.deepStrictEqual(settled, { task_id: 'child-1', status: 'running' })
+  assert.deepStrictEqual(settled, { task_id: 'child-1', status: 'running', evidence: EVIDENCE.residentByActivity })
   // 下面两行是这条测试的要点：走序列化，而不是断言某个字段等于 undefined。
   for (const value of [launched, settled]) {
     assert.strictEqual(hasUndefined(value), false, 'a returned value must carry no undefined')
     assert.strictEqual(isLossless(value), true, 'the returned value must survive a lossless JSON round-trip')
   }
+})
+
+/**
+ * **宿主重启之后死掉的孩子**：目录里还在（那是父会话日志里的持久事件，重启不丢），
+ * 本代宿主的内存里已经没有它了。
+ *
+ * 这就是那个 bug 的现场：结算通知由 `notifySettlement` 在内存里现场造，而且**要求父 Agent
+ * 当刻活着**（`dsh-subagent/lib/index.js:1254-1258`）—— 重启之后这条路再也不会跑，于是
+ * 「通知永远不来」+「孩子在目录里永远都在」，老代码只能落到最后那一行 `running`，
+ * 而那是个**永远不会兑现的承诺**。
+ *
+ * 判据不能只要「目录里有」：还得问它**还在不在这代宿主里**，而行自带的 `activity`
+ * 就是这件事（`list-children.js:149`：`sessions.get(id) === undefined ? 'inactive' : 'running'`）。
+ */
+it('result 对「目录里在、本代宿主内存里没有了」的孩子回 inactive，绝不回 running', async () => {
+  const { tool, listed } = harness({
+    children: ['child-1'],
+    descendants: [{ id: 'child-1', activity: 'inactive' }],
+  })
+  const result = await run(tool, { action: 'result', task_id: 'child-1' }, makeCaller())
+  assert.notStrictEqual(result.status, 'running', '孩子不在了就一个字都不许说它还在跑：' + JSON.stringify(result))
+  assert.deepStrictEqual(result, { task_id: 'child-1', status: 'inactive', evidence: EVIDENCE.absentByActivity })
+  // 判活必须真的去问过目录（两个面都问了），而不是凭别的什么猜出来的。
+  assert.deepStrictEqual(listed, ['children:sess-1', 'descendants:sess-1'])
+  assert.strictEqual(hasUndefined(result), false)
+  assert.strictEqual(isLossless(result), true)
+})
+
+it('result 对还在内存里的孩子仍回 running —— 与僵尸那一格只差 activity', async () => {
+  const { tool } = harness({ children: ['child-1'], descendants: [{ id: 'child-1', activity: 'running' }] })
+  const result = await run(tool, { action: 'result', task_id: 'child-1' }, makeCaller())
+  assert.deepStrictEqual(result, { task_id: 'child-1', status: 'running', evidence: EVIDENCE.residentByActivity })
+})
+
+it('result 在诊断行上改问会话存储：还在就回 running，且不许谎报一个没读过的 activity', async () => {
+  const { tool, calls } = harness({ children: ['child-1'], descendants: [{ id: 'child-1', kind: 'diagnostic' }] })
+  const result = await run(tool, { action: 'result', task_id: 'child-1' }, makeCaller())
+  assert.deepStrictEqual(result, { task_id: 'child-1', status: 'running', evidence: EVIDENCE.residentByStore })
+  // 判据必须真去问过会话存储，而不是凭目录里有这个名字就断定它还活着。
+  assert.ok(calls.includes('get:sessions'), 'the session store must actually be asked')
+  // 诊断行**不带** activity：这一格的文案不许出现任何 activity 读数（那会是一句没观察到的陈述）。
+  assert.ok(!EVIDENCE.residentByStore.includes('activity='), 'a diagnostic row must not claim an activity reading')
+})
+
+/**
+ * **`mode:'unknown'` 的僵尸**：目录里记着这个孩子，但它那一行的 mode 运行时认不出，
+ * 于是 `listDescendants` 只给一条诊断行（`list-children.js:142-143` 的 `reason:'unsupported'`）。
+ * 那一格**不带 activity**，而「一行 activity 都没有 ⇒ 倒向 running」的老路子会让宿主重启
+ * 之后留下的它永远回 running —— 同一个 bug 在这一格上的残留。
+ *
+ * 诊断行没有现成读数，但判活还有一条**同源**依据：这条 id 在本进程的会话存储里还有没有一条
+ * 活着的会话（运行时算 activity 用的是同一个式子，`list-children.js:149`）。这一格现在
+ * 跟着一起判死。
+ */
+it('result 对 mode:unknown 的僵尸孩子（诊断行 + 存储里已经没有它）回 inactive', async () => {
+  const { tool } = harness({
+    children: ['child-1'],
+    descendants: [{ id: 'child-1', kind: 'diagnostic', reason: 'unsupported' }],
+    sessionStore: [],
+  })
+  const result = await run(tool, { action: 'result', task_id: 'child-1' }, makeCaller())
+  assert.notStrictEqual(result.status, 'running', '存储里已经没有它的活会话了，不许再说它还在跑：' + JSON.stringify(result))
+  assert.deepStrictEqual(result, { task_id: 'child-1', status: 'inactive', evidence: EVIDENCE.absentByStore })
+})
+
+it('result 连会话存储都问不到时什么都不说：回 running，而不是说孩子死了', async () => {
+  const { tool } = harness({
+    children: ['child-1'],
+    descendants: [{ id: 'child-1', kind: 'diagnostic' }],
+    sessionStoreService: false,
+  })
+  const result = await run(tool, { action: 'result', task_id: 'child-1' }, makeCaller())
+  assert.deepStrictEqual(result, { task_id: 'child-1', status: 'running', evidence: EVIDENCE.noLivenessReading })
+})
+
+it('result 对「目录里在、descendants 里却没有它的行」的孩子同样不许凭空说它还在跑', async () => {
+  // 目标版本（`dsh-subagent@0.2.0-rc.2`）给不出这种形状（每个走过的目录项都落一行），
+  // 但另一个修订会丢掉解析不出的候选行 —— 这一格同样是「一处读数都没有」，不许凭空断言。
+  const { tool } = harness({ children: ['child-1'], descendants: [] })
+  const result = await run(tool, { action: 'result', task_id: 'child-1' }, makeCaller())
+  assert.deepStrictEqual(result, { task_id: 'child-1', status: 'running', evidence: EVIDENCE.noLivenessReading })
+})
+
+it('result 查不动目录时 fail-open 回 running —— 一次查询失败不许被说成孩子死了', async () => {
+  const { tool } = harness({ children: ['child-1'], descendantsThrow: true })
+  const result = await run(tool, { action: 'result', task_id: 'child-1' }, makeCaller())
+  assert.deepStrictEqual(result, { task_id: 'child-1', status: 'running', evidence: EVIDENCE.catalogUnreadable })
+})
+
+/**
+ * **刚结算、通知还没被认领**的那段窗口：孩子先离开 sessions（宿主在通知之前就 `dispose` 了它，
+ * `dsh-subagent/lib/index.js:1239` → `:1248`），通知先落进父代理的收件箱、下一次步界才进历史。
+ * 这一段里 `activity` 已经是 `inactive` —— 只按 liveness 判，就会把一个**正常结算**的孩子
+ * 说成僵尸。所以「有通知」必须是**两个落点**：会话历史 + 当刻收件箱。
+ */
+it('结算通知已投进收件箱、还没认领进历史时按 completed，不许把刚结算的孩子说成不在了', async () => {
+  const { tool } = harness({ children: ['child-1'], descendants: [{ id: 'child-1', activity: 'inactive' }] })
+  const inbox = { nextStep: [fakeSettle('child-1', 'settled: via inbox')] }
+  const result = await run(tool, { action: 'result', task_id: 'child-1' }, makeCaller([], AbortSignal.timeout(200), inbox))
+  assert.deepStrictEqual(result, {
+    task_id: 'child-1',
+    status: 'completed',
+    result: 'settled: via inbox',
+    evidence: EVIDENCE.noticeInInbox,
+  })
+})
+
+it('收件箱里是别的孩子的通知时不算数（对号入座，不许张冠李戴）', async () => {
+  const { tool } = harness({ children: ['child-1'], descendants: [{ id: 'child-1', activity: 'inactive' }] })
+  const inbox = { nextTurn: [fakeSettle('child-9', 'settled: 别人的')] }
+  const result = await run(tool, { action: 'result', task_id: 'child-1' }, makeCaller([], AbortSignal.timeout(200), inbox))
+  assert.deepStrictEqual(result, { task_id: 'child-1', status: 'inactive', evidence: EVIDENCE.absentByActivity })
 })
 
 /**
