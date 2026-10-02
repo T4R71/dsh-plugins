@@ -1,6 +1,0 @@
-{
-  "meta": {
-    "title": "System-prompt rewriting",
-    "description": "Section-name-matched rewriting of the system prompt: an observe-only baseline pass plus a rule-driven replace, delete, prepend, append or wrap pass."
-  }
-}

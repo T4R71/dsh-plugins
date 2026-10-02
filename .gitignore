@@ -5,8 +5,9 @@ dist/
 *.tgz
 *.tsbuildinfo
 
-# 锁文件（本仓库不提交）
-pnpm-lock.yaml
+# 锁文件改为提交（2026-10-02 用户批准）：
+#   git worktree 从已提交状态分叉，锁文件不进库的话新线拿不到可复现的依赖 ——
+#   实测过 --frozen-lockfile 直接失败。锁文件本来就该进库。
 
 # 内部发布笔记
 RELEASE-NOTES.md
@@ -22,3 +23,8 @@ Thumbs.db
 
 # 子代理的一次性工作目录（临时脚本与备份，不属于产品）
 scratch/
+
+# packages/dsh-prompt-plan 是一个 junction（→ packages/prompt-plan），不是真包。
+#   它被误提交进版本库后，worktree 里会变成一份真实的重复副本，让 pnpm 以为有 11 个
+#   工作区项目而锁文件只有 10 个 importer —— 实测导致 --frozen-lockfile 直接失败。
+packages/dsh-prompt-plan/
