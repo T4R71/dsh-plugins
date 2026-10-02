@@ -329,12 +329,19 @@ export const inject = ['tools', 'subagents', 'userQuestions', 'systemPrompt', 'a
  */
 export interface ResolvedConfig {
   readonly provider: string
-  /** 全局规则段：每一个代理共享的一段规则；空串表示没有这一段。 */
-  readonly defaultRules: string
+  /** 全局规则段：每一个代理共享的一段规则；空串表示没有这一段。省略即没有。 */
+  readonly defaultRules?: string
   /** 身份名 → 身份段（人格） + 工具围栏 + 深度上限 + 丢弃清单。 */
   readonly presets: Readonly<Record<string, PresetSpec>>
-  /** 后端账本文件的位置；空串走 `ledgerPathFor` 的默认位置。 */
-  readonly runsFile: string
+  /**
+   * 后端账本文件的位置；空串走 `ledgerPathFor` 的默认位置。
+   *
+   * 两格都标成可选是**实情**而不是宽容：schema 里它们各有默认值（空串），所以「没写」
+   * 与「写空串」在解析之后是同一件事，代码里两处也都按 `?? ''` 读。这样单测可以直接
+   * 只给真正要考的那几格，不必抄一遍默认值 —— 抄出来的默认值一旦哪天变了，测试还会
+   * 静默绿着。
+   */
+  readonly runsFile?: string
 }
 
 /**
@@ -378,7 +385,7 @@ export interface PresetAgentOptionsField {
   maxTokens?: number
 }
 
-export const Config: z<{ provider: string; defaultRules: string; presets: Dict<PresetSpecField>; runsFile: string }> = z.object({
+export const Config: z<{ provider: string; defaultRules?: string; presets: Dict<PresetSpecField>; runsFile?: string }> = z.object({
   /** `ctx.subagents` 里的 provider 名，必填——`startContinuable` 的第一个参数就是它。 */
   provider: z.string().required(),
   /**
@@ -1647,9 +1654,9 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
           return await dispatchTo(parent, {
             prompt: args.prompt ?? '',
             ...args.preset === undefined ? {} : { preset: args.preset },
-                  ...args.label === undefined ? {} : { label: args.label },
+            ...args.label === undefined ? {} : { label: args.label },
             ...args.bind === undefined ? {} : { bind: args.bind },
-                  }, exec.signal)
+          }, exec.signal)
         }
         case 'run': {
           const parent = requireAgent(exec)

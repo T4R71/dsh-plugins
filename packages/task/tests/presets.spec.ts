@@ -95,7 +95,7 @@ it('返回的数组是副本——调用方改不动配置表', () => {
  * 一条证明「省略 = 继承」真的通，一条证明「显式空 = fail closed」没有被顺手放开。
  */
 it('省略 allow/deny 的 preset 真的能继承全部工具——物化曾让这条路 100% 抛错', () => {
-  const parsed = Config({ provider: 'spawn', defaultRules: '', runsFile: '', presets: { lead: { persona: 'x', maxDepth: 3 } } })
+  const parsed = Config({ provider: 'spawn', presets: { lead: { persona: 'x', maxDepth: 3 } } })
   const spec = parsed.presets['lead'] as { allow?: unknown; deny?: unknown }
   // 先钉住 schema 本身：省略必须保持缺席，而不是变成 []
   assert.strictEqual(spec.allow, undefined)
@@ -107,7 +107,7 @@ it('省略 allow/deny 的 preset 真的能继承全部工具——物化曾让�
 it('显式 allow: [] 仍然 fail closed——修 schema 没有顺手放开这条护栏', () => {
   // 「一个工具都不许用」与「不限」是两种相反的意图。物化让它们在输出里无法区分，
   // 所以显式空数组必须继续报错，否则前者会被静默解释成后者——那是权限提升。
-  const parsed = Config({ provider: 'spawn', defaultRules: '', runsFile: '', presets: { none: { persona: 'x', allow: [], maxDepth: 1 } } })
+  const parsed = Config({ provider: 'spawn', presets: { none: { persona: 'x', allow: [], maxDepth: 1 } } })
   assert.throws(() => resolvePreset(parsed.presets, 'none'), EmptyPresetFilterError)
 })
 
@@ -175,8 +175,6 @@ it('没声明 agentOptions 时结果里没有这个键——省略就是继承�
 it('Config schema 收下 agentOptions，且省略时不物化', () => {
   const parsed = Config({
     provider: 'spawn',
-    defaultRules: '',
-    runsFile: '',
     presets: {
       recon: { persona: 'r', agentOptions: { reasoningEffort: 'low', model: 'm-1', maxTokens: 2048 } },
       impl: { persona: 'i' },

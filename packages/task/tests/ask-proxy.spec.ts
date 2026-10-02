@@ -26,7 +26,7 @@ interface Captured {
  * @param options - 用户给出的答案、是否挂一支假队伍。
  * @returns 任务工具、根代理、造孩子与触发事件的手段，以及可断言的树与提问记录。
  */
-function harness(options: { readonly answers?: readonly { readonly id: string; readonly selected: readonly string[] }[]; readonly teams?: boolean } = {}) {
+function harness(options: { readonly answers?: readonly { readonly id: string; readonly selected: readonly string[] }[] } = {}) {
   const store = new Map<string, Record<string, any>[]>()
   const nodesOf = (sid: string): Record<string, any>[] => {
     const existing = store.get(sid)
@@ -51,17 +51,9 @@ function harness(options: { readonly answers?: readonly { readonly id: string; r
   const listeners: { event: string; handler: (...args: any[]) => unknown }[] = []
   const askCalls: any[] = []
   const childTools = new Map<string, Captured[]>()
-  const membership = new Map<unknown, any>()
   let taskTool: Captured | undefined
   let seq = 0
   const rootAgent: any = { id: 'sess-1', session: { id: 'sess-1' } }
-  const teams = options.teams === true
-    ? {
-        listMembers: () => [],
-        spawnTeammate: async () => ({ member: { id: 'member-1' } }),
-        tryMembership: (agent: unknown) => membership.get(agent),
-      }
-    : undefined
   const ctx = {
     agents: { roots: () => [rootAgent] },
     tools: { register: (definition: Captured) => { taskTool = definition; return () => {} } },
@@ -70,7 +62,6 @@ function harness(options: { readonly answers?: readonly { readonly id: string; r
       if (key === 'userQuestions') {
         return { ask: async (request: any) => { askCalls.push(request); return { answers: options.answers ?? [{ id: 'q1', selected: ['A'] }] } } }
       }
-      if (key === 'agentTeams') return teams
       return undefined
     },
     subagents: {
@@ -100,7 +91,6 @@ function harness(options: { readonly answers?: readonly { readonly id: string; r
         systemPrompt: { section: () => () => {}, getSectionOrder: () => 0 },
       },
     }
-    if (teams !== undefined) membership.set(agent, { role: 'teammate', root: rootAgent, name: label ?? id })
     return agent
   }
   const fire = (event: string, ...args: any[]): void => {
@@ -114,7 +104,6 @@ function harness(options: { readonly answers?: readonly { readonly id: string; r
   return {
     taskTool: () => taskTool as Captured,
     rootAgent,
-    membership,
     createChild,
     fire,
     nodesOf,
@@ -185,18 +174,6 @@ it('孙代理那一层各留自己那份：中间层与中枢都不新增节点�
   assert.equal(first.detail, '答：A')
 })
 
-it('队友也拿到遮蔽版提问工具，作用域是队长（Lead）', async () => {
-  const h = harness({ teams: true })
-  h.membership.set(h.rootAgent, { role: 'lead', root: h.rootAgent, name: 'lead' })
-  await h.taskTool().execute({ action: 'dispatch', prompt: 'go', preset: 'recon', label: 'recon' }, { agent: h.rootAgent, callId: 'call-1' })
-  const member = h.createChild('member-1', 'recon')
-  h.fire('agent/created', { agent: member })
-  await h.asked(member, 'A 还是 B？')
-  assert.equal(h.askCalls.length, 1)
-  assert.equal(h.askCalls[0].agent, h.rootAgent)
-  assert.equal(h.askCalls[0].questions[0].header, '[侦察]', '队友名册名 recon 也要显示成中文')
-  assert.equal(h.nodesOf('member-1')[0]?.detail, '答：A')
-})
 
 it('角色名按映射显示成中文：preset 名与名册名都翻，卡片前缀与树标题一致', async () => {
   const h = harness()

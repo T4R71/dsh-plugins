@@ -269,7 +269,11 @@ function harness(options: { tree?: boolean; children?: readonly (string | { read
     },
     // 自动放行要 `ctx.agents.get(sid)` 拿当刻活着的父 Agent；宿主自己也是这么拿的
     // （dsh-subagent/lib/index.js:1257）。不给就跳过并记日志 —— 那条路也测了。
-    agents: { get: () => options.parentAgent },
+    //
+    // `roots()` 是**提问根**那条路要的：直连派发后靠它认出「孩子的提问该落到哪张卡上」
+    // （`rootAgentOf`）。不认根就不装遮蔽版提问工具 —— 宿主里不给它确实是这种后果，
+    // 所以这里给的是与宿主同形的答案：被派发的这一支就是根。
+    agents: { get: () => options.parentAgent, roots: () => (options.parentAgent === undefined ? [] : [options.parentAgent]) },
     // 「不通知中枢」的另一个计数点：插件若改走 `ctx.inject` 那条路会被记下来。
     inject: () => { notified.push('inject'); return undefined },
     subagents: {
@@ -433,7 +437,7 @@ it('dispatch 把 persona 与 toolFilter 平铺进 request，并包成 startConti
   systemPrompt: { section: () => () => {} },
   on: () => () => {},
   }
-  apply(ctx as never, { provider: 'default', defaultRules: '', runsFile: '', presets: { reader: { persona: 'P', allow: ['read'] } } })
+  apply(ctx as never, { provider: 'default', presets: { reader: { persona: 'P', allow: ['read'] } } })
   const result = await run(captured as Captured, { action: 'dispatch', prompt: 'go', preset: 'reader', label: 'L' }, caller)
   // bind 没传 ⇒ 结果里**没有** `node` 这个键。旧断言写的是 `node: undefined`，
   // 那正是把这个坏行为钉成期望值的元凶（真机于是炸在无损序列化上）。
@@ -471,8 +475,6 @@ it('dispatch 把 preset 的 agentOptions 放进 request——角色自己钉住�
   }
   apply(ctx as never, {
     provider: 'default',
-    defaultRules: '',
-    runsFile: '',
     presets: { recon: { persona: 'R', agentOptions: { reasoningEffort: 'low', maxTokens: 4096 } } },
   })
   await run(captured as Captured, { action: 'dispatch', prompt: 'go', preset: 'recon' }, caller)
@@ -496,7 +498,7 @@ it('preset 没声明 agentOptions 时 request 里没有这个键——省略就�
     systemPrompt: { section: () => () => {} },
     on: () => () => {},
   }
-  apply(ctx as never, { provider: 'default', defaultRules: '', runsFile: '', presets: { recon: { persona: 'R' } } })
+  apply(ctx as never, { provider: 'default', presets: { recon: { persona: 'R' } } })
   await run(captured as Captured, { action: 'dispatch', prompt: 'go', preset: 'recon' }, caller)
   const spec = seen[0] as { request: Record<string, unknown> }
   // 全等之外还要单独钉 hasOwn：物化出来的 `{}` 会让「省略」与「显式给空」长得一样。
@@ -535,7 +537,7 @@ it('归一：dispatch 带 nodes 时先写树再派活，一次调用完成建节
   systemPrompt: { section: () => () => {} },
   on: () => () => {},
   }
-  apply(ctx as never, { provider: 'default', defaultRules: '', runsFile: '', presets: { reader: { persona: 'P' } } })
+  apply(ctx as never, { provider: 'default', presets: { reader: { persona: 'P' } } })
   const result = await run(captured as Captured, {
     action: 'dispatch',
     prompt: 'go',
@@ -585,7 +587,7 @@ it('bind 把节点推成 in_progress——参数描述承诺的迁移必须真�
   systemPrompt: { section: () => () => {} },
   on: () => () => {},
   }
-  apply(ctx as never, { provider: 'default', defaultRules: '', runsFile: '', presets: {} })
+  apply(ctx as never, { provider: 'default', presets: {} })
   // 节点来自更早的一次 plan：本次 dispatch 不写树，只 bind 到既有节点。
   await run(captured as Captured, { action: 'dispatch', prompt: 'go', bind: 'existing-1' }, caller)
   assert.deepStrictEqual(order, ['start', 'bind:existing-1:child-5', 'step:existing-1:in_progress'])
@@ -618,7 +620,7 @@ it('dispatch 省略 nodes 时一个字都不写树——不带 bind 的老用法
   systemPrompt: { section: () => () => {} },
   on: () => () => {},
   }
-  apply(ctx as never, { provider: 'default', defaultRules: '', runsFile: '', presets: {} })
+  apply(ctx as never, { provider: 'default', presets: {} })
   const result = await run(captured as Captured, { action: 'dispatch', prompt: 'go' }, caller)
   assert.deepStrictEqual(order, ['start'], 'no nodes and no bind must touch the tree not at all')
   assert.strictEqual('node' in result, false, 'no bind still means the node key is absent')
@@ -646,7 +648,7 @@ it('dispatch 的 replace 标志透传给树写入——整树替换在同一调�
   systemPrompt: { section: () => () => {} },
   on: () => () => {},
   }
-  apply(ctx as never, { provider: 'default', defaultRules: '', runsFile: '', presets: {} })
+  apply(ctx as never, { provider: 'default', presets: {} })
   await run(captured as Captured, {
     action: 'dispatch', prompt: 'go', replace: true,
     nodes: [{ id: 'only', title: 'only node' }],
@@ -920,7 +922,7 @@ it('dispatch 把 drop 编进 persona，随身份一起走', async () => {
     systemPrompt: { section: () => () => {} },
   on: () => () => {},
   }
-  apply(ctx as never, { provider: 'default', defaultRules: '', runsFile: '', presets: { scout: { persona: 'P', drop: ['plan:policy'] } } })
+  apply(ctx as never, { provider: 'default', presets: { scout: { persona: 'P', drop: ['plan:policy'] } } })
   await run(captured as Captured, { action: 'dispatch', prompt: 'go', preset: 'scout' }, makeCaller())
   const persona = (seen[0] as { request: { persona: string } }).request.persona
   assert.deepStrictEqual(decodeDropDirective(persona), { drop: ['plan:policy'], text: 'P' })
@@ -999,7 +1001,7 @@ it('显式给了身份名就按身份走，与默认那支互不干扰', async (
     systemPrompt: { section: () => () => {}, getSectionOrder: () => 0 },
     on: () => () => {},
   }
-  apply(ctx as never, { provider: 'default', defaultRules: '', runsFile: '', presets: { lead: { persona: '你是中枢。' }, recon: { persona: '你是侦察。', deny: ['edit', 'write'] } } })
+  apply(ctx as never, { provider: 'default', presets: { lead: { persona: '你是中枢。' }, recon: { persona: '你是侦察。', deny: ['edit', 'write'] } } })
   await run(captured as Captured, { action: 'dispatch', prompt: 'go', preset: 'recon' }, caller)
   const spec = seen[0] as { request: Record<string, unknown> }
   // persona 前缀会挂一层丢弃指令：deny 掉的工具，其说明段不该留在这一支的提示词里。
@@ -1290,7 +1292,7 @@ it('派发简报里的两行状态文案，就是结算监听器认的那两行�
     systemPrompt: { section: () => () => {} },
     on: () => () => {},
   }
-  apply(ctx as never, { provider: 'default', defaultRules: '', runsFile: '', presets: {} })
+  apply(ctx as never, { provider: 'default', presets: {} })
   await run(captured as Captured, { action: 'dispatch', prompt: 'go', bind: 'impl' }, caller)
   assert.ok(brief.includes('【节点状态】'), '锚点不许动')
   assert.ok(brief.includes('impl'), '必须点名被绑定的节点')

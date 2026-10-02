@@ -234,6 +234,7 @@ function parseRunNode(value: unknown): RunNodeRecord | undefined {
   // conclusion 同样必须读回来：读-改-写是**整份**重写的，不认这一格的话，
   // 隔壁节点随便一条记账都会把已经存下的结论抹掉 —— 那正好会让「抗压缩」这件事失效。
   if (typeof value.conclusion === 'string') node.conclusion = value.conclusion
+  return node
 }
 
 /**
