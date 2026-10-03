@@ -25,7 +25,22 @@ export type NodeLife = 'alive' | 'done' | 'dead' | 'orphan'
 export type NodeStatus = 'pending' | 'in_progress' | 'completed' | 'blocked'
 
 /** 树节点：宿主 PlanNode 的形状（多一个字段都会被 plan_write 拒绝）。 */
-export interface TreeNode {
+export interface TreeNode extends NodeFields {
+  children?: TreeNode[] | undefined
+}
+
+/**
+ * 读取层解出来的节点：与 `TreeNode` 同一套字段，另外可能带着宿主真正存放回答的
+ * `answer` 字段（见 `plan-tree-data.ts`）。下面这些判定函数两边都收。
+ */
+export interface ReadTreeNode extends NodeFields {
+  /** 用户对这一步提问的回答；`detail` 里那句「答：」是历史写法，两者都可能出现。 */
+  answer?: string | undefined
+  children?: ReadTreeNode[] | undefined
+}
+
+/** 两种节点共有的那些字段。 */
+interface NodeFields {
   id: string
   title: string
   status: NodeStatus
@@ -33,7 +48,6 @@ export interface TreeNode {
   task?: string | undefined
   assignedTo?: string | undefined
   dependsOn?: string[] | undefined
-  children?: TreeNode[] | undefined
 }
 
 /** detail 里能被识别的语义前缀。 */
@@ -55,7 +69,7 @@ function parse(detail: string | undefined): { prefix: Prefix | ''; body: string 
  * @param upstreamDead - 祖先里有没有已经走不通的
  * @returns 生命状态
  */
-export function lifeOf(node: TreeNode, upstreamDead: boolean): NodeLife {
+export function lifeOf(node: ReadTreeNode, upstreamDead: boolean): NodeLife {
   const { prefix } = parse(node.detail)
   if (node.status === 'completed') return 'done'
   if (node.status === 'blocked' || prefix === '死因：') return 'dead'
@@ -69,7 +83,7 @@ export function lifeOf(node: TreeNode, upstreamDead: boolean): NodeLife {
  * @param node - 树节点
  * @returns 可直接显示的死因
  */
-export function deathReason(node: TreeNode): string {
+export function deathReason(node: ReadTreeNode): string {
   const { prefix, body } = parse(node.detail)
   if (prefix === '死因：' && body) return body
   if (body) return body
@@ -82,7 +96,7 @@ export function deathReason(node: TreeNode): string {
  * @param life - 已算出的生命状态
  * @returns 呈现种类
  */
-export function kindOf(node: TreeNode, life: NodeLife): NodeKind {
+export function kindOf(node: ReadTreeNode, life: NodeLife): NodeKind {
   const { prefix } = parse(node.detail)
   if (prefix === '答：' || prefix === '注：') return 'note'
   if (prefix === '归并：') return 'merge'
@@ -96,7 +110,7 @@ export function kindOf(node: TreeNode, life: NodeLife): NodeKind {
  * @param node - 树节点
  * @returns 副标题文本，没有就返回空串
  */
-export function subtitleOf(node: TreeNode): string {
+export function subtitleOf(node: ReadTreeNode): string {
   const { prefix, body } = parse(node.detail)
   // 死因与回答各有专属位置，不在副标题里重复一遍。
   if (prefix === '死因：' || prefix === '答：') return ''
@@ -104,11 +118,17 @@ export function subtitleOf(node: TreeNode): string {
 }
 
 /**
- * 用户问答的正文（只有「答：」节点有）。
+ * 用户问答的正文。
+ *
+ * 两个来源，顺序钉死：宿主的 `answer` 字段是回答**真正的存放位置**（旧实现整个漏掉了
+ * 它，带字段的回答在面板上一字不显示）；字段缺席或为空时才回落到 `detail` 里那句
+ * 「答：」—— 那是老节点承载回答的写法。两种都要能读，且**不重复**拼在一起。
  * @param node - 树节点
  * @returns 回答文本，没有就返回空串
  */
-export function answerOf(node: TreeNode): string {
+export function answerOf(node: ReadTreeNode): string {
+  const own = node.answer
+  if (own !== undefined && own !== '') return own
   const { prefix, body } = parse(node.detail)
   return prefix === '答：' ? body : ''
 }

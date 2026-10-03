@@ -30,6 +30,14 @@ export interface PlanNode {
   detail?: string | undefined
   task?: string | undefined
   assignedTo?: string | undefined
+  /**
+   * 用户对这一步提问的回答（宿主 `plan_ask` 写下的那个字段）。
+   *
+   * 与 `detail` 里的「答：」前缀不是一回事：前缀是**历史**写法（旧节点靠它承载回答，
+   * 见 `semantics.ts`），而这个字段是宿主真正的存放位置。以前这里只解出前缀那一套，
+   * 于是带字段的回答在面板上整个消失 —— 现在两者都能显示。
+   */
+  answer?: string | undefined
   dependsOn?: string[] | undefined
   children?: PlanNode[] | undefined
 }
@@ -77,6 +85,7 @@ function planNodeOf(value: unknown): PlanNode | undefined {
   if (typeof value.detail === 'string') node.detail = value.detail
   if (typeof value.task === 'string') node.task = value.task
   if (typeof value.assignedTo === 'string') node.assignedTo = value.assignedTo
+  if (typeof value.answer === 'string') node.answer = value.answer
   if (Array.isArray(value.dependsOn) && value.dependsOn.every(dep => typeof dep === 'string')) {
     node.dependsOn = [...value.dependsOn as string[]]
   }
@@ -187,6 +196,7 @@ function cloneNode(node: PlanNode): PlanNode {
   if (node.detail !== undefined) copy.detail = node.detail
   if (node.task !== undefined) copy.task = node.task
   if (node.assignedTo !== undefined) copy.assignedTo = node.assignedTo
+  if (node.answer !== undefined) copy.answer = node.answer
   if (node.dependsOn !== undefined) copy.dependsOn = [...node.dependsOn]
   if (node.children !== undefined) copy.children = node.children.map(cloneNode)
   return copy
@@ -215,6 +225,7 @@ function renameSubtree(node: PlanNode, prefix: string): PlanNode {
   if (node.detail !== undefined) copy.detail = node.detail
   if (node.task !== undefined) copy.task = node.task
   if (node.assignedTo !== undefined) copy.assignedTo = node.assignedTo
+  if (node.answer !== undefined) copy.answer = node.answer
   if (node.dependsOn !== undefined) copy.dependsOn = node.dependsOn.map(dep => `${prefix}:${dep}`)
   if (node.children !== undefined) copy.children = node.children.map(kid => renameSubtree(kid, prefix))
   return copy

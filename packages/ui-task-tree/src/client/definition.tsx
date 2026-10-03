@@ -1,8 +1,8 @@
 /**
  * 第一阶段注册：task-tree 这个标签页类型是什么。
  *
- * 它是个页，不是查看器：不认领地址。面板自己读宿主那份设置文档里的 `plan-tree-sessions`
- * 命名空间（经 `ctx.configForms` 的镜像），ui-sidebar-right 完全不知道本包存在。
+ * 它是个页，不是查看器：不认领地址。面板自己从宿主那条只读路由（`GET /t4/plan-tree`）
+ * 取树，ui-sidebar-right 完全不知道本包存在。
  */
 import type { SidebarRightTabDefinition } from '@deepseek-ai/dsh-client-ui-sidebar-right/client'
 import type { TranslateNS } from '@deepseek-ai/dsh-client-locale/client'

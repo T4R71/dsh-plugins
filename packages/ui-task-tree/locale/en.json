@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Task-tree sidebar",
-    "description": "Task-tree tab for the right Sidebar: the session's plan drawn as an outline, read from the host's settings namespace through the shared mirror."
+    "description": "Task-tree tab for the right Sidebar: the session's plan drawn as an outline, read from the host's read-only plan route."
   }
 }

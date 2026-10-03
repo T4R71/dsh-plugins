@@ -1,10 +1,10 @@
 /**
  * 任务树面板：右侧边栏的一页，只有一种呈现 —— 层级大纲。
  *
- * 读数来自宿主写进自有设置命名空间 \`plan-tree-sessions\` 的那棵树：目录实例在
- * \`index.ts\` 里对着 \`ctx.configForms.describe()\` 建成，经席位注入到这里（见
- * \`./plan-tree.ts\`）。会话日志里已经没有这棵树了 —— 宿主曾用两个不在 0.1.7
- * 白名单里的事件类型承载它，而持久化读路径会因此拒绝解释整个 log。
+ * 读数来自宿主那条只读 HTTP 路由（\`GET /t4/plan-tree\`）：目录实例在 \`index.ts\` 里
+ * 建成，经席位注入到这里（见 \`./plan-tree.ts\`）。这棵树既不在会话日志里（宿主曾用两个
+ * 不在 0.1.7 白名单里的事件类型承载它，持久化读路径会因此拒绝解释整个 log），也不在
+ * 设置文档里了（那份镜像会把整棵树复制进 profile，文档随会话一路长）。
  *
  * 折叠状态在浏览器这一侧，不影响宿主：折叠只是「这一段先不画」。
  *
@@ -18,9 +18,6 @@
  */
 import { useMemo, useState, useSyncExternalStore, type ReactNode } from 'react'
 import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
-// Type-only: 与 index.ts 同一个理由 —— 拉入 ctx.configForms 的 Context 合并。
-import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
-import type {} from '@t4r71/dsh-plan-tree/client'
 import { defaultCollapsed, type OwnerIndex } from './list.ts'
 import type { PlanTreeDirectory } from './plan-tree.ts'
 import { TaskListView } from './TaskListView.tsx'
@@ -34,8 +31,8 @@ import css from './TaskTreePanel.module.css'
 /**
  * 注入面：本包在 \`index.ts\` 里按席位 inject 下发的目录实例。
  *
- * 目录**不在组件里**建：它订阅共享镜像并做本地去重，生命周期属于插件而不是某一次渲染，
- * 建在组件里会在每次重挂载时重复订阅（而且 \`ctx\` 不是席位属性）。
+ * 目录**不在组件里**建：它轮询宿主那条路由并做本地去重，生命周期属于插件而不是某一次
+ * 渲染，建在组件里会在每次重挂载时多起一个定时器（而且 \`ctx\` 不是席位属性）。
  */
 /**
  * 读取侧合并还要往下拼几层。
@@ -59,9 +56,10 @@ export type TaskTreePanelProps =
 /**
  * 右侧边栏的「任务树」页。
  *
- * 取数失败不再静默：\`treeOf\` 给三态（有记录 / 没有记录 / 读不到文档），后两者画出
- * 不同的空态文案。旧的「取不到投影就 return null」分支把「这份 profile 没装宿主那一行」
- * 与「这条会话还没有计划」显示成同一个空白，谁也看不出是哪一种。
+ * 取数失败不再静默：\`mergedTreeOf\` 给三态（有记录 / 没有记录 / 取不到），后两者画出
+ * 不同的空态文案。旧的「取不到投影就 return null」分支把「读不到宿主的计划存储」与
+ * 「这条会话还没有计划」显示成同一个空白 —— 前者是「不知道」，后者是「确实没有」，
+ * 把前者画成后者就是拿不知道冒充事实。
  *
  * @param props - 会话标准套件 + 注入目录 + 本包文案席位
  * @returns 面板

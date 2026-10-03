@@ -1,8 +1,8 @@
 /**
  * taskTree 命名空间的中英文字典。
  *
- * 文案只有类型名、行内前缀和两种空态 —— 树的内容全部来自宿主写下的那份设置文档
- * （镜像经 `ctx.configForms.describe()` 到达本包），浏览器不拥有树的任何状态。
+ * 文案只有类型名、行内前缀和两种空态 —— 树的内容全部来自宿主那条只读 HTTP 路由
+ * （`GET /t4/plan-tree`），浏览器不拥有树的任何状态。
  */
 import type {} from '@deepseek-ai/dsh-client-ui-slots'
 
@@ -29,9 +29,9 @@ export const zh = {
 
   'empty.title': '还没有任务树',
   'empty.hint': '主代理声明计划后，这里会长出树',
-  // 与上面那条是两件事：那不是「还没有计划」，是本进程读不到承载计划的那份文档。
+  // 与上面那条是两件事：那不是「还没有计划」，是本进程读不到承载计划的宿主存储。
   // 旧实现在这种情况下直接 return null，谁也不知道空白是哪一种。
-  'view.unreadable': '读不到计划存储：这份 profile 里没有装宿主的计划行。',
+  'view.unreadable': '读不到计划存储：取不到宿主那条只读计划路由。',
 } satisfies Record<string, string>
 
 /** 键集联合类型。 */
@@ -53,5 +53,5 @@ export const en = {
 
   'empty.title': 'No task tree yet',
   'empty.hint': 'The tree appears once the lead declares a plan',
-  'view.unreadable': 'The plan store is unreadable: this profile does not mount the host plan row.',
+  'view.unreadable': 'The plan store is unreadable: the host read-only plan route did not answer.',
 } satisfies Record<TaskTreeKey, string>
