@@ -38,7 +38,10 @@ import type { PlanNode, PlanStatus } from './types.ts'
 import { planTreeStore } from './session-store.ts'
 import type { PlanTreeStore } from './session-store.ts'
 import { createTaskTreePort } from './task-tree.ts'
+import { PLAN_TREE_ROUTE, registerPlanTreeRoute } from './http-route.ts'
 export type * from './types.ts'
+export { PLAN_TREE_ROUTE, registerPlanTreeRoute } from './http-route.ts'
+export type { HttpResponse, HttpRequest, PlanTreeHttpBody, WebServerRoute, WebServerSurface } from './http-route.ts'
 
 /**
  * The narrow slice of the OPTIONAL Agent Teams service `plan_dispatch` uses.
@@ -673,6 +676,31 @@ export function apply(ctx: Context, config: ResolvedConfig = {}): void {
   // never mounted the settings service still loads this plugin, and the port's
   // writes then fail the same way the tools' do (see `PlanTreeStore.writeRecords`).
   ctx.provide('taskTree' as never, createTaskTreePort(store) as never)
+
+  // The panel's read path: the same store, served over the browser's HTTP
+  // carrier as a read-only GET (see ./http-route.ts for the route semantics and
+  // why read-only is the whole safety story there).
+  //
+  // Gated on NOTHING, for the same reason the taskTree port above is not: the
+  // panel is not a tool caller, so a deployment that turned the four tools off
+  // in favour of the sibling `task` tool still needs to SHOW the tree it is
+  // walking. Tying this to `exposeTools` would blank the sidebar in exactly the
+  // composition that replaced the tools.
+  //
+  // Registered through `ctx.inject` rather than directly, because the webserver
+  // is an INDEPENDENT row: it may be loaded before or after this plugin, and a
+  // composition without it (the Electron app, a headless run) never reaches the
+  // callback at all — which is the correct degradation, since there is no
+  // browser to read the answer. The callback's `webCtx` is used instead of the
+  // closed-over `ctx`: the injected context is the one that carries the service.
+  ctx.inject(['webServer'], (webCtx: Context) => {
+    // The disposer rides an effect so unloading this plugin releases the path,
+    // rather than leaving a handler pointing at a store that is gone.
+    webCtx.effect(
+      () => registerPlanTreeRoute(webCtx, store),
+      'plan-tree: ' + PLAN_TREE_ROUTE,
+    )
+  })
 
   // Cancellation before anything is registered: a deployment that mounted the
   // sibling `task` tool in place of these four registers neither the tools nor
