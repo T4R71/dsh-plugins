@@ -1,0 +1,16 @@
+# 组合包层：只插本包自己那一行，不碰 profile 的其余部分。
+#
+# 为什么必须有这个文件：0.2.0 的插件管理器把「是不是组合包」判在
+# `package.json` 的 `dsh.bundle.patch` 上（dsh-plugin-manager/lib/index.js
+# 的 bundleManifest：patch 缺失就返回 undefined）。没有它，这个包会被标成
+# 「异常 · not-bundle」，而且**不能被列进 profile 的 dsh.profile.bundles**。
+#
+# 反过来，客户端扫描只认「有活动 Loader 行」的包：包名没有行，`dsh.client`
+# 就不会被采集成客户端行，浏览器半边永远不下发。所以这一行是必需的 ——
+# 双轴访问模式的浏览器半边：设置页配置行 + 输入框上方的读/写两个下拉。
+#
+# 宿主半边（lib/index.js）是空插件，它存在的唯一理由是当这一行的落点。
+
+- insert:
+    - id: dual-axis-ui
+      name: '@t4r71/dsh-dual-axis-ui'

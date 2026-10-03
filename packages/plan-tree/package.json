@@ -1,7 +1,7 @@
 {
   "name": "@t4r71/dsh-plan-tree",
   "description": "Plan tree in the plugin's own settings namespace: plan_write declares the whole tree once, plan_step walks it node by node",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "publishConfig": {
     "access": "public"
   },

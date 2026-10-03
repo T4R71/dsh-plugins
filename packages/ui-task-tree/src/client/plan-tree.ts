@@ -118,28 +118,31 @@ export class PlanTreeDirectory {
   private disposed = false
 
   /**
+   * 装配时**不需要**会话 id：这条端点是批量的，取数与「要看哪条会话」无关，
+   * 后者是渲染时由面板传给 `treeOf` / `mergedTreeOf` 的。
    * @param route - 取数地址；省略即宿主的 {@link PLAN_TREE_ROUTE}
-   * @param sessionId - 当前会话 id；没有选中会话时是 undefined
    * @param fetchLike - 取数实现（测试替身用）；省略即同源 fetch
    * @param intervalMs - 轮询周期；测试要推得动定时器就得能把它调小，生产用默认值
    */
   constructor(
     private readonly route: string = PLAN_TREE_ROUTE,
-    private readonly sessionId: string | undefined = undefined,
     private readonly fetchLike: typeof fetch = defaultFetch,
     private readonly intervalMs: number = POLL_INTERVAL_MS,
   ) {
     // 初始值是 unreadable 而不是空字典：还没有从宿主那儿拿到任何东西之前，
     // 「这条会话有没有计划」是一个本进程还没有答案的问题。
     this.local = createSnapshotStore<PlanTreeSnapshot>({ kind: 'unreadable' })
-    // 有会话才发请求：没有 sessionId 时不发请求，读数就是 unreadable —— 与旧实现里
-    // 「镜像还没有答案」那一支同一个意思，绝不凭空声称「这条会话没有计划」。
-    if (this.sessionId === undefined) {
-      this.unsubscribes = []
-    } else {
-      this.unsubscribes = [this.attachVisibility(), this.startPolling()]
-      void this.refresh()
-    }
+    // **挂了就拉**，不问 sessionId。
+    //
+    // 这条端点本来就是批量的：一次回答「全部会话 → 各自那棵树」。面板要知道的那条
+    // 会话是**读取时**才定的（渲染那一刻才从 props 拿到 sessionId），而取数必须在
+    // 那之前就已经在路上 —— 否则第一次渲染必然读到 unreadable，轮询还得再等一整个
+    // 周期才补上，用户先看到的是一句「读不到」。
+    //
+    // 反过来按 sessionId 闸住取数还错在另一点：`mergedTreeOf` 要把子会话的树拼进父树，
+    // 「该问谁」本来就不止一条会话，拿当前会话当闸门等于把一份批量读数误当成单条读数。
+    this.unsubscribes = [this.attachVisibility(), this.startPolling()]
+    void this.refresh()
   }
 
   /** 稳定快照，直接交给 `useSyncExternalStore`。 */
@@ -179,7 +182,7 @@ export class PlanTreeDirectory {
 
   /** 立刻向宿主取一次（可见性变化与轮询都走它）；已经在飞的不重入。 */
   refresh(): Promise<void> {
-    if (this.disposed || this.sessionId === undefined) return Promise.resolve()
+    if (this.disposed) return Promise.resolve()
     this.inFlight ??= this.read().finally(() => { this.inFlight = undefined })
     return this.inFlight
   }

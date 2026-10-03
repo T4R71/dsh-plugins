@@ -48,9 +48,10 @@ export function apply(ctx: ClientContext): void {
   // 这里、在 effect 的 disposer 里停掉轮询与可见性订阅，而不是建在面板组件里（组件每次
   // 重挂载都会多起一个定时器）。
   //
-  // 会话 id 此刻还不知道（要等外壳开页），所以这里传 undefined：目录因此**不发任何请求**，
-  // 面板拿到的是 unreadable。等外壳长出每会话实例的装配点，会话 id 才从这个构造参数进来。
-  const directory = new PlanTreeDirectory(PLAN_TREE_ROUTE, undefined)
+  // 会话 id 此刻还不知道（要等外壳开页）—— 但这**不影响取数**：那条端点一次回答全部
+  // 会话，目录挂了就开始轮询，不拿当前会话当闸门。要看哪一条会话是**渲染时**的事，
+  // 由面板把 props 里的 sessionId 传给 treeOf / mergedTreeOf。
+  const directory = new PlanTreeDirectory(PLAN_TREE_ROUTE)
   ctx.effect(() => () => { directory.dispose() }, 'ui-task-tree: plan tree directory')
   ctx.effect(() => ctx.sidebarRightTabs.register(taskTreeDefinition(t)), 'ui-task-tree: type')
   ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'ui-task-tree: dictionaries')

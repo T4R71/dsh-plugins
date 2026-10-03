@@ -66,7 +66,7 @@ async function ticks(count: number): Promise<void> {
 
 test('the batch endpoint is read once, and a session reads its own tree and nobody else\'s', async () => {
   const route = new FakeRoute(() => ok({ trees: { s1: TREE, s2: [{ id: 'b', title: 'B', status: 'completed' }] } }))
-  const directory = new PlanTreeDirectory(PLAN_TREE_ROUTE, 's1', route.fetch)
+  const directory = new PlanTreeDirectory(PLAN_TREE_ROUTE, route.fetch)
   await settle(route)
 
   assert.deepEqual(directory.treeOf('s1'), { state: 'record', roots: TREE })
@@ -84,7 +84,7 @@ test('the batch endpoint is read once, and a session reads its own tree and nobo
 test('the merged reader grafts a dispatched sub-session\'s tree from the SAME answer', async () => {
   const child = [{ id: 'c1', title: '子步骤', status: 'pending' }]
   const route = new FakeRoute(() => ok({ trees: { s1: [{ id: 'root', title: '计划', status: 'pending', assignedTo: 'kid' }], kid: child } }))
-  const directory = new PlanTreeDirectory(PLAN_TREE_ROUTE, 's1', route.fetch)
+  const directory = new PlanTreeDirectory(PLAN_TREE_ROUTE, route.fetch)
   await settle(route)
 
   const view = directory.mergedTreeOf('s1', 2)
@@ -98,7 +98,7 @@ test('the merged reader grafts a dispatched sub-session\'s tree from the SAME an
 test('a failing endpoint reads as unreadable, never as empty', async () => {
   for (const status of [404, 500, 405]) {
     const route = new FakeRoute(() => bad(status))
-    const directory = new PlanTreeDirectory(PLAN_TREE_ROUTE, 's1', route.fetch)
+    const directory = new PlanTreeDirectory(PLAN_TREE_ROUTE, route.fetch)
     await settle(route)
     assert.deepEqual(directory.treeOf('s1'), { state: 'unreadable' }, String(status))
     assert.deepEqual(directory.mergedTreeOf('s1', 2), { state: 'unreadable' }, String(status))
@@ -107,14 +107,14 @@ test('a failing endpoint reads as unreadable, never as empty', async () => {
 
   // 网络层直接抛（掉线、跨源被拦）：同样是「不知道」。
   const throwing = new FakeRoute(() => { throw new Error('network down') })
-  const offline = new PlanTreeDirectory(PLAN_TREE_ROUTE, 's1', throwing.fetch)
+  const offline = new PlanTreeDirectory(PLAN_TREE_ROUTE, throwing.fetch)
   await settle(throwing)
   assert.deepEqual(offline.treeOf('s1'), { state: 'unreadable' })
   offline.dispose()
 
   // 答了 200 但根本不是 JSON：也读不动，不能当空。
   const garbage = new FakeRoute(() => ({ ok: true, status: 200, json: () => Promise.reject(new Error('not json')) }) as unknown as Response)
-  const broken = new PlanTreeDirectory(PLAN_TREE_ROUTE, 's1', garbage.fetch)
+  const broken = new PlanTreeDirectory(PLAN_TREE_ROUTE, garbage.fetch)
   await settle(garbage)
   assert.deepEqual(broken.treeOf('s1'), { state: 'unreadable' })
   broken.dispose()
@@ -122,7 +122,7 @@ test('a failing endpoint reads as unreadable, never as empty', async () => {
 
 test('an empty result is EMPTY: the host really says no session declared a plan', async () => {
   const route = new FakeRoute(() => ok({ trees: {} }))
-  const directory = new PlanTreeDirectory(PLAN_TREE_ROUTE, 's1', route.fetch)
+  const directory = new PlanTreeDirectory(PLAN_TREE_ROUTE, route.fetch)
   await settle(route)
   assert.deepEqual(directory.treeOf('s1'), { state: 'empty' })
   assert.deepEqual(directory.mergedTreeOf('s1', 2), { state: 'empty' })
@@ -130,7 +130,7 @@ test('an empty result is EMPTY: the host really says no session declared a plan'
 
   // 形状不对的答案不是「空」：宿主没有说「没有计划」，只说了一些读不懂的东西。
   const wrongShape = new FakeRoute(() => ok({ tree: null }))
-  const unusable = new PlanTreeDirectory(PLAN_TREE_ROUTE, 's1', wrongShape.fetch)
+  const unusable = new PlanTreeDirectory(PLAN_TREE_ROUTE, wrongShape.fetch)
   await settle(wrongShape)
   assert.deepEqual(unusable.treeOf('s1'), { state: 'unreadable' })
   unusable.dispose()
@@ -138,7 +138,7 @@ test('an empty result is EMPTY: the host really says no session declared a plan'
 
 test('a re-read that changed nothing does NOT replace the snapshot', async () => {
   const route = new FakeRoute(() => ok({ trees: { s1: TREE } }))
-  const directory = new PlanTreeDirectory(PLAN_TREE_ROUTE, 's1', route.fetch)
+  const directory = new PlanTreeDirectory(PLAN_TREE_ROUTE, route.fetch)
   await settle(route)
   const held = directory.getSnapshot()
 
@@ -171,7 +171,7 @@ test('the directory polls the route on a cycle', async () => {
   // 周期调到 20ms：这个用例要证的是「定时器真的排上了、而且会一轮轮接着排」，
   // 不是「默认周期是 1500ms」。用真实时钟等一个短周期，比用 setImmediate 假装推得动
   // 一个 1.5 秒的定时器诚实。
-  const directory = new PlanTreeDirectory(PLAN_TREE_ROUTE, 's1', route.fetch, 20)
+  const directory = new PlanTreeDirectory(PLAN_TREE_ROUTE, route.fetch, 20)
   await settle(route)
   assert.equal(route.calls.length, 1)
   await new Promise<void>(resolve => { setTimeout(resolve, 90) })
@@ -183,7 +183,7 @@ test('the directory polls the route on a cycle', async () => {
 test('dispose stops the polling; later answers do not enter the directory', async () => {
   let answer: () => Response = () => ok({ trees: {} })
   const route = new FakeRoute(() => answer())
-  const directory = new PlanTreeDirectory(PLAN_TREE_ROUTE, 's1', route.fetch)
+  const directory = new PlanTreeDirectory(PLAN_TREE_ROUTE, route.fetch)
   await settle(route)
   assert.deepEqual(directory.treeOf('s1'), { state: 'empty' })
 
@@ -200,19 +200,17 @@ test('dispose stops the polling; later answers do not enter the directory', asyn
   assert.equal(directory.treeOf('s1').state, 'empty')
 })
 
-test('no session id means no request at all', async () => {
+test('a directory with no session id still READS the batch route — the id is a read-time question', async () => {
+  // 这条端点是批量的：一次回答全部会话。装配目录的时候还不知道要看哪一条会话
+  // （外壳还没开页），但那不该成为「一个请求都不发」的理由 —— 真那么做，第一次渲染
+  // 必然读到 unreadable，而轮询要再等一整个周期才补上。
   const route = new FakeRoute(() => ok({ trees: { s1: TREE } }))
-  const directory = new PlanTreeDirectory(PLAN_TREE_ROUTE, undefined, route.fetch)
-  await ticks(4)
+  const directory = new PlanTreeDirectory(PLAN_TREE_ROUTE, route.fetch)
   await settle(route)
-  assert.equal(route.calls.length, 0)
-  // 没有人问过宿主，所以什么都不能声称 —— 特别是不能说「这条会话没有计划」。
-  assert.deepEqual(directory.treeOf(undefined), { state: 'unreadable' })
-  assert.deepEqual(directory.treeOf('s1'), { state: 'unreadable' })
-  assert.deepEqual(directory.mergedTreeOf('s1', 2), { state: 'unreadable' })
-  let notified = 0
-  directory.subscribe(() => { notified += 1 })
-  await directory.refresh()
-  assert.equal(notified, 0)
+  assert.equal(route.calls.length, 1)
+  assert.equal(route.calls[0]?.url, PLAN_TREE_ROUTE)
+  // 字典拿到了：有会话的那条读作 record，没会话的调用方读作 empty。
+  assert.deepEqual(directory.treeOf('s1'), { state: 'record', roots: TREE })
+  assert.deepEqual(directory.treeOf(undefined), { state: 'empty' })
   directory.dispose()
 })
