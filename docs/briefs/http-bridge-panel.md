@@ -20,10 +20,15 @@
    只有确实依赖「镜像里那个命名空间字典」形状的地方才需要调整。
 3. **只改取值层**：`src/client/plan-tree.ts` 的 `PlanTreeDirectory` 是唯一要重写的类。
    它的对外面保持：`getSnapshot` / `subscribe` / `treeOf` / `mergedTreeOf` / `dispose`。
-4. **变更通知**：没有服务器推送，用轮询（建议 1500–2000ms）＋ `visibilitychange` 时立刻拉一次。
+4. **用批量端点取数（关键）**：面板的 `mergedTreeOf` 需要**同时**看到多条会话的树 ——
+   父树节点上的 `assignedTo` 指向子会话 id，合并要拿那条子会话的树整体挂上去
+   （默认 maxDepth=2）。老的 settings 镜像一次就给全部会话，所以合并是纯本地的。
+   改 HTTP 后**必须**用批量端点 `GET /t4/plan-tree` → `{trees: {sessionId: PlanNode[]}}`，
+   一次取全，本地合并照旧；**不要**为每条会话单独发请求。
+5. **变更通知**：没有服务器推送，用轮询（建议 1500–2000ms）＋ `visibilitychange` 时立刻拉一次。
    仍然用 `createSnapshotStore` 做去重：序列化结果没变就**不**换快照（否则面板会被反复重画）。
-5. **只在有会话时才拉**：没有 sessionId 时不发请求，读数与现在一致（empty）。
-6. `src/client/index.ts` 里的 `inject` 数组与 package.json 的 `dsh.client.inject`：
+6. **只在有会话时才拉**：没有 sessionId 时不发请求，读数与现在一致（empty）。
+7. `src/client/index.ts` 里的 `inject` 数组与 package.json 的 `dsh.client.inject`：
    `configForms` 若不再需要就去掉（但注意 `@deepseek-ai/dsh-client-ui-settings` 的 type-only import
    可能还被别处引用）。`PlanTreeDirectory` 的构造参数会从 describeFace 变成路由 URL 之类，一并改。
 
