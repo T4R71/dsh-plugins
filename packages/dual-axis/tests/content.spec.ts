@@ -9,10 +9,12 @@
  */
 
 import { test } from 'node:test'
+import { DatabaseSync } from 'node:sqlite'
 import assert from 'node:assert/strict'
 
 import { CONTENT_EVENT_TYPES, hasContent } from '../src/content.ts'
-import { SessionAxesStore } from '../src/session-store.ts'
+import { SESSION_AXES_FIELD, SessionAxesStore } from '../src/session-store.ts'
+import type { AxesDatabase } from '../src/session-store.ts'
 import type { EffectiveScopes } from '../src/axis.ts'
 import type { Session } from '@deepseek-ai/dsh-session'
 
@@ -113,24 +115,42 @@ async function flush(): Promise<void> {
 
 /** A fake settings service over one field, with a record of every write. */
 function fakeSettings(initial: Record<string, unknown> = {}): {
-  settings: { describe(): { ns: string; value: unknown; revision: number }[]; replace(ns: string, section: object, expected?: number): Promise<void> }
+  settings: { describe(): { ns: string; value: unknown; revision: number }[] }
   writes: unknown[]
   value(): Record<string, unknown>
+  open: (file: string) => AxesDatabase
 } {
-  let value = initial
-  let revision = 0
-  const writes: unknown[] = []
+  const handle = new DatabaseSync(':memory:') as unknown as AxesDatabase
+  handle.exec(
+    'CREATE TABLE IF NOT EXISTS dual_axis_sessions (session_id TEXT PRIMARY KEY, axes TEXT NOT NULL, updated_at INTEGER NOT NULL)',
+  )
+  // Seat the records the caller asked for, BEFORE the write counter is installed
+  // so a test counts only what the store itself wrote.
+  const seed = initial[SESSION_AXES_FIELD]
+  if (seed !== undefined && typeof seed === 'object' && seed !== null) {
+    const put = handle.prepare('INSERT INTO dual_axis_sessions (session_id, axes, updated_at) VALUES (?, ?, ?)')
+    for (const [id, record] of Object.entries(seed as Record<string, unknown>)) put.run(id, JSON.stringify(record), Date.now())
+  }
+  const rows: string[] = []
+  const realPrepare = handle.prepare.bind(handle)
+  ;(handle as { prepare: unknown }).prepare = (sql: string) => {
+    if (/^\s*(INSERT|UPDATE|DELETE)/i.test(sql)) rows.push(sql)
+    return realPrepare(sql)
+  }
+  const counter = { get length() { return rows.length } }
   return {
-    writes,
-    value: () => value,
-    settings: {
-      describe: () => [{ ns: 'dual-axis-sessions', value, revision }],
-      replace: async (_ns, section) => {
-        writes.push(section)
-        value = { ...(section as Record<string, unknown>) }
-        revision += 1
-      },
+    writes: counter as unknown as unknown[],
+    open: () => handle,
+    value: () => {
+      const out: Record<string, unknown> = {}
+      for (const row of handle.prepare('SELECT session_id, axes FROM dual_axis_sessions').all() as { session_id: string; axes: string }[]) {
+        out[row.session_id] = JSON.parse(row.axes) as unknown
+      }
+      return { [SESSION_AXES_FIELD]: out }
     },
+    // No settings document is written any more; the store still looks the
+    // service up for its own config field, so an empty describe is enough.
+    settings: { describe: () => [] },
   }
 }
 
@@ -144,18 +164,18 @@ function fakeCtx(services: Record<string, unknown>, warnings: unknown[] = []): n
 
 test('an un-frozen session answers the seed and writes NO record', async () => {
   const fake = fakeSettings()
-  const store = new SessionAxesStore(fakeCtx({ settings: fake.settings }), { sleep: async () => {} })
+  const store = new SessionAxesStore(fakeCtx({ settings: fake.settings }), { sleep: async () => {}, open: fake.open })
   assert.deepEqual(store.ensure('s1', () => PAIR, false), PAIR)
   await flush()
-  assert.equal(fake.writes.length, 0, 'a session nobody has used keeps no record')
-  assert.deepEqual(fake.value(), {})
+  assert.equal(fake.writes.length, 0, 'a session nobody has used issues no write at all')
+  assert.deepEqual(fake.value().axes, {}, 'and holds no record')
 })
 
 test('the seed is recomputed on every read while the session is un-frozen', async () => {
   // This is what makes the settings page live for a session with no content: the
   // answer is whatever the row says NOW, not what it said at creation.
   const fake = fakeSettings()
-  const store = new SessionAxesStore(fakeCtx({ settings: fake.settings }), { sleep: async () => {} })
+  const store = new SessionAxesStore(fakeCtx({ settings: fake.settings }), { sleep: async () => {}, open: fake.open })
   const first: EffectiveScopes = { read: { kind: 'all' }, write: { kind: 'workspace' } }
   const second: EffectiveScopes = { read: { kind: 'deny' }, write: { kind: 'deny' } }
   assert.deepEqual(store.ensure('s1', () => first, false), first)
@@ -166,10 +186,10 @@ test('the seed is recomputed on every read while the session is un-frozen', asyn
 
 test('a used session IS repaired to the seed', async () => {
   const fake = fakeSettings()
-  const store = new SessionAxesStore(fakeCtx({ settings: fake.settings }), { sleep: async () => {} })
+  const store = new SessionAxesStore(fakeCtx({ settings: fake.settings }), { sleep: async () => {}, open: fake.open })
   assert.deepEqual(store.ensure('s1', () => PAIR, true), PAIR)
   await flush()
-  assert.equal(fake.writes.length, 1)
+  assert.deepEqual(fake.value().axes, { s1: PAIR }, 'the seed it answered with is the record that landed')
   assert.deepEqual(store.ensure('s1', () => ({ read: { kind: 'all' }, write: { kind: 'all' } }), false), PAIR,
     'once the record lands it answers, even for a caller that judges the session empty')
 })
@@ -178,7 +198,7 @@ test('a frozen session becomes un-frozen the moment it is used', async () => {
   // The transition the rule is about: no record while empty, one record once a
   // turn lands, and the recorded pair is the seed computed at THAT moment.
   const fake = fakeSettings()
-  const store = new SessionAxesStore(fakeCtx({ settings: fake.settings }), { sleep: async () => {} })
+  const store = new SessionAxesStore(fakeCtx({ settings: fake.settings }), { sleep: async () => {}, open: fake.open })
   const atCreation: EffectiveScopes = { read: { kind: 'all' }, write: { kind: 'workspace' } }
   const atFirstTurn: EffectiveScopes = { read: { kind: 'deny' }, write: { kind: 'workspace' } }
   // The person changed the settings row between opening the session and using it.
@@ -193,10 +213,10 @@ test('the default for a caller that cannot judge content is to freeze', async ()
   // Safe direction: an unjudged session keeps the pre-existing freeze-on-first-touch
   // behaviour rather than silently following the row.
   const fake = fakeSettings()
-  const store = new SessionAxesStore(fakeCtx({ settings: fake.settings }), { sleep: async () => {} })
+  const store = new SessionAxesStore(fakeCtx({ settings: fake.settings }), { sleep: async () => {}, open: fake.open })
   assert.deepEqual(store.ensure('s1', () => PAIR), PAIR)
   await flush()
-  assert.equal(fake.writes.length, 1)
+  assert.deepEqual(fake.value().axes, { s1: PAIR }, 'an unjudged session freezes on first touch')
 })
 
 test('a session that gains content is frozen at that moment, not at creation', async () => {
@@ -206,7 +226,7 @@ test('a session that gains content is frozen at that moment, not at creation', a
   // call in between. Nothing on the live read paths fires after the content
   // exists, so the event listener is what freezes it.
   const fake = fakeSettings()
-  const store = new SessionAxesStore(fakeCtx({ settings: fake.settings }), { sleep: async () => {} })
+  const store = new SessionAxesStore(fakeCtx({ settings: fake.settings }), { sleep: async () => {}, open: fake.open })
 
   // 1. Empty session: answered by the seed, nothing written.
   const atCreation: EffectiveScopes = { read: { kind: 'all' }, write: { kind: 'workspace' } }

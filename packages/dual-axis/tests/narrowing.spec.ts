@@ -22,6 +22,7 @@
  */
 
 import { test } from 'node:test'
+import { DatabaseSync } from 'node:sqlite'
 import assert from 'node:assert/strict'
 import { mkdirSync } from 'node:fs'
 import { resolve } from 'node:path'
@@ -31,6 +32,7 @@ import type { RuleGroup, WriteNarrowing } from '../src/groups.ts'
 import { NO_NARROWING, parseNarrowing, resolveEffectiveAxes } from '../src/groups.ts'
 import { resolveScope } from '../src/scope.ts'
 import { SESSION_AXES_FIELD, SessionAxesStore, parseSessionAxesRecord } from '../src/session-store.ts'
+import type { AxesDatabase } from '../src/session-store.ts'
 
 /**
  * The two real directories the fixture works with.
@@ -76,30 +78,63 @@ function fakeStore(): {
   store: SessionAxesStore
   writes(): number
   field(): Record<string, unknown>
-  seed(record: Record<string, unknown>): void
+  seed(record: Record<string, unknown>): Promise<void>
 } {
-  let value: Record<string, unknown> = {}
-  let revision = 0
-  let writes = 0
-  const settings = {
-    describe: () => [{ ns: 'dual-axis-sessions', value, revision }],
-    replace: async (_ns: string, section: object) => {
-      writes += 1
-      value = { ...(section as Record<string, unknown>) }
-      revision += 1
-    },
+  // One in-memory database, and a counter over the WRITE statements the store
+  // issues against it. The settings double stays because the store still looks
+  // the service up; it no longer holds the records.
+  const handle = new DatabaseSync(':memory:') as unknown as AxesDatabase
+  handle.exec(
+    'CREATE TABLE IF NOT EXISTS dual_axis_sessions (session_id TEXT PRIMARY KEY, axes TEXT NOT NULL, updated_at INTEGER NOT NULL)',
+  )
+  const rows: string[] = []
+  const realPrepare = handle.prepare.bind(handle)
+  let counting = true
+  ;(handle as { prepare: unknown }).prepare = (sql: string) => {
+    const statement = realPrepare(sql)
+    if (!/^\s*(INSERT|UPDATE|DELETE)/i.test(sql)) return statement
+    // Counts EXECUTIONS, not prepares: the store prepares its upsert on every
+    // write, so counting prepares would count one write several times.
+    const realRun = (statement as { run: unknown }).run.bind(statement)
+    ;(statement as { run: unknown }).run = (...args: unknown[]) => {
+      if (counting) rows.push(sql)
+      return realRun(...args)
+    }
+    return statement
   }
+  const settings = { describe: () => [] }
   const ctx = {
     get: (name: string) => (name === 'settings' ? settings : undefined),
     logger: { warn: () => {}, info: () => {}, error: () => {} },
   } as never
+  const readRows = (): Record<string, unknown> => {
+    const out: Record<string, unknown> = {}
+    for (const row of handle.prepare('SELECT session_id, axes FROM dual_axis_sessions').all() as { session_id: string; axes: string }[]) {
+      out[row.session_id] = JSON.parse(row.axes) as unknown
+    }
+    return out
+  }
+  const store = new SessionAxesStore(ctx, { sleep: async () => {}, open: () => handle })
   return {
-    store: new SessionAxesStore(ctx, { sleep: async () => {} }),
-    writes: () => writes,
-    field: () => value,
-    seed: (record: Record<string, unknown>) => {
-      value = { [SESSION_AXES_FIELD]: record }
-      revision += 1
+    store,
+    writes: () => rows.length,
+    // Wrapped in the field name, the shape every assertion below was written
+    // against when this was a settings document.
+    field: () => ({ [SESSION_AXES_FIELD]: readRows() }),
+    seed: async (record: Record<string, unknown>) => {
+      // Seeded through the STORE, not the handle: the store keeps an in-memory
+      // copy of every row it loaded, so a row written behind its back would be
+      // invisible to `refreshNarrowing` — which is exactly what that cache means
+      // in production. The counter is paused across the seed so a test still
+      // counts only the writes it is asserting about.
+      counting = false
+      try {
+        for (const [id, value] of Object.entries(record)) {
+          await store.set(id, value as EffectiveScopes)
+        }
+      } finally {
+        counting = true
+      }
     },
   }
 }
@@ -132,7 +167,7 @@ test('the stored report is the resolution own answer, byte for byte', async () =
   if (!resolved.ok) return
 
   const fake = fakeStore()
-  fake.seed({ s1: { read: resolved.axes.read, write: resolved.axes.write } })
+  await fake.seed({ s1: { read: resolved.axes.read, write: resolved.axes.write } })
   fake.store.refreshNarrowing('s1', resolved.axes.narrowing)
   await flush()
 
@@ -171,7 +206,7 @@ test('an unbounded write axis reduced to the read range reports the loss no root
   assert.equal(resolved.axes.narrowing.lostUnbounded, true)
 })
 
-test('widening the read axis over that directory publishes no narrowing at all', () => {
+test('widening the read axis over that directory publishes no narrowing at all', async () => {
   const { preset, library } = fixture()
   const resolved = resolveEffectiveAxes({ ...preset, read: { kind: 'all' } }, library, { workspaceRoot: realDir(WORKSPACE_ROOT) })
   assert.equal(resolved.ok, true)
@@ -182,7 +217,7 @@ test('widening the read axis over that directory publishes no narrowing at all',
   assert.deepEqual(resolved.axes.narrowing, NO_NARROWING)
 
   const fake = fakeStore()
-  fake.seed({ s1: { read: resolved.axes.read, write: resolved.axes.write } })
+  await fake.seed({ s1: { read: resolved.axes.read, write: resolved.axes.write } })
   fake.store.refreshNarrowing('s1', resolved.axes.narrowing)
   assert.equal(fake.writes(), 0, 'a report that removed nothing is not written')
 })
@@ -194,7 +229,7 @@ test('an unchanged report is published once, and a changed one is republished', 
   assert.equal(resolved.ok, true)
   if (!resolved.ok) return
   const fake = fakeStore()
-  fake.seed({ s1: { read: resolved.axes.read, write: resolved.axes.write } })
+  await fake.seed({ s1: { read: resolved.axes.read, write: resolved.axes.write } })
 
   fake.store.refreshNarrowing('s1', resolved.axes.narrowing)
   await flush()
@@ -234,20 +269,31 @@ test('a failed narrowing write is reported and the stored record stands', async 
   if (!resolvable.ok) return
   const warnings: unknown[] = []
   const record = { read: resolvable.axes.read, write: resolvable.axes.write }
-  const value = { [SESSION_AXES_FIELD]: { s1: record } }
-  const settings = {
-    describe: () => [{ ns: 'dual-axis-sessions', value, revision: 1 }],
-    replace: async () => { throw new Error('the document changed under this writer') },
+  // A database that refuses the narrowing write: the record is loaded, then every
+  // write against it fails.
+  const handle = new DatabaseSync(':memory:') as unknown as AxesDatabase
+  handle.exec(
+    'CREATE TABLE IF NOT EXISTS dual_axis_sessions (session_id TEXT PRIMARY KEY, axes TEXT NOT NULL, updated_at INTEGER NOT NULL)',
+  )
+  handle.prepare('INSERT INTO dual_axis_sessions (session_id, axes, updated_at) VALUES (?, ?, ?)').run('s1', JSON.stringify(record), Date.now())
+  const realPrepare = handle.prepare.bind(handle)
+  ;(handle as { prepare: unknown }).prepare = (sql: string) => {
+    if (/^\s*(INSERT|UPDATE|DELETE)/i.test(sql)) throw new Error('the database is read-only')
+    return realPrepare(sql)
   }
+  const settings = { describe: () => [] }
   const ctx = {
     get: (name: string) => (name === 'settings' ? settings : undefined),
     logger: { warn: (...args: unknown[]) => { warnings.push(args) }, info: () => {}, error: () => {} },
   } as never
-  const store = new SessionAxesStore(ctx, { sleep: async () => {}, attempts: 1 })
+  const store = new SessionAxesStore(ctx, { sleep: async () => {}, attempts: 1, open: () => handle })
   store.refreshNarrowing('s1', resolvable.axes.narrowing)
   await flush()
   assert.equal(warnings.length, 2, 'the failed refresh is logged, not swallowed')
-  assert.deepEqual(value, { [SESSION_AXES_FIELD]: { s1: record } }, 'a refresh never touches the axes')
+  // The stored record stands exactly as it was: the failed refresh changed no
+  // member of it.
+  const after = handle.prepare('SELECT axes FROM dual_axis_sessions WHERE session_id = ?').all('s1') as { axes: string }[]
+  assert.deepEqual(JSON.parse(after[0]!.axes), record, 'a refresh never touches the axes')
 })
 
 test('a stored report is validated, and an unreadable one refuses the record', () => {

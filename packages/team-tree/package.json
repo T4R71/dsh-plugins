@@ -1,7 +1,7 @@
 {
   "name": "@t4r71/dsh-team-tree",
   "description": "回填：把 Agent Teams 的 teammate 及其运行状态投影到任务树的节点上，两侧都不改",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",

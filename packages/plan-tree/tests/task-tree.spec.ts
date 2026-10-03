@@ -4,72 +4,41 @@ import { Context } from '@deepseek-ai/cordis'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
 import type { FlatNode, TaskNode, TaskTreePort } from '../src/task-tree.ts'
-import { PLAN_TREE_FIELD, PLAN_TREE_NAMESPACE, planTreeStore } from '../src/session-store.ts'
+import { PlanTreeStore, planTreeStore, setPlanTreeDatabase } from '../src/session-store.ts'
+import type { SqliteDatabase } from '../src/session-store.ts'
+import { DatabaseSync } from 'node:sqlite'
 
 import * as planTree from '../src/index.ts'
 
+/** An in-memory SQLite handle, so each test gets a database that dies with it. */
+function memoryDatabase(): SqliteDatabase {
+  return new DatabaseSync(':memory:') as unknown as SqliteDatabase
+}
+
+/** One session's tree exactly as the store holds it. */
+function storedIn(ctx: Context, sessionId: string): unknown {
+  return planTreeStore(ctx).get(sessionId)
+}
+
+/**
+ * Point the plugin's own store at a fresh in-memory database.
+ * @param ctx - the context the plugin was mounted on.
+ * @returns the isolated store.
+ */
+function storeOf(ctx: Context): PlanTreeStore {
+  setPlanTreeDatabase({ file: ':memory:', open: memoryDatabase })
+  return planTreeStore(ctx)
+}
+
 /**
  * Drives the REAL `taskTree` service the plugin provides, over the same
- * in-memory stand-in for the host settings service the tool tests use.
+ * store the tool tests use.
  *
  * Every assertion below is made against the SERVICE (the seam
  * `@t4r71/dsh-task` reaches through `ctx.get('taskTree')`) and against the
- * settings DOCUMENT, never against plugin memory: a port that lived in a second
+ * stored rows, never against plugin memory: a port that lived in a second
  * store would pass the first kind of assertion and fail the second.
  */
-
-/**
- * An in-memory stand-in for the host settings service, narrowed to the two
- * members `PlanTreeStore` calls and enforcing the revision CAS it retries on.
- */
-class FakeSettings {
-  /** The whole document: namespace id -> section. */
-  readonly sections: Record<string, Record<string, unknown>> = { [PLAN_TREE_NAMESPACE]: { [PLAN_TREE_FIELD]: {} } }
-  /** Revision per namespace, bumped on every accepted write. */
-  private readonly revisions: Record<string, number> = { [PLAN_TREE_NAMESPACE]: 0 }
-  /** How many replacements were attempted, refusals included. */
-  attempts = 0
-  /** How many of the next replacements to refuse with a conflict. */
-  conflicts = 0
-
-  /** @returns one descriptor per namespace, with its revision and value. */
-  describe(): { ns: string; value: unknown; revision: number }[] {
-    return Object.entries(this.sections).map(([ns, value]) => ({ ns, value, revision: this.revisions[ns] ?? 0 }))
-  }
-
-  /**
-   * Replace one namespace's section under the revision CAS.
-   * @param ns - the namespace to write.
-   * @param section - the complete next section.
-   * @param expectedRevision - the revision the caller read.
-   * @returns nothing; rejects with the settings conflict code on a stale write.
-   */
-  replace(ns: string, section: object, expectedRevision?: number): Promise<void> {
-    this.attempts += 1
-    const actual = this.revisions[ns] ?? 0
-    if (this.conflicts > 0) {
-      this.conflicts -= 1
-      return Promise.reject(Object.assign(new Error('settings: conflict'), { code: 'SETTINGS_CONFLICT' }))
-    }
-    if (expectedRevision !== undefined && expectedRevision !== actual) {
-      return Promise.reject(Object.assign(
-        new Error('settings: the document moved under this writer'),
-        { code: 'SETTINGS_CONFLICT', expected: expectedRevision, actual },
-      ))
-    }
-    this.sections[ns] = section as Record<string, unknown>
-    this.revisions[ns] = actual + 1
-    return Promise.resolve()
-  }
-
-  /** One session's tree exactly as the document stores it. */
-  stored(sessionId: string): unknown {
-    return (this.sections[PLAN_TREE_NAMESPACE]?.[PLAN_TREE_FIELD] as Record<string, unknown> | undefined)?.[sessionId]
-  }
-}
-
-/** The stand-in every `setup` mounts, so a test can read the document back. */
-let settings = new FakeSettings()
 
 /**
  * Mount the real plugin on a real cordis Context.
@@ -82,8 +51,7 @@ async function setup(): Promise<Context> {
   // is provided. That is the same gate a real composition passes.
   await ctx.plugin(SystemPrompt)
   await ctx.plugin(ToolRuntime)
-  settings = new FakeSettings()
-  ctx.provide('settings' as never, settings as never)
+  setPlanTreeDatabase({ file: ':memory:', open: memoryDatabase })
   await ctx.plugin(planTree)
   return ctx
 }
@@ -109,9 +77,9 @@ function nodeById(nodes: readonly TaskNode[] | undefined, id: string): TaskNode 
   return undefined
 }
 
-/** The stored tree of one session, as the settings document holds it. */
-function storedTree(sessionId: string): unknown {
-  return settings.stored(sessionId)
+/** The stored tree of one session, as the store holds it. */
+function storedTree(ctx: Context, sessionId: string): unknown {
+  return storedIn(ctx, sessionId)
 }
 
 describe('taskTree service: flat in, nested out', () => {
@@ -131,7 +99,7 @@ describe('taskTree service: flat in, nested out', () => {
     assert.strictEqual(nodeById(tree, 'leaf')?.detail, 'the deep one')
     assert.strictEqual(nodeById(tree, 'leaf')?.status, 'pending')
     // The DOCUMENT holds the nesting too: the panel reads that, not this port.
-    assert.deepStrictEqual(storedTree('s1'), [{
+    assert.deepStrictEqual(storedTree(ctx, 's1'), [{
       id: 'root',
       title: 'Root',
       status: 'pending',
@@ -153,7 +121,7 @@ describe('taskTree service: flat in, nested out', () => {
     assert.strictEqual(nodeById(port.read('one'), 'a')?.status, 'completed')
     assert.strictEqual(nodeById(port.read('two'), 'b')?.status, 'pending')
     // Partitioned in the document as well, under the session id keys.
-    assert.deepStrictEqual(Object.keys(settings.sections[PLAN_TREE_NAMESPACE]?.[PLAN_TREE_FIELD] as object), ['one', 'two'])
+    assert.deepStrictEqual(Object.keys(planTreeStore(ctx).records()).sort(), ['one', 'two'])
   })
 
   it('a merge into a session with no tree CREATES that tree', async () => {
@@ -163,7 +131,7 @@ describe('taskTree service: flat in, nested out', () => {
     // must record the plan rather than report a write it never made.
     await port.write('first', [{ id: 'a', title: 'A' }, { id: 'b', parent: 'a', title: 'B' }], false)
     assert.deepStrictEqual(port.read('first').map(node => node.id), ['a'])
-    assert.deepStrictEqual(storedTree('first'), [{
+    assert.deepStrictEqual(storedTree(ctx, 'first'), [{
       id: 'a',
       title: 'A',
       status: 'pending',
@@ -175,7 +143,7 @@ describe('taskTree service: flat in, nested out', () => {
     const ctx = await setup()
     const port = portOf(ctx)
     assert.deepStrictEqual(port.read('untouched'), [])
-    assert.strictEqual(storedTree('untouched'), undefined)
+    assert.strictEqual(storedTree(ctx, 'untouched'), undefined)
   })
 })
 
@@ -187,21 +155,21 @@ describe('taskTree service: the malformed flat shapes are refused', () => {
       port.write('cyc', [{ id: 'a', parent: 'b', title: 'A' }, { id: 'b', parent: 'a', title: 'B' }], true),
       /cycle/,
     )
-    assert.strictEqual(storedTree('cyc'), undefined)
+    assert.strictEqual(storedTree(ctx, 'cyc'), undefined)
   })
 
   it('REFUSES a self-parent and writes nothing', async () => {
     const ctx = await setup()
     const port = portOf(ctx)
     await assert.rejects(port.write('self', [{ id: 'a', parent: 'a', title: 'A' }], true), /itself/)
-    assert.strictEqual(storedTree('self'), undefined)
+    assert.strictEqual(storedTree(ctx, 'self'), undefined)
   })
 
   it('REFUSES a `parent` naming an id the write does not carry', async () => {
     const ctx = await setup()
     const port = portOf(ctx)
     await assert.rejects(port.write('orphan', [{ id: 'a', parent: 'ghost', title: 'A' }], true), /unknown parent "ghost"/)
-    assert.strictEqual(storedTree('orphan'), undefined)
+    assert.strictEqual(storedTree(ctx, 'orphan'), undefined)
   })
 
   it('REFUSES a longer cycle and a duplicate id', async () => {
@@ -219,8 +187,8 @@ describe('taskTree service: the malformed flat shapes are refused', () => {
       port.write('dup', [{ id: 'a', title: 'One' }, { id: 'a', title: 'Two' }], true),
       /duplicate/,
     )
-    assert.strictEqual(storedTree('ring'), undefined)
-    assert.strictEqual(storedTree('dup'), undefined)
+    assert.strictEqual(storedTree(ctx, 'ring'), undefined)
+    assert.strictEqual(storedTree(ctx, 'dup'), undefined)
   })
 
   it('ACCEPTS multiple roots: several parent-less nodes are a forest', async () => {
@@ -297,7 +265,7 @@ describe('taskTree service: write, step and bind', () => {
     assert.strictEqual(nodeById(port.read('f'), 'a')?.status, 'failed')
     // Stored as `blocked`: a fifth status value would make BOTH parsers drop
     // the whole tree, the host's and the panel's, rather than flag one node.
-    assert.deepStrictEqual(storedTree('f'), [{ id: 'a', title: 'A', status: 'blocked' }])
+    assert.deepStrictEqual(storedTree(ctx, 'f'), [{ id: 'a', title: 'A', status: 'blocked' }])
   })
 
   it('`bind` records the child session id on the addressed node', async () => {
@@ -306,7 +274,7 @@ describe('taskTree service: write, step and bind', () => {
     await port.write('b', [{ id: 'a', title: 'A' }, { id: 'a1', parent: 'a', title: 'A1' }], true)
     await port.bind('b', 'a1', 'child-42')
     assert.strictEqual(nodeById(port.read('b'), 'a1')?.assignedTo, 'child-42')
-    assert.deepStrictEqual(storedTree('b'), [{
+    assert.deepStrictEqual(storedTree(ctx, 'b'), [{
       id: 'a',
       title: 'A',
       status: 'pending',
@@ -318,11 +286,11 @@ describe('taskTree service: write, step and bind', () => {
     const ctx = await setup()
     const port = portOf(ctx)
     await port.write('x', [{ id: 'a', title: 'A' }], true)
-    const before = settings.attempts
+    const before = JSON.stringify(planTreeStore(ctx).get('x'))
     await assert.rejects(port.step('x', 'nope', { status: 'completed' }), /no node with id/)
     await assert.rejects(port.bind('x', 'nope', 'child-1'), /no node with id/)
-    // Neither call reached the document at all.
-    assert.strictEqual(settings.attempts, before)
+    // Neither call wrote anything at all.
+    assert.strictEqual(JSON.stringify(planTreeStore(ctx).get('x')), before)
   })
 
   it('reports a session with no tree instead of creating one implicitly', async () => {
@@ -330,7 +298,7 @@ describe('taskTree service: write, step and bind', () => {
     const port = portOf(ctx)
     await assert.rejects(port.step('nothing', 'a', { status: 'completed' }), /has no tree/)
     await assert.rejects(port.bind('nothing', 'a', 'child-1'), /has no tree/)
-    assert.strictEqual(storedTree('nothing'), undefined)
+    assert.strictEqual(storedTree(ctx, 'nothing'), undefined)
   })
 
   it('reports a `step` that carries nothing to write', async () => {
@@ -339,27 +307,21 @@ describe('taskTree service: write, step and bind', () => {
     await assert.rejects(port.step('idle', 'a', {}), /neither a/)
   })
 
-  it('a write the revision fence refused is retried and lands', async () => {
+  it('a write lands in one row upsert, with no revision fence to lose', async () => {
     const ctx = await setup()
     const port = portOf(ctx)
     await port.write('r', [{ id: 'a', title: 'A' }], true)
-    const before = settings.attempts
-    settings.conflicts = 1
-    // One forced conflict models the other writer that landed between this
-    // writer's read and its write: the store must re-read and retry.
     await port.step('r', 'a', { status: 'completed' })
-    assert.strictEqual(settings.attempts, before + 2)
-    assert.deepStrictEqual(storedTree('r'), [{ id: 'a', title: 'A', status: 'completed' }])
+    assert.deepStrictEqual(storedIn(ctx, 'r'), [{ id: 'a', title: 'A', status: 'completed' }])
   })
 
-  it('REFUSES a write when no settings namespace is composed', async () => {
-    const ctx = new Context()
-    await ctx.plugin(SystemPrompt)
-    await ctx.plugin(ToolRuntime)
-    await ctx.plugin(planTree)
+  it('REFUSES a write when the store cannot be written', async () => {
+    const ctx = await setup()
     const port = portOf(ctx)
-    await assert.rejects(port.write('nowhere', [{ id: 'a', title: 'A' }], true), /plan-tree-sessions/)
-    assert.deepStrictEqual(port.read('nowhere'), [])
+    // A store whose database is gone is the one case where a write has nowhere
+    // to go; the port must reject rather than claim the tree was stored.
+    planTreeStore(ctx).close()
+    await assert.rejects(port.write('nowhere', [{ id: 'a', title: 'A' }], true), /closed|unavailable/)
   })
 })
 

@@ -9,13 +9,15 @@ import { validateJsonSchemaValue } from '@deepseek-ai/dsh-tools'
 import { Session, SessionId } from '@deepseek-ai/dsh-session'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { PlanNode } from '../src/types.ts'
-import { PLAN_TREE_FIELD, PLAN_TREE_NAMESPACE, parsePlanTreesField, planTreeStore } from '../src/session-store.ts'
+import { PlanTreeStore, parseStoredTree, planTreeStore, setPlanTreeDatabase } from '../src/session-store.ts'
+import type { SqliteDatabase } from '../src/session-store.ts'
+import { DatabaseSync } from 'node:sqlite'
 
 import * as planTree from '../src/index.ts'
 
 /**
  * Drives the REAL plugin body: mounts `dsh-plan-tree` on a real `ToolRuntime`
- * and a STAND-IN settings service carrying the same `plan-tree-sessions`
+ * and a real SQLite row the store writes
  * namespace a real composition mounts, then invokes the registered tools through
  * `ctx.tools.execute` with a fake parent Agent carrying a real `Session`.
  *
@@ -26,81 +28,17 @@ import * as planTree from '../src/index.ts'
 
 const testToolSignal = new AbortController().signal
 
-/**
- * An in-memory stand-in for the host settings service, narrowed to the two
- * members this package calls.
- *
- * It ENFORCES the revision CAS (`plan-tree`'s store retries on it) and it counts
- * replacement attempts, so a test can prove a write really went through the
- * document instead of merely through plugin memory.
- */
-class FakeSettings {
-  /** The whole document: namespace id -> section. */
-  readonly sections: Record<string, Record<string, unknown>> = { [PLAN_TREE_NAMESPACE]: { [PLAN_TREE_FIELD]: {} } }
-  /** Revision per namespace, bumped on every accepted write. */
-  private readonly revisions: Record<string, number> = { [PLAN_TREE_NAMESPACE]: 0 }
-  /** How many replacements were attempted, refusals included. */
-  attempts = 0
-  /** Revisions a write was offered, in order. */
-  readonly seenRevisions: (number | undefined)[] = []
-  /** How many of the next replacements to refuse with a conflict. */
-  conflicts = 0
-
-  /** @returns one descriptor per namespace, with its revision and value. */
-  describe(): { ns: string; value: unknown; revision: number }[] {
-    return Object.entries(this.sections).map(([ns, value]) => ({ ns, value, revision: this.revisions[ns] ?? 0 }))
-  }
-
-  /**
-   * Replace one namespace's section under the revision CAS.
-   * @param ns - the namespace to write.
-   * @param section - the complete next section.
-   * @param expectedRevision - the revision the caller read.
-   * @returns nothing; rejects with `code: 'SETTINGS_CONFLICT'` on a stale write.
-   */
-  replace(ns: string, section: object, expectedRevision?: number): Promise<void> {
-    this.attempts += 1
-    this.seenRevisions.push(expectedRevision)
-    const actual = this.revisions[ns] ?? 0
-    // One conflict forced by a test models the other writer that landed between
-    // this writer's read and its write, with the outcome pinned instead of
-    // raced.
-    if (this.conflicts > 0) {
-      this.conflicts -= 1
-      return Promise.reject(Object.assign(new Error('settings: conflict'), { code: 'SETTINGS_CONFLICT' }))
-    }
-    if (expectedRevision !== undefined && expectedRevision !== actual) {
-      return Promise.reject(Object.assign(
-        new Error('settings: the document moved under this writer'),
-        { code: 'SETTINGS_CONFLICT', expected: expectedRevision, actual },
-      ))
-    }
-    this.sections[ns] = section as Record<string, unknown>
-    this.revisions[ns] = actual + 1
-    return Promise.resolve()
-  }
-
-  /** One session's tree exactly as the document stores it. */
-  stored(sessionId: string): unknown {
-    return (this.sections[PLAN_TREE_NAMESPACE]?.[PLAN_TREE_FIELD] as Record<string, unknown> | undefined)?.[sessionId]
-  }
-}
-
 /** A parent Agent backed by a real Session — the tools read `agent.session`. */
 function agentWithSession(id = 'planner'): Agent & { session: Session } {
   const session = Session.create(SessionId(id))
   return { id: SessionId(id), session } as unknown as Agent & { session: Session }
 }
 
-/** The stand-in every `setup` mounts, so a test can read the document back. */
-let settings = new FakeSettings()
-
 async function setup(): Promise<Context> {
   const ctx = new Context()
   await ctx.plugin(SystemPrompt)
   await ctx.plugin(ToolRuntime)
-  settings = new FakeSettings()
-  ctx.provide('settings' as never, settings as never)
+  setPlanTreeDatabase({ file: ':memory:', open: memoryDatabase })
   await ctx.plugin(planTree)
   return ctx
 }
@@ -116,11 +54,16 @@ function call(ctx: Context, name: string, args: unknown, agent: Agent) {
   })
 }
 
-/**
- * The plan tree of one agent's session, read out of the settings document and
- * validated the same way the tool surface validates it — the value the panel
- * receives through its describe mirror.
- */
+/** An in-memory SQLite handle, so each test gets a database that dies with it. */
+function memoryDatabase(): SqliteDatabase {
+  return new DatabaseSync(':memory:') as unknown as SqliteDatabase
+}
+
+/** One session's tree exactly as the store holds it. */
+function storedIn(ctx: Context, sessionId: string): unknown {
+  return planTreeStore(ctx).get(sessionId)
+}
+
 function treeOf(ctx: Context, agent: Agent & { session: Session }): PlanNode[] | null {
   const stored = planTreeStore(ctx).get(String(agent.session.header.id))
   if (stored === undefined) return null
@@ -160,45 +103,41 @@ describe('plan_write', () => {
     assert.strictEqual(nodeById(tree, 'mid')?.children?.length, 1)
   })
 
-  it('writes the plan into the settings document and appends NO session event', async () => {
+  it('writes the plan into the store and appends NO session event', async () => {
     const ctx = await setup()
     const agent = agentWithSession('store-not-log')
     await call(ctx, 'plan_write', { nodes: [{ id: 'a', title: 'A', status: 'pending' }] }, agent)
     // The document carries it, under THIS session's key.
-    assert.deepStrictEqual(settings.stored('store-not-log'), [{ id: 'a', title: 'A', status: 'pending' }])
+    assert.deepStrictEqual(storedIn(ctx, 'store-not-log'), [{ id: 'a', title: 'A', status: 'pending' }])
     // And the session log does not: the two event types this package used to
     // append are outside 0.1.7's KNOWN_SESSION_EVENT_TYPES, so a log carrying
     // one cannot be reopened at all.
     assert.deepStrictEqual(agent.session.snapshotEvents(), [])
   })
 
-  it('reports a plan write as a failure when no settings namespace is composed', async () => {
-    const ctx = new Context()
-    await ctx.plugin(SystemPrompt)
-    await ctx.plugin(ToolRuntime)
-    await ctx.plugin(planTree)
+  it('reports a plan write as a failure when the store cannot be written', async () => {
+    const ctx = await setup()
     const agent = agentWithSession('no-store')
+    // A store whose database is gone is the one case where a write has nowhere
+    // to go; the tool must report it rather than claim the plan was stored.
+    planTreeStore(ctx).close()
     const result = await call(ctx, 'plan_write', { nodes: [{ id: 'a', title: 'A', status: 'pending' }] }, agent)
     assert.strictEqual(result.isError, true)
-    if (!result.isError) throw new Error('expected a rejection')
-    assert.ok(JSON.stringify(result).includes('plan-tree-sessions'))
   })
 
-  it('carries a tree through the stored document (parsed, not stripped)', async () => {
+  it('carries a tree through a stored row (parsed, not stripped)', async () => {
     const ctx = await setup()
-    // Written straight into the document, the way another writer or a human
-    // editing settings.yaml would: the read path must parse it rather than
-    // assume it was written by this process.
-    settings.sections[PLAN_TREE_NAMESPACE] = {
-      [PLAN_TREE_FIELD]: {
-        wire: [{ id: 'a', title: 'A', status: 'pending', task: 'run it', assignedTo: 'worker-a', answer: 'yes', dependsOn: [] }],
-      },
-    }
-    const parsed = parsePlanTreesField(settings.sections[PLAN_TREE_NAMESPACE]![PLAN_TREE_FIELD])
-    assert.strictEqual(parsed['wire']?.[0]?.task, 'run it')
-    assert.strictEqual(parsed['wire']?.[0]?.assignedTo, 'worker-a')
-    assert.strictEqual(parsed['wire']?.[0]?.answer, 'yes')
+    // Written straight into the database, the way another writer would: the read
+    // path must parse it rather than assume it was written by this process.
+    const row = [{ id: 'a', title: 'A', status: 'pending', task: 'run it', assignedTo: 'worker-a', answer: 'yes', dependsOn: [] }]
+    const parsed = parseStoredTree(JSON.stringify(row))
+    assert.strictEqual(parsed?.[0]?.task, 'run it')
+    assert.strictEqual(parsed?.[0]?.assignedTo, 'worker-a')
+    assert.strictEqual(parsed?.[0]?.answer, 'yes')
+    assert.strictEqual(parseStoredTree('not json'), undefined)
+    assert.strictEqual(parseStoredTree('{"not":"an array"}'), undefined)
     // The plugin's OWN reader agrees with the pure parser.
+    planTreeStore(ctx).replace('wire', row as never)
     const tree = planTreeStore(ctx).get('wire')
     assert.strictEqual(tree?.[0]?.assignedTo, 'worker-a')
   })
@@ -336,7 +275,7 @@ describe('plan_step', () => {
     assert.strictEqual(result.isError, true)
     // A rejected step writes NOTHING: the document still carries the plan as it
     // was, not a half-applied fold.
-    assert.deepStrictEqual(settings.stored('unknown-step'), [{ id: 'real', title: 'Real', status: 'pending' }])
+    assert.deepStrictEqual(storedIn(ctx, 'unknown-step'), [{ id: 'real', title: 'Real', status: 'pending' }])
   })
 
   it('rejects a step naming an unknown id WITHOUT appending an event', async () => {
@@ -347,12 +286,12 @@ describe('plan_step', () => {
     assert.deepStrictEqual(agent.session.snapshotEvents(), [])
   })
 
-  it('writes the step into the settings document, not into the session log', async () => {
+  it('writes the step into the store, not into the session log', async () => {
     const ctx = await setup()
     const agent = agentWithSession('step-doc')
     await call(ctx, 'plan_write', { nodes: [{ id: 's', title: 'S', status: 'pending' }] }, agent)
     await call(ctx, 'plan_step', { id: 's', status: 'in_progress', assignedTo: 'worker-a' }, agent)
-    assert.deepStrictEqual(settings.stored('step-doc'), [{ id: 's', title: 'S', status: 'in_progress', assignedTo: 'worker-a' }])
+    assert.deepStrictEqual(storedIn(ctx, 'step-doc'), [{ id: 's', title: 'S', status: 'in_progress', assignedTo: 'worker-a' }])
     assert.deepStrictEqual(agent.session.snapshotEvents(), [])
   })
 })
@@ -463,9 +402,9 @@ describe('plan_dispatch with a Team service', () => {
     assert.strictEqual(node?.assignedTo, 'worker-a')
     assert.strictEqual(node?.status, 'in_progress')
 
-    // The assignment must be DURABLE in the settings document, not merely in
+    // The assignment must be DURABLE in the store, not merely in
     // memory: a client rebuilding from the document has to see it.
-    assert.deepStrictEqual(settings.stored('lead'), [
+    assert.deepStrictEqual(storedIn(ctx, 'lead'), [
       { id: 'ship', title: 'Ship it', status: 'in_progress', task: 'ship the feature', assignedTo: 'worker-a' },
     ])
     // And nothing at all on the session log.
@@ -608,8 +547,8 @@ describe('plan_ask', () => {
     assert.strictEqual(node?.status, 'completed')
     assert.strictEqual(node?.answer, 'blue')
 
-    // Durable in the settings document, not merely in memory.
-    assert.deepStrictEqual(settings.stored('answered'), [
+    // Durable in the store, not merely in memory.
+    assert.deepStrictEqual(storedIn(ctx, 'answered'), [
       { id: 'root', title: 'Root', status: 'in_progress' },
       { id: 'q-colour', title: 'Which colour?', status: 'completed', detail: 'Which colour?', answer: 'blue' },
     ])
@@ -716,33 +655,36 @@ describe('the stored document', () => {
     assert.strictEqual(result.isError, true)
   })
 
-  it('retries a write the revision fence refused, and stores the tree', async () => {
+  it('stores a step in one row upsert, with no revision fence to lose', async () => {
     const ctx = await setup()
     const agent = agentWithSession('contended')
     await call(ctx, 'plan_write', { nodes: [{ id: 'a', title: 'A', status: 'pending' }] }, agent)
     // A second writer lands between this writer's read and its write: the store
     // must re-read the revision and retry rather than report a lost write.
-    const before = settings.attempts
-    settings.conflicts = 1
     const step = await call(ctx, 'plan_step', { id: 'a', status: 'completed' }, agent)
     assert.strictEqual(step.isError, false)
-    // Two attempts: the refused one and the one that landed.
-    assert.strictEqual(settings.attempts, before + 2)
-    assert.deepStrictEqual(settings.stored('contended'), [{ id: 'a', title: 'A', status: 'completed' }])
+    // One row upsert: no revision fence to lose, so the step lands first try.
+    assert.deepStrictEqual(storedIn(ctx, 'contended'), [{ id: 'a', title: 'A', status: 'completed' }])
   })
 
-  it('drops an unreadable session entry instead of failing the whole document', () => {
-    const parsed = parsePlanTreesField({
-      good: [{ id: 'a', title: 'A', status: 'pending' }],
-      broken: [{ id: 'b', title: 'B', status: 'not-a-status' }],
-      alsoBroken: 'not an array',
-    })
-    assert.deepStrictEqual(Object.keys(parsed), ['good'])
+  it('drops an unreadable row instead of failing the whole database', () => {
+    // One handle shared by both stores: two \`:memory:\` opens are two DATABASES,
+    // so a test that reopened without sharing would prove nothing.
+    const handle = memoryDatabase()
+    const store = new PlanTreeStore({ file: ':memory:', open: () => handle })
+    store.replace('good', [{ id: 'a', title: 'A', status: 'pending' }])
+    // A row another writer left malformed must cost THAT session only.
+    handle.prepare(
+      'INSERT INTO plan_tree_sessions (session_id, tree, updated_at) VALUES (?,?,?)',
+    ).run('broken', '{ not json', Date.now())
+    const reopened = new PlanTreeStore({ file: ':memory:', open: () => handle })
+    assert.deepStrictEqual([...Object.keys(reopened.records())].sort(), ['good'])
   })
 
-  it('reads an absent or non-object field as no trees at all', () => {
-    assert.deepStrictEqual(parsePlanTreesField(undefined), {})
-    assert.deepStrictEqual(parsePlanTreesField('nope'), {})
+  it('reads a row that is not an array as no tree at all', () => {
+    assert.strictEqual(parseStoredTree('nope'), undefined)
+    assert.strictEqual(parseStoredTree('{"a":1}'), undefined)
+    assert.deepStrictEqual(parseStoredTree('[]'), [])
   })
 })
 
@@ -808,8 +750,7 @@ describe('the exposeTools switch', () => {
     const ctx = new Context()
     await ctx.plugin(SystemPrompt)
     await ctx.plugin(ToolRuntime)
-    settings = new FakeSettings()
-    ctx.provide('settings' as never, settings as never)
+    setPlanTreeDatabase({ file: ':memory:', open: memoryDatabase })
     await ctx.plugin(planTree, config)
     return ctx
   }

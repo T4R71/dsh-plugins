@@ -35,7 +35,7 @@ import { z as zod } from 'zod'
 import type { ZodType } from 'zod'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { PlanNode, PlanStatus } from './types.ts'
-import { PLAN_TREE_FIELD, planTreeStore } from './session-store.ts'
+import { planTreeStore } from './session-store.ts'
 import type { PlanTreeStore } from './session-store.ts'
 import { createTaskTreePort } from './task-tree.ts'
 export type * from './types.ts'
@@ -189,7 +189,7 @@ const planTreeSchema: ZodType<PlanNode[]> = zod.array(zod.lazy(() => planNodeSch
  * @param store - the session store for this host context.
  * @param sessionId - the session whose plan to read.
  * @returns the parsed tree, or `null` before the first declaration.
- * @throws When no settings namespace is served, or a stored tree is unreadable.
+ * @throws When the store is unavailable, or a stored tree is unreadable.
  */
 function readTree(store: PlanTreeStore, sessionId: string): PlanNode[] | null {
   if (!store.served()) throw new Error(planTreeUnavailable)
@@ -199,8 +199,7 @@ function readTree(store: PlanTreeStore, sessionId: string): PlanNode[] | null {
   if (!parsed.success) {
     throw new Error(
       'plan-tree: the stored plan of session ' + JSON.stringify(sessionId)
-      + ' is unreadable; the settings document field ' + JSON.stringify(PLAN_TREE_FIELD)
-      + ' must hold an array of plan nodes',
+      + ' is unreadable; the stored row must hold an array of plan nodes',
     )
   }
   return parsed.data
@@ -234,7 +233,7 @@ function sessionIdOf(exec: { agent?: Agent | undefined }, tool: string): string 
  * @param store - the session store for this host context.
  * @param sessionId - the session the tree belongs to.
  * @param nodes - the complete next tree.
- * @throws When no settings namespace is served, or the revision race was lost.
+ * @throws When the store cannot be written.
  */
 async function writeTree(
   store: PlanTreeStore,
@@ -245,9 +244,9 @@ async function writeTree(
   await store.replace(sessionId, nodes)
 }
 
-/** The rejection every tool gives when the settings namespace is not composed. */
+/** The rejection every tool gives when the store cannot be reached. */
 const planTreeUnavailable =
-  'plan-tree: the plan tree store has no settings namespace; '
+  'plan-tree: the plan tree store is unavailable; '
   + 'the composition must load the `plan-tree-sessions` row of @t4r71/dsh-plan-tree'
 
 const planNodeSchema: ZodType<PlanNode> = zod.object({

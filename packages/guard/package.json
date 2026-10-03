@@ -1,7 +1,7 @@
 {
   "name": "@t4r71/dsh-guard",
   "description": "The merged degeneration guard: stream brake, turn-completion continuation and automatic retry in one plugin, over the stock llm-pi-ai access layer",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publishConfig": {
     "access": "public"
   },

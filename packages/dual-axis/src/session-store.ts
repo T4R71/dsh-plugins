@@ -52,6 +52,9 @@ import type { Session } from '@deepseek-ai/dsh-session'
 import { DEFAULT_READ_SCOPE, DEFAULT_WRITE_SCOPE } from './axis.ts'
 import type { AxisScope, EffectiveScopes } from './axis.ts'
 import { axesOf, declaredSection, defaultGroupIds, normalizeScope } from './config.ts'
+import { createRequire } from 'node:module'
+import { mkdirSync } from 'node:fs'
+import { dirname, join } from 'node:path'
 import { parseNarrowing, seedGroupReferences } from './groups.ts'
 import type { WriteNarrowing } from './groups.ts'
 import { hasContent } from './content.ts'
@@ -233,7 +236,8 @@ export function inheritedAxes(ctx: Context, session: Session): EffectiveScopes |
   if (session.header.origin !== 'subagent') return undefined
   const parentId = session.header.parentSession
   if (parentId === undefined) return undefined
-  return sessionAxesStore(ctx).get(String(parentId))
+  const store = sessionAxesStore(ctx)
+  return store.get(String(parentId))
 }
 
 /**
@@ -394,7 +398,98 @@ export interface SessionAxesSweep {
 }
 
 /** Options for {@link SessionAxesStore}. */
-export interface SessionAxesStoreOptions {
+/** Basename of the database under the harness home's \`storages\` directory. */
+export const AXES_DB_FILE = 'dual-axis.db'
+
+/** The table holding one row per session. */
+export const AXES_TABLE = 'dual_axis_sessions'
+
+/** The \`node:sqlite\` surface this store uses, declared structurally. */
+export interface AxesStatement {
+  /** Run the statement and return every row. */
+  all(...params: unknown[]): unknown[]
+  /** Run the statement once. */
+  run(...params: unknown[]): unknown
+}
+
+/** The \`node:sqlite\` database handle this store uses. */
+export interface AxesDatabase {
+  /** Prepare a statement for repeated execution. */
+  prepare(sql: string): AxesStatement
+  /** Run one statement with no result. */
+  exec(sql: string): void
+  /** Close the handle. */
+  close(): void
+}
+
+/** One row as it comes back from SQLite. */
+interface AxesRow {
+  session_id: string
+  axes: string
+}
+
+/**
+ * Open a database handle through \`node:sqlite\`.
+ *
+ * Loaded through \`createRequire\` rather than a static import so a runtime
+ * without \`node:sqlite\` still LOADS this package: only a store that is actually
+ * opened fails.
+ * @param file - absolute database path.
+ * @returns the open handle.
+ */
+function openAxesDatabase(file: string): AxesDatabase {
+  const require = createRequire(import.meta.url)
+  const sqlite = require('node:sqlite') as { DatabaseSync: new (path: string) => AxesDatabase }
+  return new sqlite.DatabaseSync(file)
+}
+
+/**
+ * The harness home's \`storages\` directory, without importing the harness.
+ * @returns an absolute directory path; the caller creates it.
+ */
+function storageDir(): string {
+  const home = process.env['DSH_HOME']
+  if (home !== undefined && home !== '') return join(home, 'storages')
+  const profile = process.env['DSH_PROFILE_DIR']
+  if (profile !== undefined && profile !== '') return join(profile, '..', 'storages')
+  return join(process.cwd(), 'storages')
+}
+
+/**
+ * Parse one stored record.
+ *
+ * A row another writer left malformed is reported as no record rather than
+ * throwing out of a fence read: one bad row must cost one session.
+ * @param text - the stored JSON text.
+ * @returns the record, or \`undefined\` when the row is unreadable.
+ */
+function parseAxisRow(text: string): SessionAxesRecord | undefined {
+  try {
+    return parseSessionAxesField({ one: JSON.parse(text) })['one']
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Whether two stored records are the same value.
+ * @param a - the previous record, if any.
+ * @param b - the next record.
+ * @returns whether the row can be left untouched.
+ */
+function sameAxesRecord(a: SessionAxesRecord | undefined, b: SessionAxesRecord): boolean {
+  return a !== undefined && JSON.stringify(a) === JSON.stringify(b)
+}
+
+/** Where this store's database lives; production never sets either member. */
+export interface SessionAxesStoreDatabaseOptions {
+  /** Absolute database path; defaults to the harness home's storages directory. */
+  file?: string | undefined
+  /** Database opener, injectable so tests need no real \`node:sqlite\`. */
+  open?: ((file: string) => AxesDatabase) | undefined
+}
+
+export interface SessionAxesStoreOptions extends SessionAxesStoreDatabaseOptions {
   /** Attempts per write; defaults to {@link AXES_WRITE_ATTEMPTS}. */
   readonly attempts?: number
   /** Backoff before attempt N; defaults to {@link AXES_WRITE_BACKOFF_MS}. */
@@ -414,11 +509,11 @@ export interface SessionAxesStoreOptions {
  * pays one `describe()` per document change, not one per tool dispatch.
  */
 export class SessionAxesStore {
-  private readonly options: Required<SessionAxesStoreOptions>
-  private cachedRevision: number | undefined
+  private readonly options: Required<SessionAxesStoreOptions & SessionAxesStoreDatabaseOptions>
+  /** The open database, created on first use. */
+  private db: AxesDatabase | undefined
+  /** Every stored record, authoritative for this process. */
   private cachedRecords: Record<string, SessionAxesRecord> = {}
-  /** Parsed records by the JSON spelling that produced them. */
-  private readonly bySpelling = new Map<string, Record<string, SessionAxesRecord>>()
   /**
    * Session ids with a repair write outstanding (or already landed) since the
    * record was found missing. Prevents one repair per tool dispatch while the
@@ -446,39 +541,61 @@ export class SessionAxesStore {
       attempts: options.attempts ?? AXES_WRITE_ATTEMPTS,
       backoffMs: options.backoffMs ?? AXES_WRITE_BACKOFF_MS,
       sleep: options.sleep ?? ((ms: number) => new Promise<void>(resolve => { setTimeout(resolve, ms) })),
+      file: options.file,
+      open: options.open,
     }
+    this.cachedRecords = {}
+    this.db = this.connect()
   }
 
   /**
-   * This namespace's current settings row, or `undefined` when no settings
-   * service is mounted or the entry is not composed.
-   * @returns the descriptor carrying the value and the revision.
+   * This store's database, opened on first use.
+   * @returns the handle.
+   * @throws {Error} when the database cannot be opened.
    */
-  private descriptor(): { value: unknown; revision: number } | undefined {
-    const settings = this.ctx.get('settings')
-    if (settings === undefined) return undefined
-    return settings.describe().find(row => row.ns === SESSION_AXES_NAMESPACE)
+  private database(): AxesDatabase {
+    if (this.db === undefined) this.db = this.connect()
+    return this.db
+  }
+
+  /**
+   * Open the database, create the table, and load every stored row.
+   *
+   * Synchronous on purpose: the fence and the prompt are synchronous decision
+   * paths, so the rows have to be in memory before the first read.
+   * @returns the open handle.
+   */
+  private connect(): AxesDatabase {
+    const file = this.options.file ?? join(storageDir(), AXES_DB_FILE)
+    try {
+      mkdirSync(dirname(file), { recursive: true })
+    } catch { /* an existing directory is the normal case */ }
+    let db: AxesDatabase
+    try {
+      db = this.options.open !== undefined ? this.options.open(file) : openAxesDatabase(file)
+    } catch (error: unknown) {
+      throw new Error('dual-axis: opening ' + file + ' failed', { cause: error })
+    }
+    db.exec('PRAGMA journal_mode = WAL')
+    db.exec('PRAGMA synchronous = NORMAL')
+    db.exec(
+      'CREATE TABLE IF NOT EXISTS ' + AXES_TABLE
+      + ' (session_id TEXT PRIMARY KEY, axes TEXT NOT NULL, updated_at INTEGER NOT NULL)',
+    )
+    for (const row of db.prepare('SELECT session_id, axes FROM ' + AXES_TABLE).all() as AxesRow[]) {
+      const record = parseAxisRow(row.axes)
+      if (record !== undefined) this.cachedRecords[row.session_id] = record
+    }
+    return db
   }
 
   /**
    * Every stored pair, by session id.
-   * @returns the parsed field.
-   * @throws When the document carries an unreadable record.
+   * @returns the parsed field, a fresh object each call.
+   * @throws When a stored record is unreadable.
    */
   records(): Record<string, SessionAxesRecord> {
-    const descriptor = this.descriptor()
-    if (descriptor === undefined) return {}
-    if (descriptor.revision === this.cachedRevision) return this.cachedRecords
-    const value = isRecord(descriptor.value) ? descriptor.value[SESSION_AXES_FIELD] : undefined
-    const spelling = JSON.stringify(value ?? null)
-    let records = this.bySpelling.get(spelling)
-    if (records === undefined) {
-      records = parseSessionAxesField(value)
-      this.bySpelling.set(spelling, records)
-    }
-    this.cachedRevision = descriptor.revision
-    this.cachedRecords = records
-    return records
+    return { ...this.cachedRecords }
   }
 
   /**
@@ -754,32 +871,49 @@ export class SessionAxesStore {
    * @throws {SessionAxesConflictError} when every attempt was refused.
    */
   private async replaceRecords(records: Record<string, SessionAxesRecord>): Promise<void> {
-    const settings = this.ctx.get('settings')
-    const entryExists = this.descriptor() !== undefined
-    if (settings === undefined || !entryExists) {
-      throw new Error(
-        'dual-axis: no configurable plugin entry "' + SESSION_AXES_NAMESPACE
-        + '"; the session axis store cannot be written',
+    const db = this.database()
+    // Row-by-row against the previous in-memory state: a session whose record is
+    // gone is DELETEd, one that moved is upserted. Only the rows that changed are
+    // touched, and there is no document to rewrite and no revision to lose.
+    const before = this.cachedRecords
+    try {
+      const put = db.prepare(
+        'INSERT INTO ' + AXES_TABLE + ' (session_id, axes, updated_at) VALUES (?, ?, ?)'
+        + ' ON CONFLICT(session_id) DO UPDATE SET axes = excluded.axes, updated_at = excluded.updated_at',
       )
-    }
-    let conflict: unknown
-    for (let attempt = 0; attempt < this.options.attempts; attempt += 1) {
-      const backoff = this.options.backoffMs[attempt] ?? this.options.backoffMs[this.options.backoffMs.length - 1] ?? 0
-      if (backoff > 0) await this.options.sleep(backoff)
-      const revision = this.descriptor()?.revision
-      try {
-        await settings.replace(SESSION_AXES_NAMESPACE, { [SESSION_AXES_FIELD]: records }, revision)
-        return
-      } catch (error) {
-        conflict = error
+      const drop = db.prepare('DELETE FROM ' + AXES_TABLE + ' WHERE session_id = ?')
+      for (const [id, record] of Object.entries(records)) {
+        if (sameAxesRecord(before[id], record)) continue
+        put.run(id, JSON.stringify(record), Date.now())
       }
+      for (const id of Object.keys(before)) if (!(id in records)) drop.run(id)
+    } catch (error: unknown) {
+      throw new Error('dual-axis: storing the session axes failed', { cause: error })
     }
-    throw new SessionAxesConflictError(conflict, this.options.attempts)
+    this.cachedRecords = { ...records }
   }
 }
 
 /** Stores by host context, so every consumer of one process shares one cache. */
 const stores = new WeakMap<Context, SessionAxesStore>()
+
+/**
+ * Where a store created without explicit options puts its rows.
+ *
+ * Unset in production, where every store resolves the harness home's database.
+ * A test sets it so the store the package builds INTERNALLY — the one
+ * {@link inheritedAxes} reaches through {@link sessionAxesStore} — lands in the
+ * same in-memory database as the one the test holds.
+ */
+let defaultDatabase: SessionAxesStoreDatabaseOptions | undefined
+
+/**
+ * Point every store built from now on at one database.
+ * @param options - the database options, or \`undefined\` for production defaults.
+ */
+export function setSessionAxesDatabase(options?: SessionAxesStoreDatabaseOptions): void {
+  defaultDatabase = options
+}
 
 /**
  * The store of one host context. Consumers hold no service of their own: the
@@ -789,10 +923,15 @@ const stores = new WeakMap<Context, SessionAxesStore>()
  * @returns the shared store.
  */
 export function sessionAxesStore(ctx: Context): SessionAxesStore {
-  const existing = stores.get(ctx)
+  // Keyed by the ROOT context: cordis derives a child context per plugin, so two
+  // callers in one application can hold different \`ctx\` objects naming the same
+  // host. Keying by the argument would give them two stores over one database,
+  // and a repair written through one would be invisible to the other.
+  const root = (ctx as { root?: Context }).root ?? ctx
+  const existing = stores.get(root)
   if (existing !== undefined) return existing
-  const created = new SessionAxesStore(ctx)
-  stores.set(ctx, created)
+  const created = new SessionAxesStore(root, defaultDatabase ?? {})
+  stores.set(root, created)
   return created
 }
 

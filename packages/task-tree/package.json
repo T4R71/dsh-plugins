@@ -41,11 +41,6 @@
     "locale/*.json"
   ],
   "license": "MIT",
-  "dependencies": {
-    "@t4r71/dsh-plan-tree": "workspace:^",
-    "@t4r71/dsh-task": "workspace:^",
-    "@t4r71/dsh-ui-task-tree": "workspace:^"
-  },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.4"
   },
@@ -58,5 +53,10 @@
     "tsx": "^4.22.4",
     "typescript": "^6.0.3"
   },
-  "icon": "./icon.svg"
+  "icon": "./icon.svg",
+  "dependencies": {
+    "@t4r71/dsh-plan-tree": "workspace:^",
+    "@t4r71/dsh-task": "workspace:^",
+    "@t4r71/dsh-ui-task-tree": "workspace:^"
+  }
 }
