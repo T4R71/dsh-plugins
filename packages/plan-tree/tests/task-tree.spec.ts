@@ -4,7 +4,7 @@ import { Context } from '@deepseek-ai/cordis'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
 import type { FlatNode, TaskNode, TaskTreePort } from '../src/task-tree.ts'
-import { PlanTreeStore, planTreeStore, setPlanTreeDatabase } from '../src/session-store.ts'
+import { planTreeStore, setPlanTreeDatabase } from '../src/session-store.ts'
 import type { SqliteDatabase } from '../src/session-store.ts'
 import { DatabaseSync } from 'node:sqlite'
 
@@ -18,16 +18,6 @@ function memoryDatabase(): SqliteDatabase {
 /** One session's tree exactly as the store holds it. */
 function storedIn(ctx: Context, sessionId: string): unknown {
   return planTreeStore(ctx).get(sessionId)
-}
-
-/**
- * Point the plugin's own store at a fresh in-memory database.
- * @param ctx - the context the plugin was mounted on.
- * @returns the isolated store.
- */
-function storeOf(ctx: Context): PlanTreeStore {
-  setPlanTreeDatabase({ file: ':memory:', open: memoryDatabase })
-  return planTreeStore(ctx)
 }
 
 /**
