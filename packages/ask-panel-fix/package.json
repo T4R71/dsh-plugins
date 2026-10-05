@@ -1,0 +1,61 @@
+{
+  "name": "@t4r71/dsh-ask-panel-fix",
+  "version": "0.1.0",
+  "publishConfig": {
+    "access": "public"
+  },
+  "description": "修掉官方问答面板「正文一长就把选项挤出可见区」的挤压：用 DOM 后处理 + 注入 CSS 把滚动容器提级到卡片整体，不 fork 官方、不改 asar。",
+  "type": "module",
+  "exports": {
+    ".": {
+      "default": "./index.mjs"
+    },
+    "./client": {
+      "default": "./lib/client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [],
+      "platform": "web",
+      "immediately": true
+    }
+  },
+  "files": [
+    "index.mjs",
+    "lib/client.js",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node build.mjs"
+  },
+  "license": "MIT",
+  "author": "T4R71 <T4R71@outlook.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/T4R71/dsh-plugins.git",
+    "directory": "packages/ask-panel-fix"
+  },
+  "bugs": "https://github.com/T4R71/dsh-plugins/issues",
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "cordis",
+    "client-plugin",
+    "question-panel",
+    "ui-fix"
+  ],
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.4"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.4"
+  },
+  "main": "index.mjs"
+}

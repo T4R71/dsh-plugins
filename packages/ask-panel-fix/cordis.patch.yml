@@ -1,0 +1,11 @@
+# 组合包层：只插本包自己那一行，不碰 profile 的其余部分。
+#
+# 为什么必须有这一行：客户端扫描（dsh-client-modules）是**增量**的，它只认
+# 「有活动 Loader 行」的包 —— 从行名解析到包根，再看 `dsh.client.platform`
+# 是不是 `'web'`、`exports['./client']` 在不在。行名必须等于包名。
+#
+# 宿主半边（index.mjs）是空插件，它存在的唯一理由是当这一行的落点。
+
+- insert:
+    - id: ask-panel-fix
+      name: '@t4r71/dsh-ask-panel-fix'
