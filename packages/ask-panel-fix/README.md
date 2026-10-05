@@ -125,9 +125,38 @@ $env:ELECTRON_RUN_AS_NODE=1
 撤下：把 `bundles` 里那一项删掉、按需再跑一次 profile 的 `pnpm install` 即可。
 宿主半边是空插件，页面上会立刻退回官方行为。
 
-> 本包**没有**在真机上装载过——本次交付只做到「产物可物化 + 符合官方三条 DOM 契约」这一档。
-> 装完后最省事的验收：在页面控制台看有没有 `[ask-panel-fix] 就绪` 与
+> **验证到哪一档**（2026-10-06，一手）：产物被**装进本机正在运行的 GUI 页面**（真
+> `window.__ModuleLoader__`、真 React 渲染出来的待答卡片）跑通了，包括对同一张卡片做
+> 开/关本插件样式的 A/B——缺陷复现与修复都在真卡上量到（数值见下「实测」一节）。
+> **还没做**的是「加进 profile 的 `bundles` 后由宿主自然加载」那一档：本包在 profile 里
+> 尚未装配（`/plugins/??@t4r71/dsh-ask-panel-fix/client.js` 实测 **404**），所以「冷装
+> 冒烟」仍是**未做**。装完后最省事的验收：页面控制台看有没有 `[ask-panel-fix] 就绪` 与
 > `[ask-panel-fix] 首个问答卡片已接管滚动`，再触发一个正文很长的问答、确认选项没被挤掉。
+
+## 实测
+
+在真页面上对**同一张**待答卡片做的（先注入插件、再整段替换 `h2` 正文把卡片撑爆，然后
+只切 `style.disabled` 这一个变量）：
+
+| 量 | 本插件样式 关 | 本插件样式 开 |
+| --- | --- | --- |
+| 卡片 `overflow-y` | `hidden`（官方 `.card`） | `auto` |
+| 卡片 `scrollHeight / clientHeight` | 473 / 432 | 712 / 432 |
+| 内层 `[data-question-scroll]` `clientHeight` | **0**（被 flex 压没） | 239 |
+| 内层 `overflow-y` | `auto` | `visible` |
+| 最后一个选项底边 vs 卡片底边 | 885 vs 710，**超出 175px** | 超出 175px |
+| 卡片能滚到的最大距离 | 0（`overflow:hidden`） | 280px |
+| 滚到底后最后一个选项落在卡片内 | **否 —— 够不到** | **是** |
+
+关掉时 `body.clientHeight` 塌成 **0** 就是症状的机制：官方把 `body` 设成 `flex:auto;
+min-height:0` 的自滚动区，正文一长，flex 先把 `body` 压到零高、由它内部滚动，而
+`footer`（选项就在里面）被 `flex-shrink:0` 顶出卡片，`overflow:hidden` 把多出来的裁掉
+——选项既看不见、也滚不到。
+
+同轮另测：连跑三次 `rescan()` 不产生重复（`style`/标记计数不变）；`apply()` 拿到的
+disposer 执行后 `style` 归 0、全局 `__DSH_ASK_PANEL_FIX__` 消失、卡片回到 `hidden`；
+`MutationObserver` 路径在一个临时合成节点上验过（挂上去 ~100ms 后自动打标）；全程没
+改动那张真卡的问题正文与选中项（收尾时逐项核对过）。
 
 ## 自检
 
@@ -143,6 +172,9 @@ window.__DSH_ASK_PANEL_FIX__.stats()
 - `styleTag`：注入的样式表在不在。
 
 问答面板出现时控制台还会打一行 `[ask-panel-fix] 首个问答卡片已接管滚动（锚点 [data-question-key]）`。
+
+> 本插件**不注册任何 slot、不接管应答通道**：只加 CSS 与两个自带属性，选项的点击/提交
+> 仍走官方实现。
 
 ## 构建期校验（`node build.mjs` 自带）
 
