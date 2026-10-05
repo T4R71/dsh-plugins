@@ -2307,6 +2307,10 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
           merged: { type: 'boolean', description: 'worktree mode=merge：这条线是否已合回并统一提交到主线。' },
           worktrees: { type: 'array', items: { type: 'string' }, description: 'worktree mode=list：在飞的线，每条一行（名字 / 分支 / 检出路径 / 提交数 / 未提交改动数）。' },
           probe: { type: 'string', description: 'probe：这一炮的原始读数（子会话 id、cwd、跑过的命令、每条结果的沙箱自报档位、标记文件在不在）。**原文照抄**，不改写成结论。' },
+          output: { type: 'string', description: 'commit / worktree merge：机械验证命令的真实回显。只在「跑过但没过」时带回，用来判断为什么没过；命令没跑起来时报文写在 result 里。' },
+          // **必须在这一份里报备**：宿主拿它做回执校验，出现未声明的属性时整份回执被判非法，
+          // 调用方看到的是「returned invalid output: value.output is not a declared property」——
+          // 而它承载的本来正是「为什么没过」。缺了它，那句报错反而**盖掉**真因。
         },
       },
       render: (_args, value) => [{ type: 'text', text: 'task ' + String(value.status) }],

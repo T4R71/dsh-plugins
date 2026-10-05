@@ -31,6 +31,12 @@ interface Captured {
   readonly name: string
   readonly execute: (args: TaskArgs, exec: unknown) => Promise<Record<string, unknown>>
   readonly parameters: ParameterJsonSchema
+  /**
+   * 回执的声明形状。宿主拿它校验返回值：出现**未声明**的属性时整份回执被判非法，
+   * 调用方看到的是 `returned invalid output` —— 真因反而被这句话盖掉。
+   * 所以「返回的每个键都在这一份里报过备」这件事本身要测。
+   */
+  readonly output?: { readonly schema?: { readonly properties?: Record<string, unknown> } }
 }
 
 /** 会话历史里的一条，只写 `settledNotice` 真会读的那几个键。 */
@@ -3073,4 +3079,59 @@ it('commit：点名一条不存在的线当场抛，并把在飞的线列出来'
     /no isolated line named "nope"/,
   )
 })
+
+/**
+ * 回执里**每一个键**都必须在这份工具的输出声明里报过备。
+ *
+ * 这一条钉的不是「好看」：宿主拿声明做回执校验，出现未声明的属性时整份回执被判非法，
+ * 调用方看到的是 `tool "task" returned invalid output: "value.output" is not a declared
+ * property` —— 它**盖掉**了返回值本来要说的那句话。
+ *
+ * 测试复现不了宿主那一层校验（那是传输层的事），所以这里钉的是它执行的那个不变量：
+ * 返回值 ⊆ 声明。声明漏了谁，这条就当场红，而不是等到真机上失败那一刻才发现真因没了。
+ * @param tool - 抓到的工具定义。
+ * @param value - 某次调用的真实返回值。
+ */
+function assertAllKeysDeclared(tool: Captured, value: Record<string, unknown>): void {
+  const declared = Object.keys(tool.output?.schema?.properties ?? {})
+  assert.ok(declared.length > 0, '工具必须声明输出形状，否则这条断言等于空转')
+  const undeclared = Object.keys(value).filter(key => !declared.includes(key))
+  assert.deepStrictEqual(undeclared, [],
+    '这些键没在输出声明里报备，宿主会把整份回执判成非法、真因随之丢失：' + undeclared.join(', ')
+      + '（已声明：' + declared.sort().join(', ') + '）')
+}
+
+it('commit：机械验证没过仍提交时，回执里的每个键都在输出声明里 —— 否则真因被那句校验报错盖掉', async () => {
+  const repo = await repoForLines()
+  const h = harness({ tree: true, runsFile: freshLedgerFile(), worktreeAuto: true, worktreePrepare: '' })
+  await run(h.tool, { action: 'run', run: 'a', nodes: [{ id: 'A', prompt: 'go' }] }, callerIn(repo))
+  const line = lineNames(h.worktreesFile)[0] as string
+  const worktree = String(lineRecord(h.worktreesFile, line).path)
+  // 有东西可提交，验证命令**必挂**：这一档正是「跑过、没过、但按记录员纪律照样提交」。
+  writeFileSyncNode(join(worktree, 'a.txt'), 'a\n', 'utf8')
+  const value = await run(h.tool,
+    { action: 'commit', line, units: ['u'], verify: 'exit 4', onFail: 'record' },
+    callerIn(repo))
+  // 先把这一档确实走到失败路径钉住 —— 否则「键都在声明里」可能只是因为压根没带 output。
+  assert.equal(value.status, 'completed', '记录员档：没过也照样提交')
+  assert.equal(typeof value.output, 'string', '没过就必须把验证命令的真实回显交回去，让人看得见为什么没过')
+  assertAllKeysDeclared(h.tool, value)
+})
+
+it('worktree merge：合回的整体验证没过时，回执里的每个键都在输出声明里 —— 否则真因被那句校验报错盖掉', async () => {
+  const repo = await repoForLines()
+  const h = harness({ tree: true, runsFile: freshLedgerFile(), worktreeAuto: true, worktreePrepare: '' })
+  await run(h.tool, { action: 'run', run: 'a', nodes: [{ id: 'A', prompt: 'go' }] }, callerIn(repo))
+  const line = lineNames(h.worktreesFile)[0] as string
+  const worktree = String(lineRecord(h.worktreesFile, line).path)
+  writeFileSyncNode(join(worktree, 'a.txt'), 'a\n', 'utf8')
+  await run(h.tool, { action: 'commit', line, units: ['u'], verify: 'exit 0', onFail: 'record' }, callerIn(repo))
+  // 整套检查必挂：这一档就是我当时真实撞上的那个失败路径。
+  const value = await run(h.tool, { action: 'worktree', mode: 'merge', line, verify: 'exit 4' }, callerIn(repo))
+  assert.equal(value.status, 'failed', '整体验证没过 ⇒ 合回必须判失败')
+  assert.equal(value.merged, false)
+  assert.equal(typeof value.output, 'string', '没过就必须把整套检查的真实回显交回去')
+  assertAllKeysDeclared(h.tool, value)
+})
+
 
