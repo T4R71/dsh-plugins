@@ -164,7 +164,19 @@ function ledgerFileAbsent(file: string): boolean {
  *   （或直接给一个 `taskRuns` 服务）、父 Agent 是谁。
  * @returns 被注册的工具定义、调用记录、目录查询记录，以及可变的会话历史。
  */
-function harness(options: { tree?: boolean; children?: readonly (string | { readonly id: string; readonly createdAt: number; readonly mode: 'one-shot' | 'continuable' | 'unknown'; readonly label?: string })[]; answers?: { id: string; selected: string[] }[]; presets?: Record<string, { persona?: string; allow?: string[]; deny?: string[]; maxDepth?: number; drop?: string[]; agentOptions?: { provider?: string; model?: string; reasoningEffort?: string; maxTokens?: number } }>; defaultRules?: string; runsFile?: string; worktreesFile?: string; worktreeGoal?: string; worktreeVerify?: string; worktreeMergeVerify?: string; worktreePrepare?: string; worktreeAuto?: boolean; parentAgent?: Record<string, unknown>; descendants?: readonly { readonly id: string; readonly activity?: 'running' | 'inactive'; readonly kind?: 'child' | 'diagnostic'; readonly reason?: 'corrupt' | 'unsupported' | 'unavailable' }[]; descendantsThrow?: boolean; sessionStore?: readonly string[]; sessionStoreService?: boolean; beforeStart?: () => void } = {}): {
+function harness(options: { tree?: boolean; children?: readonly (string | { readonly id: string; readonly createdAt: number; readonly mode: 'one-shot' | 'continuable' | 'unknown'; readonly label?: string })[]; answers?: { id: string; selected: string[] }[]; presets?: Record<string, { persona?: string; allow?: string[]; deny?: string[]; maxDepth?: number; drop?: string[]; agentOptions?: { provider?: string; model?: string; reasoningEffort?: string; maxTokens?: number } }>; defaultRules?: string; runsFile?: string; worktreesFile?: string; worktreeGoal?: string; worktreeVerify?: string; worktreeMergeVerify?: string; worktreePrepare?: string; worktreeAuto?: boolean; parentAgent?: Record<string, unknown>; descendants?: readonly { readonly id: string; readonly activity?: 'running' | 'inactive'; readonly kind?: 'child' | 'diagnostic'; readonly reason?: 'corrupt' | 'unsupported' | 'unavailable' }[]; descendantsThrow?: boolean; sessionStore?: readonly string[]; sessionStoreService?: boolean; beforeStart?: () => void;
+  /**
+   * 「第一次装配」的落点：宿主在 `startContinuable` **内部**就把孩子材料化、并按它的身份
+   * 装配一次系统提示词 —— 那一次发生在**返回值之前**。假宿主在这里补上同一步。
+   * @param childId - 这次派发用的子会话 id（与返回值逐字相同）。
+   * @param spec - `startContinuable` 收到的那个 spec。
+   */
+  assembling?: (childId: string, spec: unknown) => Promise<void>
+  /**
+   * 假宿主认不认调用方预留的 `spec.childId`。默认不认（孩子拿宿主自己发的 `child-N`）；
+   * 开了就是当刻那一代宿主 —— `lib/index.js:1677` 的 `spec.childId ?? brandString(randomUUID())`。
+   */
+  hostChildId?: boolean } = {}): {
   tool: Captured
   calls: string[]
   listed: string[]
@@ -292,11 +304,24 @@ function harness(options: { tree?: boolean; children?: readonly (string | { read
     inject: () => { notified.push('inject'); return undefined },
     subagents: {
       resolveMaxDepth: () => undefined,
-      startContinuable: async (spec: unknown) => {
+      startContinuable: async (spec: { readonly childId?: string }) => {
+        // 宿主有两代，差别就在 `spec.childId` 这一格认不认：
+        //   默认（`hostChildId` 没开）演的是**不认**的那一代 —— 孩子拿到的永远是宿主自己
+        //   发的那个 id，`child-N` 就是它；那一代里调用方在派发前不可能知道 id，
+        //   孩子第一次装配注定少一段（本插件救不回来，只保证此后每一轮都对得上）。
+        //   `hostChildId: true` 演的是当刻这一代（`lib/index.js:1677`
+        //   `spec.childId ?? brandString(randomUUID())`）：孩子用的就是调用方预留的那一个。
+        const actual = options.hostChildId === true
+          ? spec.childId ?? 'child-' + String(++dispatches)
+          : 'child-' + String(++dispatches)
         // 派发**之前**的那条缝：测试在这里制造「孩子起来了、账本却写不进去」的窗口。
         options.beforeStart?.()
         starts.push(spec)
-        return { childId: 'child-' + String(++dispatches) }
+        // 宿主在**返回之前**就把孩子材料化、并按它的身份装配一次系统提示词 —— 真机上
+        // 那一次正好落在 `startContinuable` 还没返回的时候。`actual` 是孩子**实际**
+        // 会用的 id：认这一格的那一代就是调用方预留的那一个。
+        if (options.assembling !== undefined) await options.assembling(actual, spec)
+        return { childId: actual }
       },
       sendMessage: async (agent: unknown, target: unknown, content: unknown, options_: unknown) => {
         sent.push({ agent, target, content, options: options_ })
@@ -2773,6 +2798,46 @@ it('过程记录提醒（2026-10-01 冻结 v3）：只进「本插件派出的�
   const stranger = await assembleFor(h.listeners, 'sess-other')
   assert.strictEqual(stranger.result, stranger.produced, '没被派出的会话必须原样返回同一个引用')
   assert.equal(JSON.stringify(stranger.produced).includes('【阶段建议】'), false)
+})
+
+it('第一次装配：孩子还在 startContinuable 里的时候，那段提醒就已经在它的提示词里了', async () => {
+  const ledger = freshLedgerFile()
+  // 孩子在**返回之前**装配的那一次 —— 真机就是这个顺序（宿主在 startContinuable 内部
+  // 材料化孩子，本插件的注册登记原先落在返回值之后）。
+  // 这一条不依赖任何夹具的宽容：只要那一次装配拿不到 childId，它就在这里是空的。
+  const assemble = async (sid: string, h: ReturnType<typeof harness>): Promise<{ identity: string; nudge: string }> => {
+    const entries = h.listeners.filter(item => item.event === 'system-prompt/assemble')
+    assert.ok(entries.length > 0, 'apply 必须订阅 system-prompt/assemble')
+    const context = { agent: { session: { id: sid } } }
+    const produced = { sections: [{ name: 'harness:identity', order: -1000, text: '你是中枢。' }], tools: [] }
+    const step = (index: number): (() => Promise<unknown>) => async () => {
+      const entry = entries[index]
+      if (entry === undefined) return produced
+      const handler = entry.handler as unknown as (assembly: unknown, ctx: unknown, next: () => Promise<unknown>) => Promise<unknown>
+      return await handler(undefined, context, step(index + 1))
+    }
+    const result = await step(0)() as { sections?: readonly { name?: string; text?: string }[] }
+    const sections = result.sections ?? []
+    return {
+      identity: String(sections[0]?.text ?? ''),
+      nudge: String(sections.find(section => section.name === 'task:process-nudge')?.text ?? ''),
+    }
+  }
+  let first: { identity: string; nudge: string } | undefined
+  const h = harness({
+    tree: true,
+    runsFile: ledger,
+    parentAgent: { session: { id: SESSION } },
+    hostChildId: true,
+    assembling: async (childId) => { first = await assemble(childId, h) },
+  })
+  await startRun(h.tool, [{ id: 'A', prompt: 'a' }])
+  assert.ok(first !== undefined, '假宿主必须真的走过那一次装配')
+  // 那一次装配**就是**孩子的身份：上下文里的 sid 与返回的 childId 逐字相同。
+  assert.equal(first?.identity, '你是中枢。', '第一次装配拿到的是孩子自己的系统提示词')
+  assert.ok(String(first?.nudge).startsWith('【过程记录（必须）】'),
+    '孩子第一次装配时这一段就必须在 —— 否则它会从无到有地追加进提示词，整段前缀作废：'
+    + JSON.stringify(first?.nudge))
 })
 
 /**

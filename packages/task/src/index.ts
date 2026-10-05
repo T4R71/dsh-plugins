@@ -75,7 +75,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 // 服务面的类型来自这个模块的 `declare module '@deepseek-ai/cordis'` 增补：
 // 没有这条 import，`ctx.subagents` 在 Context 上不存在（模块增补不会被自动加载）。
-import type { SubagentInterruptAuthority, SubagentStartRequest } from '@deepseek-ai/dsh-subagent'
+import type { ContinuableStart, SubagentInterruptAuthority, SubagentStartRequest } from '@deepseek-ai/dsh-subagent'
 import { SessionId } from '@deepseek-ai/dsh-session'
 // `compaction/*` 是宿主自己的会话事件词汇，由 @deepseek-ai/dsh-compaction 用
 // `declare module '@deepseek-ai/dsh-session/types'` 增补进 `SessionEventMap`。
@@ -1804,30 +1804,58 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
       ...preset.agentOptions !== undefined ? { agentOptions: narrowAgentOptions(preset.agentOptions) } : {},
     }
     const allowTools = preset.toolFilter?.allow
-    const started = await ctx.subagents.startContinuable({
-      provider: config.provider,
-      // 显示名走中文，键用**实际生效的 preset 键**：点名 impl 而 label 写「验证」时，
-      // 面板必须显示「实现」—— 显示层只有对上真正跑的身份才有意义。
-      // 没点名 preset 时（走 DEFAULT_PRESET）照样显示生效的那一支，不用 label 冒充身份。
-      label: roleLabel(effectiveKey),
-      request,
-      signal,
-    })
-    // 白名单按 childId 落表。为什么要等这一步：`agent/created` 是**串行**的，
-    // 而 `agents.create({ sessionId: childId, ... })` 用的就是这个 id ——
-    // 本次 `await` 返回后到孩子第一次装配之间，还有一整个事件分发的间隙，
-    // 所以这里登记赶得上；反过来说，登记必须**先于**任何 `await` 之外的让出。
-    if (allowTools !== undefined && allowTools.length > 0) {
-      pendingAllow.set(String(started.childId), [...allowTools])
-    }
-    // 「本插件派出的子代理」这一集合也在这里落：与上面两条登记同一个窗口、同一条纪律
-    // （`await` 返回后到孩子第一次装配之间还有一整个事件分发的间隙），供给 `system-prompt/assemble`
-    // 里那段**建议**判身份用 —— 只有本插件派出去的孩子才会看到它。
-    dispatchedChildren.add(String(started.childId))
-    // 提问根同样按 childId 落表：`agent/created` 是串行的，这次的登记赶得上孩子的第一次装配。
+    // **id 先于孩子存在**：宿主允许调用方自己定这一个
+    // （`dsh-subagent/lib/index.js:1677` 的 `spec.childId ?? brandString(randomUUID())`），
+    // 而这一步是本插件唯一能把三处登记**放到孩子第一次装配之前**的办法。
+    //
+    // 为什么非提前不可：宿主在 `startContinuable` **内部**就把孩子材料化、并按它的身份装配一次
+    // 系统提示词；那一次发生在返回值之前。原先三处登记都等返回值，于是那一次装配里
+    // 这段提醒**缺席**、返回之后第二次装配才带上 —— 文本纯追加（真机实测 105788 → 106044），
+    // 孩子的系统提示词因此被整段替换、前缀从 token 0 起全部失效。登记挪到调用之前之后，
+    // 孩子看到的第一次与此后每一次装配都是逐字相同的那一份。
+    const childId = SessionId(randomUUID())
     const askRoot = rootAgentOf(parent)
-    if (askRoot !== undefined) {
-      pendingAskRoots.set(String(started.childId), { root: askRoot, label: roleLabel(effectiveKey) })
+    // 三处登记都按 childId 认领，所以只能**成组**地写、成组地撤：撤一半留一半正是
+    // 「静默失效」的样子（白名单等一个不存在的孩子、集合里留一条死 id）。
+    const registerChild = (id: string): void => {
+      if (allowTools !== undefined && allowTools.length > 0) pendingAllow.set(id, [...allowTools])
+      // 这一处给 `system-prompt/assemble` 里那段提醒判身份用 —— 只有本插件派出去的孩子才会看到它。
+      dispatchedChildren.add(id)
+      // 提问根同样按 childId 落表（`agent/created` 里按同一个 id 查）。
+      if (askRoot !== undefined) pendingAskRoots.set(id, { root: askRoot, label: roleLabel(effectiveKey) })
+    }
+    const forgetChild = (id: string): void => {
+      pendingAllow.delete(id)
+      dispatchedChildren.delete(id)
+      pendingAskRoots.delete(id)
+    }
+    // 登记与派发之间**不许有 `await`**：宿主一进 `startContinuable` 就可能材料化孩子并按
+    // 它的身份装配一次，而那就是孩子看到的第一次。
+    registerChild(String(childId))
+    let started: ContinuableStart
+    try {
+      started = await ctx.subagents.startContinuable({
+        provider: config.provider,
+        // 显示名走中文，键用**实际生效的 preset 键**：点名 impl 而 label 写「验证」时，
+        // 面板必须显示「实现」—— 显示层只有对上真正跑的身份才有意义。
+        // 没点名 preset 时（走 DEFAULT_PRESET）照样显示生效的那一支，不用 label 冒充身份。
+        label: roleLabel(effectiveKey),
+        childId,
+        request,
+        signal,
+      })
+    } catch (error) {
+      // 派发没起来 ⇒ 那个 id 没有变成任何孩子，三条登记跟着撤掉，原因原样往上抛。
+      forgetChild(String(childId))
+      throw error
+    }
+    // 宿主用的是我们预留的 id（`spec.childId ?? randomUUID()` 的前一个分支）⇒ 三处登记
+    // 从孩子的第一次装配起就对得上。它若坚持自己发一个：把三条挪到那个 id 上，退回老行为 ——
+    // 那一代宿主里 id 在派发前根本不存在，第一次装配注定少一段，本插件修不了；
+    // 能保证的是派发照常成功，以及此后每一次装配都逐字相同（同一个 id、同一段文本）。
+    if (String(started.childId) !== String(childId)) {
+      forgetChild(String(childId))
+      registerChild(String(started.childId))
     }
     return await settleDispatch({ agent: parent }, spec.bind, started.childId)
   }
@@ -1838,8 +1866,9 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
    * 中枢自己的提示词、以及没被本插件派出的会话**一个字都不加**。
    *
    * 只在进程内存里、重启即失效：重启之后那些子会话本来就不在了，集合留着只会是一堆死 id。
-   * 登记点与 `pendingAllow` / `pendingAskRoots` 完全相同（派发那一刻），因为那两处已经把
-   * 「`await` 返回后到孩子第一次装配之间还有一整个事件分发的间隙」这件事验证过了。
+   * 登记点与 `pendingAllow` / `pendingAskRoots` 完全相同，而且比它们的注释说的还要早一格：
+   * 这三个键用的都是**本插件自己造的**那个 id（{@link dispatchTo} 在调 `startContinuable`
+   * 之前就把它交了出去），所以孩子**第一次**装配时查到的就是他自己的身份。
    */
   const dispatchedChildren = new Set<string>()
 
