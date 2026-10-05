@@ -77,6 +77,13 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 // 没有这条 import，`ctx.subagents` 在 Context 上不存在（模块增补不会被自动加载）。
 import type { SubagentInterruptAuthority, SubagentStartRequest } from '@deepseek-ai/dsh-subagent'
 import { SessionId } from '@deepseek-ai/dsh-session'
+// `compaction/*` 是宿主自己的会话事件词汇，由 @deepseek-ai/dsh-compaction 用
+// `declare module '@deepseek-ai/dsh-session/types'` 增补进 `SessionEventMap`。
+// 本包**没有**也不该有那个依赖：它只是几十个 compaction 事件类型里的一条判别式，
+// 为类型把它拉进发布依赖图不划算 —— packages/guard/src/interop.ts:5-27 记着同一条判断。
+// 于是 `event.type` 那个映射联合里**不含** `'compaction/end'`，直接与字面量比较会得到 TS2367。
+// 解法是在读取判别式的那一处把联合**放宽成 `string`**（见快照失效那条监听器）：
+// 判别式在运行时本来就是字符串，读它不需要知道联合的全部成员。
 import type { Dict } from '@deepseek-ai/cosmokit'
 import { allowToolSectionFilter, decodeDropDirective, encodeDropDirective, resolvePreset, toolSectionsForFilter } from './presets.ts'
 import type { PresetAgentOptions, PresetSpec } from './presets.ts'
@@ -1005,13 +1012,15 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
   }
 
   /**
-   * 把这条会话记录过的决策渲染成一段提示词。
+   * 决策段落：**截至上次压缩的那份快照**，压缩时才重算。
    *
-   * 这是「决策在压缩时重放」的落点。决策**不放在对话里**——对话会被压缩掉——
-   * 而是放在任务树里，再由本函数在**每一次**装配时重新读出来。于是无论上下文
-   * 被压缩过几轮，用户拍过的板都还在。
-   * @param sid - 会话 id。
-   * @returns 提示词片段；没有决策时返回空串（空 section 会被 renderPrompt 丢掉）。
+   * 决策**不放在对话里**——对话会被压缩掉——而是放在任务树里，再由 {@link buildDecisions}
+   * 读出来。但**不是每一轮都读**：段文本每轮都变会让核心侧每次装配都改写系统提示词
+   * 节点 0，把整条前缀缓存打掉；所以这里按会话记住一份快照，只在压缩结束时作废
+   * （见 {@link invalidateDecisions} 与 {@link COMPACTION_END_EVENT}）。
+   *
+   * 「压缩之间恒定」因此是**这个段落的语义**，不是优化：压缩前新落的决策暂存，
+   * 不进系统段，要等下一次压缩结束才一起补上。这个代价换的是整条前缀的 cacheRead。
    */
   /**
    * 去掉问答节点 detail 上的 `答：` 前缀。
@@ -1024,7 +1033,14 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
   const stripAnswerPrefix = (detail: string): string =>
     detail.startsWith(ANSWER_PREFIX) ? detail.slice(ANSWER_PREFIX.length) : detail
 
-  const renderDecisions = (sid: string): string => {
+  /**
+   * 真去树上读一遍、渲染一份决策快照。**每次调用都重新读树**。
+   *
+   * 这是「渲染」那一半；「什么时候允许渲染」由 {@link renderDecisions} 管。
+   * @param sid - 会话 id。
+   * @returns 提示词片段；没有决策时返回空串。
+   */
+  const buildDecisions = (sid: string): string => {
     let nodes: readonly TaskNode[] = []
     // 树服务缺席时**静默返回空**，而不是把整个装配炸掉：这个函数跑在每次模型步的
     // 前头，为一段可选提示词让整轮对话失败是不划算的。
@@ -1054,11 +1070,69 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
     ].join('\n')
   }
 
-  // 决策段落。`text` 是**函数**，每次装配重新求值（dsh-system-prompt/lib/index.js:
+  /**
+   * 这段的**快照**：每个会话存一份 {@link buildDecisions} 的产物，压缩时才作废。
+   *
+   * 为什么非缓存不可：段文本每轮都变，核心侧 {@link SystemPromptProjection.project}
+   * 就会走「整段 replace 节点 0」那条路（dsh-src/packages/core/agent-loop/src/runtime-context.ts:98），
+   * provider 的前缀缓存从第 0 个 token 起失配、该次请求 cacheRead 归零。只有让渲染文本
+   * 「两次压缩之间逐字节恒定」，才能落到 `head.text === rendered` 那条直接返回空的分支。
+   *
+   * 失效点见 {@link invalidateDecisions}。用 `has()` 而不是 `get() !== undefined`：
+   * 「没算过」与「算出来是空串」（会话开头、尚无决策）是两回事，后者也该被记住。
+   */
+  const decisionSnapshots = new Map<string, string>()
+
+  /**
+   * 取这条会话截至上次压缩的决策快照；没有就算一份并记住。
+   * @param sid - 会话 id。
+   * @returns 提示词片段；快照恒定时逐字节相同。
+   */
+  const renderDecisions = (sid: string): string => {
+    const cached = decisionSnapshots.get(sid)
+    if (cached !== undefined) return cached
+    const fresh = buildDecisions(sid)
+    decisionSnapshots.set(sid, fresh)
+    return fresh
+  }
+
+  /**
+   * 作废某条会话的决策快照，下一次求值重读树。压缩结束与会话回收两条路都调它。
+   * @param sid - 会话 id。
+   */
+  const invalidateDecisions = (sid: string): void => {
+    decisionSnapshots.delete(sid)
+  }
+
+  /**
+   * 一次压缩**结束**的落点：`compaction/end`（含带 `error` 的那次尝试）。
+   *
+   * 为什么认这个事件：压缩是唯一会把「决策」从上下文里抹掉的动作 —— 真正的替换面
+   * （`user/message` 的 shadow 面）落在 `compaction/summary` 与 `compaction/end`
+   * 之间（dsh-src/packages/compaction/compaction-basic/src/region.ts:491-509 与 :237），
+   * 也就是**早于** `compaction/end`。所以在 `end` 上作废，之后任何一次求值都是
+   * 「压缩已完成」的那份全量视图，不存在「取到半旧快照」的窗口；
+   * 反过来挂在 `compaction/start` 或 `summary` 上，都会在压缩真正落地前就把缓存丢掉，
+   * 反而提前触发一次改写。
+   *
+   * 失败的压缩带 `error` 也一并作废：不区分成败才能保证「结束时清掉」这条不变式，
+   * 多算一次的代价远小于把一份陈旧快照永久钉死。
+   *
+   * `compaction/prune`（裁掉历史中部的工具结果）**故意不在这里**：它不动系统提示词，
+   * 决策段的内容与它无关。
+   */
+  const COMPACTION_END_EVENT = 'compaction/end'
+
+  // 决策段落。`text` 仍然是**函数**，每次装配都会被求值（dsh-system-prompt/lib/index.js:
   // `text: typeof section.text === "function" ? section.text(context) : section.text`），
   // 而 `context` 由 `assembleContextFor` 造出来，里面带着 `agent`
   // （dsh-agent/lib/index.js: `return { agent, scope: agent, ... }`）——
   // 会话身份就是从那里拿到的。
+  //
+  // 它每次都被**求值**，但求值结果在两次压缩之间是同一份快照（{@link renderDecisions}）：
+  // 宿主把 section 文本拼进提示词，核心侧再拿整份渲染文本与节点 0 比，
+  // 恒等时那次 `project()` 返回空、一个字节都不改写。**函数形态与快照语义不冲突**：
+  // 前者是装配缝的契约，后者是这段文本自身的语义。
   //
   // 没有用「记一条决策就重新注册一次 section」的写法：`PromptLayer.sections` 是
   // `NamedEntries`，**同名重复注册会直接抛错**，那条路根本走不通。
@@ -1070,6 +1144,41 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
       return sid === undefined ? '' : renderDecisions(sid)
     },
   })
+
+  /**
+   * 快照的两条失效通路。挂在**根作用域**（`{ global: true }`）上，与下面那条结算监听器同一个理由：
+   * 段是每一个代理都装的，缓存也必须跟着每一条会话走 —— 子代理同样有自己的一份决策段。
+   *
+   * 监听器**自己吞掉一切异常**：一次事件分发失败不许把整轮对话炸掉，与结算监听器同一条纪律。
+   */
+  ctx.on('session/event', (session, event) => {
+    try {
+      // 判别式按 `string` 读：`SessionEventMap` 的联合里没有 `compaction/*`
+      // （那一条由本包不依赖的 @deepseek-ai/dsh-compaction 增补），
+      // 直接拿联合与字面量比会得到 TS2367。理由见文件顶部的 import 段落。
+      const type: string = event.type
+      if (type !== COMPACTION_END_EVENT) return
+      invalidateDecisions(String(session.id))
+    } catch (error) {
+      ctx.logger?.warn?.('task: invalidating the decision snapshot failed: ' + String(error))
+    }
+  }, { global: true })
+
+  /**
+   * 会话被回收时把那份快照一并丢掉。
+   *
+   * 不丢也只是几 KB 的字符串，但它会**无限增长**：每条会话（含每个子代理）一辈子留一项，
+   * 长跑进程里就是一个只增不减的表。`session/disposed` 是宿主已有的回收点
+   * （dsh-src/packages/deliverables/workspace-changes/src/index.ts:152 就是照这个用法写的），
+   * 用它比在这里自建一套 LRU 便宜得多。
+   */
+  ctx.on('session/disposed', (session) => {
+    try {
+      invalidateDecisions(String(session.id))
+    } catch (error) {
+      ctx.logger?.warn?.('task: dropping the decision snapshot of a disposed session failed: ' + String(error))
+    }
+  }, { global: true })
 
   /**
    * 全局规则段：**每一个**代理共享的一段规则，注册在根作用域。

@@ -1076,21 +1076,36 @@ it('决策节点按 ask- 前缀累加编号，不会互相覆盖', async () => {
 })
 
 /**
- * 决策段落 —— "压缩时重放"的落点。
+ * 决策段落 —— "压缩时重放"的落点，但**两次压缩之间逐字节恒定**。
  *
- * `text` 必须是**函数**：section 文本在每次装配时求值，所以上下文被压缩过几轮之后，
- * 决策仍然会被重新读出来。写成静态字符串就等于只在注册那一刻快照一次，那正是要避免的。
+ * `text` 仍然是**函数**（每次装配都被求值，见 dsh-system-prompt），但求值结果是一份
+ * 按会话记住的**快照**：段文本每轮都变会让核心侧整段 replace 系统提示词节点 0，
+ * 把整条前缀缓存从第 0 个 token 起打掉（dsh-src 的 runtime-context.ts:98）。
+ * 快照只在压缩结束时作废。
  */
-it('决策段落是动态函数：每次装配重读树，所以压缩不掉', async () => {
-  const { sections, treeNodes } = harness({ tree: true })
+it('决策段是函数形态，但两次压缩之间取到的是同一份快照', async () => {
+  const { sections, treeNodes, listeners } = harness({ tree: true })
+  /** 把一次「压缩结束」派发给所有监听器 —— 快照的失效点。 */
+  const invalidate = (): void => {
+    for (const entry of listeners) {
+      if (entry.event !== 'session/event') continue
+      (entry.handler as unknown as (session: unknown, event: unknown) => void)({ id: SESSION }, { type: 'compaction/end', data: {} })
+    }
+  }
   const section = sections.find(entry => entry.name === 'task:decisions')
   assert.ok(section !== undefined, 'apply 必须注册决策段落')
-  assert.strictEqual(typeof section.text, 'function', 'text 必须是函数，否则压缩后就没了')
+  assert.strictEqual(typeof section.text, 'function', 'text 仍是函数：装配缝的契约没变')
   const render = section.text as (context: unknown) => string
   const context = { agent: { session: { id: SESSION } } }
   // 没有决策时是空串：空 section 会被 renderPrompt 丢掉，不白占提示词。
   assert.strictEqual(render(context), '')
+
+  // 第一次装配之后新落的决策**不进**这一轮的系统段 —— 这正是快照的语义。
   treeNodes.push({ id: 'ask-1', title: '折叠要哪种？', detail: '答：默认折叠可展开' })
+  assert.strictEqual(render(context), '', '快照已经算过（空串），就得一直是空串')
+
+  // 压缩结束 → 快照作废 → 重新读树，这一次才看得见。
+  invalidate()
   const text = render(context)
   assert.match(text, /折叠要哪种？/)
   assert.match(text, /默认折叠可展开/)
@@ -1098,6 +1113,48 @@ it('决策段落是动态函数：每次装配重读树，所以压缩不掉', a
   assert.ok(!text.includes('答：'), '前缀不该漏进提示词')
   // 拿不到会话身份时返回空串，而不是抛出 —— 它在每次模型步的前头跑。
   assert.strictEqual(render({}), '')
+})
+
+/**
+ * 快照的失效点必须是 `compaction/end`。
+ *
+ * 挂在别的压缩事件上（`start`/`summary`）会在压缩真正落地**之前**就把缓存丢掉，
+ * 反而提前触发一次系统提示词改写；挂在太晚的地方则会让一份陈旧快照被永久钉死。
+ */
+it('快照只在 compaction/end 上作废：start / summary 都不动它', async () => {
+  const { sections, treeNodes, listeners } = harness({ tree: true })
+  const render = sections.find(entry => entry.name === 'task:decisions')?.text as (context: unknown) => string
+  const context = { agent: { session: { id: SESSION } } }
+  const fire = (type: string): void => {
+    for (const entry of listeners) {
+      if (entry.event !== 'session/event') continue
+      (entry.handler as unknown as (session: unknown, event: unknown) => void)({ id: SESSION }, { type, data: {} })
+    }
+  }
+  assert.strictEqual(render(context), '')
+  treeNodes.push({ id: 'ask-1', title: '折叠要哪种？', detail: '答：A' })
+  fire('compaction/start')
+  assert.strictEqual(render(context), '', '压缩还没落地，快照不许被提前丢掉')
+  fire('compaction/summary')
+  assert.strictEqual(render(context), '', 'summary 之后替换面才落，仍然太早')
+  fire('compaction/end')
+  assert.match(render(context), /折叠要哪种？/, '压缩结束才重新读树')
+})
+
+/**
+ * 快照跟着会话走，会话回收时一并丢掉，不许只增不减。
+ */
+it('会话被回收时快照一并丢掉，表不会无限增长', async () => {
+  const { sections, treeNodes, listeners } = harness({ tree: true })
+  const render = sections.find(entry => entry.name === 'task:decisions')?.text as (context: unknown) => string
+  const context = { agent: { session: { id: SESSION } } }
+  assert.strictEqual(render(context), '')
+  treeNodes.push({ id: 'ask-1', title: '折叠要哪种？', detail: '答：A' })
+  for (const entry of listeners) {
+    if (entry.event !== 'session/disposed') continue
+    (entry.handler as unknown as (session: unknown) => void)({ id: SESSION })
+  }
+  assert.match(render(context), /折叠要哪种？/, '丢了快照就得重新算，于是能看见新决策')
 })
 
 it('树缺席时 ask 直接报错，绝不问完再把答案丢在对话里', async () => {
