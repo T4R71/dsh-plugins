@@ -180,16 +180,20 @@ export function seedAxesFor(
  * pair, answer {@link DEFAULT_AXES}. That is also what a live read answers — see
  * {@link SessionAxesStore.ensure} — so the pair a picker shows for a session with
  * no record and the pair the host enforces are one value rather than two.
+ * The parent's pair is AUTHORITATIVE for a subagent child: the settings row is
+ * not consulted at all, so `defaultGroups` is not stacked on top of it. A child
+ * that inherited a pair and then took the settings page's blank-slate groups
+ * gained write roots its parent never had — the parent's own pair was already
+ * derived from that same row, groups included, so re-attaching them adds
+ * references the parent deliberately does not hold.
  * @param row - the settings row's value, untrusted: a human may have edited it.
  * @param inherited - the parent's pair for a subagent child, or `undefined`.
  * @returns the seed pair.
  */
 export function seedPair(row: unknown, inherited: EffectiveScopes | undefined): EffectiveScopes {
   try {
-    return seedGroupReferences(
-      inherited === undefined ? axesOf(row) : pairOf(inherited),
-      defaultGroupIds(row),
-    )
+    if (inherited !== undefined) return pairOf(inherited)
+    return seedGroupReferences(axesOf(row), defaultGroupIds(row))
   } catch {
     // An invented boundary is worse than the deployment's built-in one, and this
     // is the answer every other reader of an unreadable document already gives.

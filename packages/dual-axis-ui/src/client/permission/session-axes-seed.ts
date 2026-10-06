@@ -2,8 +2,8 @@
  * 记录缺席时两个下拉该显示的那一对轴：宿主 `seedPair` 的逐字镜像。
  *
  * 宿主那一份在 `@t4r71/dsh-dual-axis` 的 `src/session-store.ts`，是
- * `seedAxesFor` 的纯核：设置页那一行（`read` / `write` / `defaultGroups`），
- * 加上子代理子会话从**父会话当刻的记录**继承来的那一对，折成「这条会话在新存储里
+ * `seedAxesFor` 的纯核：子代理子会话取**父会话当刻的记录**（权威，设置页那一行不参与），
+ * 其余会话取设置页那一行（`read` / `write` / `defaultGroups`），折成「这条会话在新存储里
  * 还没有记录时被钉下、也被判定路径执行的那一对」。记录落地之前，活读路径（模型提示词、
  * 读围栏、`/axis` 的兜底）交回的就是它，所以界面必须显示同一个值 —— 显示别的就是
  * 「界面显示 A、宿主执行 B」：设置页默认若是「禁止读」，那一轮仍然被当成「全盘读」。
@@ -220,6 +220,10 @@ function seedGroupReferences(axes: SeededAxes, ids: readonly string[]): SeededAx
 /**
  * 记录缺席时该显示的那一对轴 —— 与宿主 `seedPair` 同一份计算、同一个兜底。
  *
+ * 父会话那一对对子代理子会话是**权威**：设置页那一行完全不作数，`defaultGroups`
+ * 不再叠加上去 —— 父会话自己那一对本来就出自同一行（组已经叠过一次），再叠一次会
+ * 给子会话添上父会话刻意没持有的写根。
+ *
  * 永不抛：设置页那一行读不懂、父会话记录读不懂，一律答
  * {@link SESSION_AXES_FALLBACK}，与宿主在同一种输入上的答案相同。
  * @param row - 设置页那一行（`dual-axis` 命名空间）的取值，未信任。
@@ -228,10 +232,8 @@ function seedGroupReferences(axes: SeededAxes, ids: readonly string[]): SeededAx
  */
 export function sessionAxesSeed(row: unknown, inherited: SeededAxes | undefined): SeededAxes {
   try {
-    return seedGroupReferences(
-      inherited === undefined ? axesOfRow(row) : pairOf(inherited),
-      defaultGroupIds(row),
-    )
+    if (inherited !== undefined) return pairOf(inherited)
+    return seedGroupReferences(axesOfRow(row), defaultGroupIds(row))
   } catch {
     return SESSION_AXES_FALLBACK
   }

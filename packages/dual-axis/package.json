@@ -1,7 +1,7 @@
 {
   "name": "@t4r71/dsh-dual-axis",
   "description": "The dual-axis access-mode bundle: the file sandbox's read and write axes, custom allow/deny paths included, as an installable profile layer",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "publishConfig": {
     "access": "public"
   },

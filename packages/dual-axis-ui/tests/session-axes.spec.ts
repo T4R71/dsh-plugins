@@ -151,24 +151,28 @@ test('a record still wins over the seed', () => {
 
 test('a subagent child seeds from its parent record, not from the settings row', () => {
   // 宿主 inheritedAxes 读的是父会话当刻的记录；客户端读的是同一份文档里的同一个 id。
-  // 父会话那一对两条轴都是闭合取值，所以默认加载清单对它们一条也不生效：逐轴判定。
   const parent = { read: { kind: 'deny' }, write: { kind: 'workspace' } }
   assert.deepEqual(
     sessionAxesView(doc({ p1: parent }), 'c1', 'p1'),
     { state: 'default', axes: parent },
   )
-  // 父会话的记录里有一条自定义轴时，组仍然只挂到那条轴上。
+  // 父会话的记录是**权威**：默认加载清单不再叠加上去。父会话那一对本来就出自同一行
+  // （组已经叠过一次），再叠一次会给子会话添上父会话刻意没持有的写根 —— 那是子会话
+  // 拿到父会话没有的写权限。
   const customParent = { read: { kind: 'custom', base: 'deny' }, write: { kind: 'workspace' } }
   assert.deepEqual(
     sessionAxesView(doc({ p1: customParent }), 'c1', 'p1'),
     {
       state: 'default',
       axes: {
-        read: { kind: 'custom', base: 'deny', groups: ['A'], allow: [], deny: [] },
+        read: { kind: 'custom', base: 'deny', groups: [], allow: [], deny: [] },
         write: { kind: 'workspace' },
       },
     },
   )
+  // 对照：同样这一行、同样这个组，对**没有父会话可继承**的会话照样生效 —— 组本身没坏，
+  // 只是不再是子会话的种子来源。
+  assert.deepEqual(sessionAxesView(doc({}), 'c1'), { state: 'default', axes: ROW_SEED })
   // 父会话自己也没有记录时退回设置页那一行 —— 与宿主同一条分支。
   assert.deepEqual(sessionAxesView(doc({}), 'c1', 'p1'), { state: 'default', axes: ROW_SEED })
   // 父会话有记录时，父会话自己的那一条仍然照读。

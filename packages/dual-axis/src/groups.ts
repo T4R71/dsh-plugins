@@ -37,9 +37,11 @@
  * @module @t4r71/dsh-dual-axis/groups
  */
 
+import { sep } from 'node:path'
+
 import type { AxisScope, EffectiveScopes } from './axis.ts'
 import { pathList } from './config.ts'
-import { isLexicallyUnder, resolveScope, scopeContains } from './scope.ts'
+import { isEvaluableAxis, isLexicallyUnder, resolveScope, scopeContains } from './scope.ts'
 import type { ResolvedScope, ScopePolicy } from './scope.ts'
 
 /** One group's rules for one axis. Either list may be absent. */
@@ -358,41 +360,132 @@ export function scopeOfResolved(resolved: ResolvedScope): AxisScope {
 }
 
 /**
- * The removals in a range that remove something, so two ranges that differ only
- * in irrelevant removals compare equal.
- * @param scope - the evaluated range.
- * @returns the deny roots that would otherwise be permitted.
+ * Whether two evaluated ranges permit exactly the same paths.
+ *
+ * A range permits a REGION, not a pair of lists: the union of the subtrees its
+ * allow roots name, minus the union of the subtrees its deny roots name. Two
+ * spellings of one region permit exactly the same paths, and both directions of
+ * that happen here:
+ *
+ * - a removal no allow root reaches is inert — `deny ["C:\\out"]` beside a write
+ *   root at `C:\\ws` removes nothing, so the two ranges are the same one;
+ * - an allow root a removal sits ABOVE is removed whole — `allow ["C:\\ws\\a"],
+ *   deny ["C:\\ws"]` permits nothing at all, however much its allow list reads
+ *   like it permits `C:\\ws\\a`.
+ *
+ * The second case is the one a list-shaped comparison gets wrong in the
+ * direction that matters. It asks whether this range's ALLOW LIST reaches the
+ * removal, which is the wrong question the moment the removal lies above the
+ * list: two ranges that differ exactly there were called equal, and the caller
+ * below kept an UNINTERSECTED write axis on that answer — one permitting a path
+ * the read axis refuses, while the same misjudgement reported a narrowing for a
+ * write root the write axis's own removal had already taken away.
+ *
+ * So the comparison is made where the answer cannot be misread: on POINTS, with
+ * {@link scopeContains} — the fence's own predicate — deciding each one.
+ * @param left - one evaluated range.
+ * @param right - the other.
+ * @returns whether the two permit the same paths.
  */
-function relevantDenies(scope: ResolvedScope): readonly string[] {
-  const permitAll: ResolvedScope = { unbounded: scope.unbounded, allow: scope.allow, deny: [] }
-  return scope.deny.filter(root => scopeContains(permitAll, root, isLexicallyUnder))
+function sameRange(left: ResolvedScope, right: ResolvedScope): boolean {
+  // An unbounded range permits whatever its own removals leave, and no union of
+  // bounded roots reaches all of it, while a bounded range reaches nothing
+  // outside its own roots. The two are therefore never the same region, not even
+  // when the bounded one is empty.
+  if (left.unbounded !== right.unbounded) return false
+  return exactDiff(left, right).length === 0 && exactDiff(right, left).length === 0
 }
 
-/** Whether two evaluated ranges permit exactly the same paths. */
-function sameRange(left: ResolvedScope, right: ResolvedScope): boolean {
-  const sameSet = (one: readonly string[], other: readonly string[]): boolean =>
-    one.length === other.length && one.every(value => other.includes(value))
-  if (left.unbounded !== right.unbounded) return false
-  // An unbounded range is described by its removals alone; its allow list is
-  // never consulted, so two unbounded ranges differing only there are equal.
-  if (left.unbounded) return sameSet(relevantDenies(left), relevantDenies(right))
-  return sameSet(left.allow, right.allow) && sameSet(relevantDenies(left), relevantDenies(right))
+/**
+ * The witness for "this range permits at least one path the other does not" —
+ * empty exactly when there is none.
+ *
+ * A region is a union of subtrees with holes cut into it, and every such region
+ * holds either one of the roots the two ranges name or a path strictly below one
+ * of them that no deeper root covers. That is {@link boundaryPoints}, so a
+ * difference between two regions always shows at one of those points — the
+ * answer is never "no difference" for want of a point to look at. Each answer is
+ * the fence's own {@link scopeContains}, so a witness is a path one range
+ * provably permits and the other provably refuses; a caller reading the empty
+ * answer as "so the write axis may be kept un-intersected" is never told that
+ * wrongly, and the worst outcome of the comparison is an intersection carried
+ * out where it changed nothing.
+ * @param left - the range whose extra permissions are asked about.
+ * @param right - the range it is measured against.
+ * @returns the path justifying the answer, or an empty list.
+ */
+function exactDiff(left: ResolvedScope, right: ResolvedScope): readonly string[] {
+  for (const point of boundaryPoints(left, right)) {
+    if (scopeContains(left, point, isLexicallyUnder) && !scopeContains(right, point, isLexicallyUnder)) return [point]
+  }
+  return []
+}
+
+/**
+ * The points a comparison of two regions has to look at: every root either range
+ * names, and one child of each.
+ *
+ * A root decides the boundary (a path is under it or is not) and the child
+ * stands for the whole part of that subtree no deeper root carves off, so
+ * between them they represent every region the roots can tell apart.
+ * @param left - one evaluated range.
+ * @param right - the other.
+ * @returns the representative points of every region the two can carve out.
+ */
+function boundaryPoints(left: ResolvedScope, right: ResolvedScope): readonly string[] {
+  const roots = [...new Set([...left.allow, ...left.deny, ...right.allow, ...right.deny])]
+  const points: string[] = [...roots]
+  for (const root of roots) points.push(freshChild(root, roots))
+  return points
+}
+
+/**
+ * One path strictly under `root` that no root strictly under `root` covers.
+ *
+ * The name is chosen against the first path component every deeper root names
+ * after `root`, which is what makes the point a representative of the "everything
+ * else below this root" region rather than a path some deeper root already
+ * removed. Such a name always exists: a finite root set can never exhaust the
+ * names left over.
+ * @param root - the root to descend from.
+ * @param roots - every root either range names.
+ * @returns the representative path.
+ */
+function freshChild(root: string, roots: readonly string[]): string {
+  const taken = new Set<string>()
+  for (const other of roots) {
+    if (other === root || !isLexicallyUnder(other, root)) continue
+    const rest = other.length > root.length ? other.slice(root.length).replace(/^[\\/]+/, '') : ''
+    const name = rest.split(/[\\/]/)[0]
+    if (name !== undefined && name.length > 0) taken.add(name.toLowerCase())
+  }
+  let name = 'dual-axis'
+  while (taken.has(name)) name += '-'
+  return root + sep + name
 }
 
 /**
  * What the intersection removed: every root the write axis permitted that the
- * effective range does not, counting both roots dropped from the allow list and
- * roots the read axis newly denies.
+ * effective range does not.
+ *
+ * Both halves ask the same two questions of the root they are about — did the
+ * write axis itself reach it, and does the effective range reach it now — because
+ * a removal the write axis had already carried is not something the read axis
+ * did. Counting a root the write axis denied itself (`allow ["C:\\dead"], deny
+ * ["C:\\dead"]`) reported a narrowing of that root on a session where the read
+ * axis removed nothing, and the model read a sentence about work it had never
+ * been able to do. `after` is a subset of `before` by construction, so a root
+ * `before` does not reach is one `after` does not reach either, and the two
+ * answers cannot disagree about it.
  * @param before - the write axis's own range.
  * @param after - the effective write range.
  * @returns the narrowing report.
  */
 function narrowingOf(before: ResolvedScope, after: ResolvedScope): WriteNarrowing {
   const lostUnbounded = before.unbounded && !after.unbounded
-  const droppedRoots = [
-    ...before.allow.filter(root => !scopeContains(after, root, isLexicallyUnder)),
-    ...after.deny.filter(root => !before.deny.includes(root) && scopeContains(before, root, isLexicallyUnder)),
-  ]
+  const dropped = (root: string): boolean =>
+    scopeContains(before, root, isLexicallyUnder) && !scopeContains(after, root, isLexicallyUnder)
+  const droppedRoots = [...before.allow, ...after.deny].filter(dropped)
   const unique = [...new Set(droppedRoots)]
   return { narrowed: lostUnbounded || unique.length > 0, droppedRoots: unique, lostUnbounded }
 }
@@ -485,15 +578,36 @@ export function resolveEffectiveAxes(
  * spell a path list; the narrower base is the largest tier both axes contain, so
  * mirroring it keeps the operating-system confinement inside the intersection
  * instead of leaving it at the write axis's own, wider base.
+ *
+ * An axis whose own entries cannot be evaluated — a `custom` spelling that
+ * names no absolute path — ranks at `deny`. Resolution answers such a pair with
+ * `ok: false` and the tool layer then refuses everything, so ranking it by its
+ * declared base would let the mirror WIDEN exactly where the fence above it
+ * closed: measured on `read = custom(all, allow ["relative/oops"])` beside
+ * `write = workspace`, the pair resolves to nothing while the mirror produced
+ * `workspace-write`. The failure path is the one place the operator needs the
+ * two layers to agree, so it fails closed to the narrowest tier there is.
  * @param left - one axis.
- * @param right - the other axis.
+ * @param right - the other.
  * @returns the narrower base.
  */
 export function narrowerBase(left: AxisScope, right: AxisScope): 'deny' | 'workspace' | 'all' {
-  const rank = (scope: AxisScope): number => scope.kind === 'custom'
-    ? ['deny', 'workspace', 'all'].indexOf(scope.base)
-    : ['deny', 'workspace', 'all'].indexOf(scope.kind)
-  return rank(left) <= rank(right)
-    ? (left.kind === 'custom' ? left.base : left.kind as 'deny' | 'workspace' | 'all')
-    : (right.kind === 'custom' ? right.base : right.kind as 'deny' | 'workspace' | 'all')
+  const rank = (scope: AxisScope): number => {
+    if (!isEvaluableAxis(scope)) return 0
+    const base = scope.kind === 'custom' ? scope.base : scope.kind
+    return ['deny', 'workspace', 'all'].indexOf(base)
+  }
+  return rank(left) <= rank(right) ? baseOf(left) : baseOf(right)
+}
+
+/**
+ * One axis's own tier, as the mirror spells it. Only meaningful for an axis
+ * {@link narrowerBase} ranked by its base; an unevaluable one is reported as
+ * `deny`, which is also the tier that comparison gives it.
+ * @param scope - the axis value.
+ * @returns the base the axis declares, or `deny` when it cannot be evaluated.
+ */
+function baseOf(scope: AxisScope): 'deny' | 'workspace' | 'all' {
+  if (!isEvaluableAxis(scope)) return 'deny'
+  return scope.kind === 'custom' ? scope.base : scope.kind as 'deny' | 'workspace' | 'all'
 }

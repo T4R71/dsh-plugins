@@ -67,13 +67,41 @@ export class ScopeConfigError extends Error {
   }
 }
 
+/**
+ * Whether one configured entry names an absolute host path, which is the only
+ * thing {@link canonicalEntry} will accept.
+ * @param value - the configured entry.
+ * @returns whether the entry can be canonicalized.
+ */
+function spellable(value: string): boolean {
+  return value.trim().length > 0 && isAbsoluteSpelling(value)
+}
+
 /** Canonicalize one configured custom entry, failing closed on anything that cannot name an absolute host path. */
 function canonicalEntry(value: string, entry: 'allow' | 'deny'): string {
   // Absolute-ness is checked on the SPELLING before resolution, so a relative
   // entry fails loudly instead of silently resolving against process.cwd() and
   // granting a directory the user never named.
-  if (value.trim().length === 0 || !isAbsoluteSpelling(value)) throw new ScopeConfigError(entry, value)
+  if (!spellable(value)) throw new ScopeConfigError(entry, value)
   return canonicalPath(value)
+}
+
+/**
+ * Whether {@link resolveScope} can evaluate this axis at all — whether it
+ * would return a range instead of throwing {@link ScopeConfigError}.
+ *
+ * The answer is policy-free: the three closed kinds always resolve, and a
+ * `custom` axis resolves exactly when every one of its entries is spellable,
+ * because canonicalization is the only step that can fail. A caller that has
+ * to stay TOTAL — the tier mirror, which runs where the resolution itself is
+ * allowed to fail — asks this instead of catching the throw, and the shared
+ * {@link spellable} keeps the two answers from drifting apart.
+ * @param scope - the axis value.
+ * @returns whether the axis has an evaluated range.
+ */
+export function isEvaluableAxis(scope: AxisScope): boolean {
+  if (scope.kind !== 'custom') return true
+  return scope.allow.every(spellable) && scope.deny.every(spellable)
 }
 
 /**

@@ -105,7 +105,7 @@ The whole `axes` field is written in one `replace`, because removing a record ne
 
 ### A session with no record
 
-A session with no record is not an error and it never hides a control. Every live decision path — the model-facing paragraph, the read fence, and `/axis` — reads through `SessionAxesStore.ensure`, which answers `seedPair` (`seedAxesFor`'s pure core): the settings row's `read`/`write` plus its `defaultGroups`, or, for a subagent child, its parent's stored pair. That value is what the session runs under and what the pickers show, so "interface shows A, host enforces B" cannot happen.
+A session with no record is not an error and it never hides a control. Every live decision path — the model-facing paragraph, the read fence, and `/axis` — reads through `SessionAxesStore.ensure`, which answers `seedPair` (`seedAxesFor`'s pure core): the settings row's `read`/`write` plus its `defaultGroups`, or, for a subagent child, its parent's stored pair. The parent's pair is authoritative for a child: the row is not consulted on that path, so `defaultGroups` is never stacked on top of it (the parent's own pair came from that same row already, groups included). That value is what the session runs under and what the pickers show, so "interface shows A, host enforces B" cannot happen.
 
 ### When the record is written
 

@@ -49,7 +49,24 @@ const INHERITED_CUSTOM: EffectiveScopes = {
   write: { kind: 'custom', base: 'workspace', groups: [], allow: [], deny: ['D:\\two'] },
 }
 
+/**
+ * The inherited pair the authority test below uses, and the case that puts it
+ * through this harness: a child whose parent holds a CUSTOM pair while the
+ * settings row names a default group the parent never held.
+ */
+const AUTHORITY_PARENT: EffectiveScopes = {
+  read: { kind: 'custom', base: 'deny', allow: ['D:\\proj'], deny: [] },
+  write: { kind: 'custom', base: 'deny', allow: ['D:\\proj\\out'], deny: [] },
+}
+
+const AUTHORITY_ROW = { read: { kind: 'all' }, write: { kind: 'all' }, defaultGroups: ['g1'] }
+
 const CASES: readonly Case[] = [
+  {
+    what: 'an inherited custom pair, with a default group the parent never held',
+    row: AUTHORITY_ROW,
+    inherited: AUTHORITY_PARENT,
+  },
   {
     what: 'the distinctive pair the acceptance run saves: read deny, write deny, one group',
     // Both axes are closed, so neither takes the reference: the group needs a
@@ -222,4 +239,41 @@ test('a closed axis is seeded as declared, and a custom one takes the group', ()
     write: { kind: 'workspace' },
   })
   assert.deepEqual(sessionAxesSeed(noGroups, undefined), seedPair(noGroups, undefined))
+})
+
+test('an inherited pair is authoritative: the settings row is not stacked on it', () => {
+  // The defect this pins (repro-inherit4): a child carrying its parent's pair also
+  // took the settings page's `defaultGroups`, so it referenced a group the parent
+  // never held — and `resolveEffectiveAxes` gave it a write root the parent's own
+  // pair does not permit. The parent's pair was already derived from that same row,
+  // groups included; re-attaching them adds references, not seeds.
+  //
+  // The client half is covered TRANSITIVELY: the same row and inherited pair are
+  // in CASES above, so the parity test holds `sessionAxesSeed` to these very bytes.
+  // The inherited pair comes back normalized — and with NO group reference added.
+  assert.deepEqual(seedPair(AUTHORITY_ROW, AUTHORITY_PARENT), {
+    read: { kind: 'custom', base: 'deny', groups: [], allow: ['D:\\proj'], deny: [] },
+    write: { kind: 'custom', base: 'deny', groups: [], allow: ['D:\\proj\\out'], deny: [] },
+  })
+  // `g1` — the row's default group — is nowhere on the child's write axis. That is
+  // the difference the defect turned into a permitted write root.
+  assert.deepEqual(seedPair(AUTHORITY_ROW, AUTHORITY_PARENT).write, {
+    kind: 'custom', base: 'deny', groups: [], allow: ['D:\\proj\\out'], deny: [],
+  })
+
+  // The same row still seeds a session with nothing to inherit, groups included:
+  // only the inheritance path skips the stacking, not the seeding itself.
+  assert.deepEqual(seedPair(AUTHORITY_ROW, undefined), { read: { kind: 'all' }, write: { kind: 'all' } })
+  const custom = { read: { kind: 'custom', base: 'deny' }, write: { kind: 'all' }, defaultGroups: ['g1'] }
+  assert.deepEqual(seedPair(custom, undefined), {
+    read: { kind: 'custom', base: 'deny', groups: ['g1'], allow: [], deny: [] },
+    write: { kind: 'all' },
+  })
+
+  // An unreadable settings row does not change an inherited pair: the row is not
+  // consulted on that path at all.
+  assert.deepEqual(
+    seedPair({ read: { kind: 'wide' }, write: { kind: 'deny' } }, AUTHORITY_PARENT),
+    seedPair(AUTHORITY_ROW, AUTHORITY_PARENT),
+  )
 })
