@@ -30,6 +30,7 @@
 import type { Volatile } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { DEFAULT_HEARTBEAT_ASSEMBLIES, DEFAULT_LEDGER_KEEP, DEFAULT_LEDGER_LINES } from './cache.ts'
+import { DEFAULT_OBSERVATION_KEEP, DEFAULT_OBSERVATION_LINES } from './observe.ts'
 
 /** The schema default for {@link Config.cacheLedgerLines}, named where it is used. */
 export const CACHE_LEDGER_LINES_DEFAULT = DEFAULT_LEDGER_LINES
@@ -37,6 +38,14 @@ export const CACHE_LEDGER_LINES_DEFAULT = DEFAULT_LEDGER_LINES
 export const CACHE_LEDGER_KEEP_DEFAULT = DEFAULT_LEDGER_KEEP
 /** The schema default for {@link Config.cacheHeartbeat}, named where it is used. */
 export const CACHE_HEARTBEAT_DEFAULT = DEFAULT_HEARTBEAT_ASSEMBLIES
+/** The schema default for {@link Config.observationLines}, named where it is used. */
+export const OBSERVATION_LINES_DEFAULT = DEFAULT_OBSERVATION_LINES.sections
+/** The schema default for {@link Config.observationTextLines}, named where it is used. */
+export const OBSERVATION_TEXT_LINES_DEFAULT = DEFAULT_OBSERVATION_LINES.sectionsText
+/** The schema default for {@link Config.observationPurityLines}, named where it is used. */
+export const OBSERVATION_PURITY_LINES_DEFAULT = DEFAULT_OBSERVATION_LINES.purity
+/** The schema default for {@link Config.observationKeep}, named where it is used. */
+export const OBSERVATION_KEEP_DEFAULT = DEFAULT_OBSERVATION_KEEP
 
 /** This package's row id in `cordis.patch.yml`; also its settings namespace. */
 export const PROMPT_PLAN_ROW_ID = 'prompt-plan'
@@ -107,6 +116,51 @@ export interface Config {
    * and a log of every turn.
    */
   cacheRecordEveryAssembly?: Volatile<boolean>
+  /**
+   * Lines per `sections.jsonl` before it rotates. Default 1000.
+   *
+   * Load-bearing like the cache caps, and for the measured reason: this file
+   * reached 70.3 MB over 10137 lines on the deployment this was written against —
+   * 6.9 KB per line, one digest per section each carrying a 64-character preview.
+   * 1000 lines x (1 live + {@link Config.observationKeep} rotations) is about
+   * 21 MB worst case, and about 21 hours of assemblies at the 141/hour that
+   * deployment produced. A value below 1 is clamped to 1: an unbounded
+   * observation log is the failure being fixed, so it cannot be asked for.
+   */
+  observationLines?: Volatile<number>
+  /**
+   * Lines per `sections-text.jsonl` before it rotates. Default 100.
+   *
+   * TEN TIMES SMALLER THAN `observationLines`, and that ratio is the measurement
+   * rather than a preference: a line here is the FULL TEXT of every section in one
+   * assembly — 92 KB measured, against 6.9 KB for a digest line, a factor of 13.
+   * This file is what grew to 769.8 MB. Holding its line count to 100 x (1 live +
+   * {@link Config.observationKeep} rotations) bounds it to about 28 MB while still
+   * keeping ~300 assemblies of full text, which is the window an operator reads a
+   * rule's before/after out of. Only written when `config.fullText` is true.
+   */
+  observationTextLines?: Volatile<number>
+  /**
+   * Lines per `purity.jsonl` before it rotates. Default 2000.
+   *
+   * The largest cap of the three because its lines are the smallest — about 200
+   * bytes, integers and booleans, no section text — so 2000 lines x 3 files is
+   * roughly 1 MB, and the wider window is worth it: purity is the evidence that an
+   * observe window changed nothing, and the more assemblies that evidence covers
+   * the stronger it is.
+   */
+  observationPurityLines?: Volatile<number>
+  /**
+   * Rotated copies kept per observation log, `.1` … `.n`. Default 2.
+   *
+   * Two, where the cache ledgers keep four, because the sizes are not comparable:
+   * four rotations of a 92 KB-per-line full-text log would be the 842 MB shape
+   * again. Three files per log is the smallest window that still shows what the
+   * prompt held just before the current one. `baseline.json` is deliberately NOT
+   * rotated and has no line cap — it is an overwritten index, one entry per section
+   * NAME, not a log, and it is the union every rotation would otherwise destroy.
+   */
+  observationKeep?: Volatile<number>
 }
 
 /**
@@ -128,6 +182,10 @@ export const Config = z.object({
   cacheLedgerKeep: z.number().default(CACHE_LEDGER_KEEP_DEFAULT).volatile(),
   cacheHeartbeat: z.number().default(CACHE_HEARTBEAT_DEFAULT).volatile(),
   cacheRecordEveryAssembly: z.boolean().default(false).volatile(),
+  observationLines: z.number().default(OBSERVATION_LINES_DEFAULT).volatile(),
+  observationTextLines: z.number().default(OBSERVATION_TEXT_LINES_DEFAULT).volatile(),
+  observationPurityLines: z.number().default(OBSERVATION_PURITY_LINES_DEFAULT).volatile(),
+  observationKeep: z.number().default(OBSERVATION_KEEP_DEFAULT).volatile(),
 })
 
 /**
@@ -163,6 +221,14 @@ export interface ResolvedConfig {
   readonly cacheLedgerKeep: number
   readonly cacheHeartbeat: number
   readonly cacheRecordEveryAssembly: boolean
+  /** Lines per `sections.jsonl` before it rotates. Default 1000. */
+  readonly observationLines: number
+  /** Lines per `sections-text.jsonl` before it rotates. Default 100. */
+  readonly observationTextLines: number
+  /** Lines per `purity.jsonl` before it rotates. Default 2000. */
+  readonly observationPurityLines: number
+  /** Rotated copies kept per observation log, `.1` … `.n`. Default 2. */
+  readonly observationKeep: number
 }
 
 /**
@@ -190,6 +256,14 @@ export function resolvedConfig(source: unknown): ResolvedConfig {
     cacheLedgerKeep: positive(unwrap<number>(record.cacheLedgerKeep), DEFAULT_LEDGER_KEEP),
     cacheHeartbeat: nonNegative(unwrap<number>(record.cacheHeartbeat), DEFAULT_HEARTBEAT_ASSEMBLIES),
     cacheRecordEveryAssembly: unwrap<boolean>(record.cacheRecordEveryAssembly) ?? false,
+    // The observation caps are clamped here as well as in the Observer: this
+    // function also reads a settings document that never went through the schema,
+    // and a cap of zero would turn a bounded log back into an unbounded one — the
+    // exact failure the caps exist to prevent.
+    observationLines: positive(unwrap<number>(record.observationLines), OBSERVATION_LINES_DEFAULT),
+    observationTextLines: positive(unwrap<number>(record.observationTextLines), OBSERVATION_TEXT_LINES_DEFAULT),
+    observationPurityLines: positive(unwrap<number>(record.observationPurityLines), OBSERVATION_PURITY_LINES_DEFAULT),
+    observationKeep: positive(unwrap<number>(record.observationKeep), OBSERVATION_KEEP_DEFAULT),
   }
 }
 

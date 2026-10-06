@@ -315,6 +315,16 @@ export class PromptPlan {
     this.observer = new Observer({
       directory: paths.artifactDir,
       mode: this.resolved.mode,
+      // The three caps are passed here and nowhere else: the Observer is the only
+      // thing that rotates, and it rotates inside its own write queue. Not passing
+      // them would leave the observation logs unbounded, which is the 842 MB this
+      // revision exists to prevent.
+      lines: {
+        sections: this.resolved.observationLines,
+        sectionsText: this.resolved.observationTextLines,
+        purity: this.resolved.observationPurityLines,
+      },
+      keep: this.resolved.observationKeep,
       report: (record) => {
         ctx.logger?.error(
           'prompt-plan: PURITY VIOLATION at assembly %s — %s',

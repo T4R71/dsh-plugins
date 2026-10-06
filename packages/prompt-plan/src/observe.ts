@@ -11,23 +11,57 @@
  * is to run with the rewriter in observe mode, change nothing, and accumulate.
  * Guessing the keys first is what the operator's decision forbids.
  *
- * FIVE ARTIFACTS, ONE DIRECTORY, all append-only so a crashed run loses nothing
- * already written:
+ * FIVE ARTIFACTS, ONE DIRECTORY. Three of them are append-only logs and EVERY
+ * ONE OF THOSE THREE IS CAPPED AND ROTATES; the fourth is an index that is
+ * overwritten in place and is deliberately NOT rotated:
  *
  *   sections.jsonl   one JSON object per assembly: the full digest list for that
  *                    assembly, with the assembly ordinal. Line-oriented, so a
- *                    partial last line is discardable.
+ *                    partial last line is discardable. Capped, rotates.
  *   sections-text.jsonl
  *                    the same, but with each section's FULL text. Separate file
  *                    because it is orders of magnitude larger and most reading
- *                    never needs it.
+ *                    never needs it. Capped, rotates.
  *   baseline.json    the accumulated index: one entry per section NAME, with the
  *                    first and last assembly that carried it, its text length
  *                    range, and the set of sha256 prefixes it has ever had. This
  *                    is the "section-name baseline" the rules are written from.
+ *                    NOT rotated and NOT capped by a line count: it holds one
+ *                    entry per NAME rather than one per assembly, is rewritten
+ *                    wholesale each time, and therefore has a size proportional to
+ *                    how many distinct section names the deployment registers —
+ *                    not to how long the process runs. See
+ *                    {@link ARTIFACT_NAMES.baseline}'s note. It is the file the
+ *                    rule set is authored from, so it must survive every rotation.
  *   purity.jsonl     one line per assembly: the evidence that this pass changed
- *                    nothing.
+ *                    nothing. Capped, rotates.
  *   README.txt       how to read the four files above, written on first use.
+ *
+ * WHY THE THREE LOGS ARE CAPPED — THE MEASUREMENT THIS EXISTS FOR. The desktop
+ * profile directory this was written against accumulated 842 MB in 62 hours:
+ * `sections-text.jsonl` 769.8 MB over 8733 lines (92 KB per line, the full text
+ * of a whole assembly), `sections.jsonl` 70.3 MB over 10137 lines (6.9 KB per
+ * line: one digest per section, each carrying a 64-character preview), and
+ * `purity.jsonl` 1.7 MB. That is 13.6 MB/hour with no ceiling at all, and the
+ * same directory's `cache-prefix.jsonl` / `cache-usage.jsonl` — which rotate —
+ * never passed 2000 lines. The caps are therefore per FILE, chosen from the
+ * measured bytes per line, with the rotated copies counted:
+ *
+ *   sections.jsonl      6.9 KB/line x 1000 lines x 3 files  ~=  21 MB
+ *   sections-text.jsonl  92 KB/line x  100 lines x 3 files  ~=  28 MB
+ *   purity.jsonl        0.2 KB/line x 2000 lines x 3 files  ~=   1 MB
+ *
+ * Worst case for the directory is therefore ~50 MB instead of unbounded, while
+ * still holding roughly 21 hours of digest lines and 300 assemblies of full text
+ * at the measured 141 assemblies/hour. A window that is too short is recoverable
+ * (raise the cap); a file that grows without bound is not, and it is what this
+ * revision exists to stop.
+ *
+ * WHAT ROTATION COSTS, STATED ONCE. The window is bounded, so the OLDEST lines
+ * are deleted and are gone for good: `baseline.json` is the accumulation that
+ * survives them, which is exactly why it is not rotated. Each cap value below 1
+ * is clamped to 1 rather than honoured — an unbounded observation log is the
+ * failure being fixed here, so a hand-edited settings document cannot ask for one.
  *
  * PURITY IS NOT ASSERTED, IT IS DEMONSTRATED, AND THE CRITERION IS THE DIGESTS.
  * For every assembly, observe mode digests the sections as they arrived at the
@@ -73,7 +107,7 @@
  * @module @t4r71/dsh-prompt-plan/observe
  */
 
-import { appendFile, mkdir, writeFile } from 'node:fs/promises'
+import { appendFile, mkdir, rename, rm, writeFile } from 'node:fs/promises'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { digestSections, describeDigestDifference, firstDigestDifference, sameSectionList, sha256, SAME_DIGEST_MEMBERS } from './digest.ts'
@@ -84,10 +118,113 @@ import type { SectionRecord } from './sections.ts'
 export const ARTIFACT_NAMES = {
   sections: 'sections.jsonl',
   sectionsText: 'sections-text.jsonl',
+  /**
+   * The accumulated index. NEVER ROTATED and never line-capped: it is not a log.
+   *
+   * Every other machine-readable file here holds one line per ASSEMBLY and
+   * therefore grows with how long the process runs; this one holds one entry per
+   * section NAME and is rewritten wholesale, so its size is set by how many
+   * distinct names the deployment registers and by {@link BASELINE_HASH_CAP}. The
+   * measured file was 17 KB after 10137 assemblies — the same order as one
+   * `sections-text.jsonl` line. Rotating it would also delete the union the whole
+   * observe pass exists to accumulate, which is the opposite of what a cap is for.
+   */
   baseline: 'baseline.json',
   purity: 'purity.jsonl',
   readme: 'README.txt',
 } as const
+
+/**
+ * Lines per observation log file before it rotates, per log.
+ *
+ * DERIVED FROM THE MEASURED BYTES PER LINE of the 842 MB incident, not chosen
+ * for roundness. Measured there: `sections.jsonl` 70.3 MB / 10137 lines = 6.9 KB
+ * per line (one digest per section, each carrying a 64-character text preview),
+ * `sections-text.jsonl` 769.8 MB / 8733 lines = 92 KB per line (every section's
+ * full text), `purity.jsonl` 1.7 MB for the same number of assemblies = ~0.2 KB.
+ *
+ * With {@link DEFAULT_OBSERVATION_KEEP} rotations each, worst case is
+ * `lines x (keep + 1) x bytes`:
+ *
+ *   sections.jsonl       6.9 KB x 1000 x 3 = 20.7 MB   (~21 h at 141 assemblies/h)
+ *   sections-text.jsonl   92 KB x  100 x 3 = 27.6 MB   (~300 assemblies)
+ *   purity.jsonl         0.2 KB x 2000 x 3 =  1.2 MB   (~42 h)
+ *   ------------------------------------------------------------------------
+ *   the whole directory                   ~=   50 MB   (was 842 MB, unbounded)
+ *
+ * The asymmetry is the point: the cap is set per log from what a line of that
+ * log costs, because one number for all three would either starve `purity.jsonl`
+ * (whose lines are 350 times smaller) or let the full-text log back to hundreds
+ * of megabytes. `sections-text.jsonl` is opt-in via `config.fullText` and is the
+ * one file whose history is short on purpose; an operator who wants more of it
+ * raises `config.observationTextLines` and pays for it deliberately.
+ */
+export const DEFAULT_OBSERVATION_LINES = {
+  sections: 1000,
+  sectionsText: 100,
+  purity: 2000,
+} as const
+
+/**
+ * Rotated copies kept per observation log (`.1` … `.keep`).
+ *
+ * Two rather than the cache ledgers' four, because the two sides are not the same
+ * size: a cache line is a few hundred bytes, so five files there cost about a
+ * megabyte, while five `sections-text.jsonl` files would be the 842 MB shape
+ * again at any useful line count. Three files per log is the smallest window that
+ * still answers "what was in the prompt just before this" — the new active file,
+ * the rotation that just closed, and one step further back.
+ */
+export const DEFAULT_OBSERVATION_KEEP = 2
+
+/** One log's line cap. See {@link DEFAULT_OBSERVATION_LINES}. */
+export interface ObservationLogCaps {
+  readonly sections: number
+  readonly sectionsText: number
+  readonly purity: number
+}
+
+/** One log's runtime state: how full its active file is. */
+interface LogState {
+  lines: number
+}
+
+/**
+ * Clamp one cap to a value that can actually bound a file.
+ *
+ * A cap of zero or a fractional one would mean "rotate before every line" or
+ * "never rotate", and the second of those is the unbounded file this exists to
+ * prevent. Clamped here, in the Observer, and not only in the config, so a direct
+ * construction — a test, or a future caller — cannot ask for an unbounded log.
+ * @param value - the configured number.
+ * @returns a positive integer.
+ */
+function atLeastOne(value: number): number {
+  return Number.isFinite(value) ? Math.max(1, Math.floor(value)) : 1
+}
+
+/**
+ * Count the newlines a file holds, for the rotation counter.
+ *
+ * A copy of the cache ledger's own helper rather than an import from it: that one
+ * is module-private, and the alternative — exporting it — would have made this
+ * module's cap depend on a module whose rotation it must not change.
+ * @param path - the file to count.
+ * @returns the line count, or 0 when the file does not exist.
+ */
+function countLinesSync(path: string): number {
+  try {
+    const text = readFileSync(path, 'utf8')
+    if (text.length === 0) return 0
+    let count = 0
+    for (let index = 0; index < text.length; index += 1) {
+      if (text.charCodeAt(index) === 10) count += 1
+    }
+    return text.charCodeAt(text.length - 1) === 10 ? count : count + 1
+  } catch {
+    return 0
+  }
+}
 
 /**
  * The member that attributes a line to its session, and the two questions the
@@ -242,6 +379,13 @@ export interface ObserverOptions {
   readonly mode: string
   /** Called once per failing record, so the host log carries it too. */
   readonly report: (record: PurityRecord) => void
+  /**
+   * Lines per observation log before it rotates. Defaults to
+   * {@link DEFAULT_OBSERVATION_LINES}; every value is clamped to at least 1.
+   */
+  readonly lines?: ObservationLogCaps
+  /** Rotated copies kept per log. Defaults to {@link DEFAULT_OBSERVATION_KEEP}. */
+  readonly keep?: number
 }
 
 const README_TEXT = `prompt-plan observation artifacts
@@ -282,6 +426,30 @@ sections-text.jsonl
   The same lines — same ordinal, at, sessionId, mode, sectionCount and
   completeShape — with each section's full "text" in place of its preview and
   hash. Large; read it with a filter, not whole.
+
+THREE OF THESE FILES ARE CAPPED AND ROTATE — READ THIS BEFORE LOOKING FOR AN
+OLD LINE
+  sections.jsonl, sections-text.jsonl and purity.jsonl are bounded logs. Each
+  holds at most its configured number of lines, then rotates: "name" becomes
+  "name.1", the previous "name.1" becomes "name.2", and so on up to the retained
+  copy count, with the oldest file DELETED. So the oldest lines in this directory
+  are gone for good, and a line you expected may be in a rotation rather than in
+  the live file. Search "sections.jsonl", "sections.jsonl.1", "sections.jsonl.2"
+  (… and the same for the other two) when an ordinal is missing from the live
+  file.
+
+  The defaults are derived from what a line actually costs, and they differ per
+  file because the three files do: about 6.9 KB per sections.jsonl line, 92 KB
+  per sections-text.jsonl line (a whole assembly's text), and 0.2 KB per
+  purity.jsonl line. Defaults: 1000 / 100 / 2000 lines respectively, with 2
+  rotated copies each, so the whole directory is bounded at roughly 50 MB.
+
+  baseline.json IS NOT ROTATED, and that is deliberate rather than an omission:
+  it is not a log. It holds one entry per section NAME and is rewritten wholesale
+  each assembly, so its size follows the number of registered names, not the
+  length of the run — 17 KB after 10137 assemblies, the size of one full-text
+  line. It is also the union every rotation below would destroy, and the file
+  rules are written from, so it outlives every rotation of the three logs.
 
 baseline.json
   The accumulated index — THE FILE RULES ARE WRITTEN FROM. One entry per
@@ -347,17 +515,54 @@ export class Observer {
   private baseline: Record<string, BaselineEntry> = {}
   private ready: Promise<void> | undefined
   private queue: Promise<void> = Promise.resolve()
+  private readonly options: ObserverOptions
+  private readonly lines: ObservationLogCaps
+  private readonly keep: number
+  /**
+   * One counter per LOG, and they are separate on purpose.
+   *
+   * Three files, three line counts. Sharing one counter would make a rotation of
+   * `sections-text.jsonl` — which happens every 100 assemblies — reset the count
+   * of `purity.jsonl`, which has a cap of 2000: purity would rotate about twenty
+   * times more often than its own cap asked for and its window would shrink to
+   * whatever the full-text cap happened to be. Each file also has its own cap, so
+   * one shared counter could not even be compared against the right number.
+   */
+  private readonly sectionsState: LogState = { lines: 0 }
+  private readonly sectionsTextState: LogState = { lines: 0 }
+  private readonly purityState: LogState = { lines: 0 }
 
   /**
-   * @param options - artifact directory, mode string, and the failure reporter.
+   * @param options - artifact directory, mode string, failure reporter, and caps.
    */
-  constructor(private readonly options: ObserverOptions) {
+  constructor(options: ObserverOptions) {
+    this.options = options
+    this.lines = {
+      sections: atLeastOne(options.lines?.sections ?? DEFAULT_OBSERVATION_LINES.sections),
+      sectionsText: atLeastOne(options.lines?.sectionsText ?? DEFAULT_OBSERVATION_LINES.sectionsText),
+      purity: atLeastOne(options.lines?.purity ?? DEFAULT_OBSERVATION_LINES.purity),
+    }
+    this.keep = atLeastOne(options.keep ?? DEFAULT_OBSERVATION_KEEP)
     // Resumed SYNCHRONOUSLY, and in the constructor rather than in the first
     // queued write, because `record` takes its ordinal from this field before
     // any write is queued: hydrating later would number this run's first
     // assembly 0 and collide with the run that already used 0.
     this.baseline = this.readBaseline()
     this.ordinal = this.readNextOrdinal()
+    // The line counters are resumed the same way and for the same reason: a mount
+    // that started them at 0 would let the ACTIVE file grow to `lines` on top of
+    // whatever it already held, so a host that restarts often would never rotate
+    // and the file would be unbounded again — the exact failure this caps. Read
+    // from the active file only: a rotation renames the active file away, so the
+    // active file's own count is the count this counter is compared against.
+    this.sectionsState.lines = countLinesSync(this.pathOf(ARTIFACT_NAMES.sections, ''))
+    this.sectionsTextState.lines = countLinesSync(this.pathOf(ARTIFACT_NAMES.sectionsText, ''))
+    this.purityState.lines = countLinesSync(this.pathOf(ARTIFACT_NAMES.purity, ''))
+  }
+
+  /** One log's path, with an optional rotation suffix. */
+  private pathOf(base: string, suffix: string): string {
+    return join(this.options.directory, base + suffix)
   }
 
   /**
@@ -404,11 +609,44 @@ export class Observer {
    * Read from the ASSEMBLY LOG rather than from `baseline.assemblies`: the log
    * is append-only and is the record every artifact line cross-references, so
    * one past its highest ordinal can never collide with a line already written.
+   *
+   * THE ROTATIONS ARE PART OF THE LOG, and that is a change rotation forced. The
+   * active file is the newest lines, so it carries the highest ordinal — EXCEPT
+   * immediately after a rotation, when the file that held them has just been
+   * renamed to `.1` and the active file is brand new and empty. Reading only the
+   * active file there would answer 0, and the next line written would reuse an
+   * ordinal that `.1` already holds, which breaks the one thing the ordinal is
+   * for. So the files are walked newest-first and the search stops at the first
+   * one that yields a number: that is one read on a normal mount, and at most
+   * `keep + 1` in the one case that needs them.
    * @returns the next free ordinal.
    */
   private readNextOrdinal(): number {
+    for (const base of this.rotationBases(ARTIFACT_NAMES.sections)) {
+      const highest = this.lastOrdinalIn(base)
+      if (highest >= 0) return highest + 1
+    }
+    return 0
+  }
+
+  /**
+   * One log's files, newest first: the active file, then `.1` up to `.keep`.
+   *
+   * The order is the order the lines were written in, which is what makes "stop
+   * at the first file that answers" correct rather than merely cheap.
+   * @param base - the log's file name.
+   * @returns the file names, in descending recency.
+   */
+  private rotationBases(base: string): string[] {
+    const names = [base + '']
+    for (let index = 1; index <= this.keep; index += 1) names.push(base + `.${String(index)}`)
+    return names
+  }
+
+  /** The highest ordinal one file holds, or -1 when it holds none. */
+  private lastOrdinalIn(name: string): number {
     try {
-      const text = readFileSync(join(this.options.directory, ARTIFACT_NAMES.sections), 'utf8')
+      const text = readFileSync(join(this.options.directory, name), 'utf8')
       let highest = -1
       for (const line of text.split('\n')) {
         if (line.length === 0) continue
@@ -419,9 +657,9 @@ export class Observer {
           // A torn last line is expected on a crashed run and is skipped.
         }
       }
-      return highest + 1
+      return highest
     } catch {
-      return 0
+      return -1
     }
   }
 
@@ -522,10 +760,16 @@ export class Observer {
 
     // One chained write per assembly: order in the files matches ordinal order,
     // and a slow disk never reorders two assemblies against each other.
+    //
+    // EVERY append below goes through `appendLog`, which rotates when the file is
+    // full. The rotation happens HERE, inside the one queue, and never on a second
+    // path: a rename outside this chain could land between an assembly's
+    // `sections.jsonl` line and its own `:rules` companion — which share an
+    // ordinal and are written one after the other on purpose — and split them
+    // across two files.
     this.queue = this.queue.then(async () => {
       await this.prepare()
-      const directory = this.options.directory
-      await appendFile(join(directory, ARTIFACT_NAMES.sections), JSON.stringify(record) + '\n', 'utf8')
+      await this.appendLog(ARTIFACT_NAMES.sections, JSON.stringify(record), this.sectionsState, this.lines.sections)
       if (fullText) {
         const textRecord = {
           ...record,
@@ -537,21 +781,78 @@ export class Observer {
             ...section.interpolate === undefined ? {} : { interpolate: section.interpolate },
           })),
         }
-        await appendFile(join(directory, ARTIFACT_NAMES.sectionsText), JSON.stringify(textRecord) + '\n', 'utf8')
+        await this.appendLog(ARTIFACT_NAMES.sectionsText, JSON.stringify(textRecord), this.sectionsTextState, this.lines.sectionsText)
       }
-      await appendFile(join(directory, ARTIFACT_NAMES.purity), JSON.stringify(purity) + '\n', 'utf8')
+      await this.appendLog(ARTIFACT_NAMES.purity, JSON.stringify(purity), this.purityState, this.lines.purity)
       if (!purity.ok) this.options.report(purity)
       this.accumulate(afterDigests, ordinal)
       if (ruleTrace.length > 0) {
-        await appendFile(
-          join(directory, ARTIFACT_NAMES.sections),
-          JSON.stringify({ ordinal, at, [SESSION_ID_FIELD]: subject, mode: `${this.options.mode}:rules`, ruleFile, trace: ruleTrace }) + '\n',
-          'utf8',
+        await this.appendLog(
+          ARTIFACT_NAMES.sections,
+          JSON.stringify({ ordinal, at, [SESSION_ID_FIELD]: subject, mode: `${this.options.mode}:rules`, ruleFile, trace: ruleTrace }),
+          this.sectionsState,
+          this.lines.sections,
         )
       }
       await this.writeBaseline(ruleFile)
     })
     return this.queue
+  }
+
+  /**
+   * Append one line to a log, rotating first when the active file is full.
+   *
+   * THE ROTATION IS THE ENFORCEMENT OF THE CAP. Without it a log grows for the
+   * life of the directory — 842 MB in 62 hours on the deployment this was
+   * measured on. The check is `>=` before the write and the counter is reset to 0
+   * rather than decremented, because `rotate` renames the active file away and
+   * creates a new EMPTY one: after it, the active file holds exactly zero lines
+   * and any other value would make the counter disagree with the file.
+   *
+   * The counter is the in-memory fact and the file is the on-disk one; they are
+   * kept equal by construction — reset to 0 here, incremented below, and resumed
+   * from the file's own line count at mount — because a counter that drifted low
+   * would let the file grow past its cap, and one that drifted high would rotate
+   * a file that was not full.
+   * @param base - the log's file name.
+   * @param line - the JSON line, without its newline.
+   * @param state - that log's line counter, updated in place.
+   * @param cap - that log's own line cap.
+   */
+  private async appendLog(base: string, line: string, state: LogState, cap: number): Promise<void> {
+    if (state.lines >= cap) {
+      await this.rotate(base)
+      state.lines = 0
+    }
+    await appendFile(this.pathOf(base, ''), line + '\n', 'utf8')
+    state.lines += 1
+  }
+
+  /**
+   * Rotate one log: `name` to `.1`, `.1` to `.2`, … and the oldest away.
+   *
+   * Ascending from the highest suffix, so every destination has just been vacated
+   * by the previous step and no rename ever collides. A missing source is expected
+   * on the first rotations and is not an error. The new active file is created
+   * EMPTY, which is what lets the line counter restart at 0 and agree with the
+   * file from the next append on.
+   * @param base - the log's file name.
+   */
+  private async rotate(base: string): Promise<void> {
+    await rm(this.pathOf(base, `.${String(this.keep)}`), { force: true })
+    for (let index = this.keep - 1; index >= 1; index -= 1) {
+      try {
+        await rename(this.pathOf(base, `.${String(index)}`), this.pathOf(base, `.${String(index + 1)}`))
+      } catch {
+        // absent: this rotation has not reached that depth yet
+      }
+    }
+    try {
+      await rename(this.pathOf(base, ''), this.pathOf(base, '.1'))
+    } catch {
+      // absent: nothing was ever written under this name
+    }
+    await appendFile(this.pathOf(base, ''), '', 'utf8')
   }
 
   /** Fold one assembly's digests into the accumulated index. */

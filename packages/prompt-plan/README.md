@@ -59,15 +59,66 @@ absent.
 
 ## Observation artifacts
 
-Five files in the artifact directory, all append-only except the baseline:
+Five files in the artifact directory. **Three of them are capped logs that
+rotate; one is an index that does not; one is a note:**
 
-| File | One line per | Contents |
+| File | One line per | Contents | Bounded by |
+| --- | --- | --- | --- |
+| `sections.jsonl` | assembly | ordinal, timestamp, **sessionId**, mode, section count, complete-shape flag, and every section's digest | `observationLines` × (`observationKeep`+1), rotates |
+| `sections-text.jsonl` | assembly | the same with each section's **full text** (opt-in: `config.fullText`) | `observationTextLines` × (`observationKeep`+1), rotates |
+| `baseline.json` | — | the accumulated index: one entry per section **name** | **not a log** — see below |
+| `purity.jsonl` | assembly | the evidence that the handler changed nothing, attributed to its **sessionId** | `observationPurityLines` × (`observationKeep`+1), rotates |
+| `README.txt` | — | the same explanation, written beside the data | — |
+
+### The logs are capped, and rotation deletes
+
+This is the fix for a measured incident, not a nicety. The desktop profile
+directory this was written against reached **842 MB in 62 hours** — 13.6 MB/hour
+with no ceiling — in three files:
+
+| File | Measured | Per line |
 | --- | --- | --- |
-| `sections.jsonl` | assembly | ordinal, timestamp, **sessionId**, mode, section count, complete-shape flag, and every section's digest |
-| `sections-text.jsonl` | assembly | the same with each section's **full text** (opt-in: `config.fullText`) |
-| `baseline.json` | — | the accumulated index: one entry per section **name** |
-| `purity.jsonl` | assembly | the evidence that the handler changed nothing, attributed to its **sessionId** |
-| `README.txt` | — | the same explanation, written beside the data |
+| `sections-text.jsonl` | 769.8 MB / 8733 lines | ~92 KB (a whole assembly's text) |
+| `sections.jsonl` | 70.3 MB / 10137 lines | ~6.9 KB (one digest per section, each with a 64-character preview) |
+| `purity.jsonl` | 1.7 MB / the same assemblies | ~0.2 KB (integers and booleans, no section text) |
+
+The caps are therefore **per file, derived from those measured bytes per line**,
+because one number for all three would either starve the smallest file or let the
+full-text log straight back to hundreds of megabytes:
+
+| File | Default lines | Default copies | Worst case |
+| --- | --- | --- | --- |
+| `sections.jsonl` | 1000 | 2 rotations | ~21 MB (~21 h at the measured 141 assemblies/h) |
+| `sections-text.jsonl` | 100 | 2 rotations | ~28 MB (~300 assemblies) |
+| `purity.jsonl` | 2000 | 2 rotations | ~1 MB |
+| **whole directory** | | | **~50 MB** |
+
+When a log reaches its cap it rotates: `sections.jsonl` → `.1` → `.2`, the
+previous `.1` becoming `.2`, and the oldest file **deleted**. So the window is
+`lines × (1 + observationKeep)` and the **oldest lines are gone for good** — if an
+ordinal is missing from the live file, look in `sections.jsonl.1` and
+`sections.jsonl.2` before concluding it was never written. A cap below 1
+configured by hand is **clamped to 1** rather than honoured, because an unbounded
+observation log is exactly the failure these caps exist to prevent. The counters
+are resumed from the file at mount, so a host that restarts often still rotates
+on time.
+
+### `baseline.json` is deliberately NOT rotated
+
+It is the one file here that is **not** a log, and capping it by line count would
+be a category error:
+
+- it holds **one entry per section NAME**, not one per assembly, and is rewritten
+  wholesale each time — so its size follows how many names the deployment
+  registers, not how long the process runs. Measured: **17 KB after 10137
+  assemblies**, about the size of a single `sections-text.jsonl` line;
+- it is the **union** the whole observe pass exists to accumulate, and the file
+  rules are written from. Rotation is defined by deleting the oldest file; applied
+  here that would delete exactly the accumulation, and nothing could reconstruct it
+  from the `.jsonl` lines afterwards — see the note below on accumulation.
+
+It outlives every rotation of the three logs, which is what makes raising a log's
+cap safe to do.
 
 These files are **one stream shared by every session** the plugin serves, so read
 `sessionId` before comparing any two lines. It is the session an assembly
@@ -91,8 +142,13 @@ It **accumulates across restarts**, which the union argument above requires: on
 mount the observer reads the index already in the directory and continues its
 counters, so a second run adds to the first run's names instead of publishing an
 index that covers only its own assemblies. The ordinal counter resumes one past
-the highest ordinal in `sections.jsonl`, so a line's ordinal identifies exactly
-one assembly for the life of the directory.
+the highest ordinal in the **sections log — the newest of `sections.jsonl`,
+`.1`, `.2` …** — so a line's ordinal identifies exactly one assembly for the life
+of the directory. The rotations are part of that read, and that is not an
+embellishment: the active file is what a rotation has just renamed away and
+replaced with an empty one, so a mount that followed a rotation and read only the
+active file would answer "the next ordinal is 0" and reuse an ordinal `.1` still
+holds.
 
 That counter is deliberately **not** per-session. It is one sequence across the
 whole directory — sessions interleave into it, so two adjacent lines are often two
@@ -147,7 +203,10 @@ prevented: the changed prompt has already been sent.
 effect at the next pin), a change **without** it is something else writing to the
 prompt. The ledger carries **only hashes** — never section text; to see what a
 section said, look its digest up in `sections.jsonl` (or `sections-text.jsonl`
-with `config.fullText: true`).
+with `config.fullText: true`) — and look in that log's rotations too, since the
+observation logs are capped and rotate: a digest whose assembly is older than the
+window is gone, and an older assembly may also be in `sections.jsonl.1` rather
+than in `sections.jsonl`.
 
 **The usage ledger** is fed from a second seam — the `session/event` feed, on
 `assistant/message`. It has to be a second seam: `system-prompt/assemble` runs
@@ -484,12 +543,20 @@ collections, duplicate keys.
     artifactDir: ''      # '' -> <profile dir>/prompt-plan-observations
     fullText: false      # also write sections-text.jsonl
     observe: true        # false stops writing any artifact
+    observationLines: 1000       # lines per sections.jsonl before it rotates
+    observationTextLines: 100    # lines per sections-text.jsonl before it rotates
+    observationPurityLines: 2000 # lines per purity.jsonl before it rotates
+    observationKeep: 2           # rotated copies kept per log, .1 ... .n
     cacheDiag: false     # the cache-stability ledgers; see below. OFF by default
     cacheLedgerLines: 2000   # lines per cache ledger file before it rotates
     cacheLedgerKeep: 4       # rotated copies kept, .1 ... .n
     cacheHeartbeat: 200      # assemblies between heartbeat lines; 0 = changes only
     cacheRecordEveryAssembly: false   # true = a prefix line per assembly, not only on change
 ```
+
+The four `observation*` fields bound the three observation logs; each cap is
+derived from the measured bytes per line of that file, and the reasoning is in
+"Observation artifacts" above. They apply whenever `observe: true`.
 
 `cacheDiag` is independent of `observe`: with `observe: false` and `cacheDiag:
 true` the observation artifacts stop and the two cache ledgers keep going. With
