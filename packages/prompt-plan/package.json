@@ -1,7 +1,7 @@
 {
   "name": "@t4r71/dsh-prompt-plan",
   "description": "Section-name-matched system-prompt rewriting: an observe-only baseline pass and a rule-driven replace/delete/prepend/append/wrap pass over the system-prompt/assemble waterfall",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "publishConfig": {
     "access": "public"
   },

@@ -15,6 +15,15 @@
  * surface as an odd file path later. The one field that is deliberately untyped
  * is none of them.
  *
+ * THE SETTINGS DIRECTORY IS A REPORTED FACT, NOT A SILENT `undefined`. The
+ * member this module reads off the settings service — `describe()[i].directory` —
+ * DOES NOT EXIST on the host this package runs on; see
+ * {@link SettingsDirectorySource} for the measurement. An earlier revision read
+ * it anyway and answered `undefined`, which travelled unremarked through
+ * `ruleFilePath` into a cleared pin, so rewrite mode ran with no rules in force
+ * and said nothing that named the cause. {@link settingsDirectoryOf} now returns
+ * the reason as its own sentence, and the caller reports it.
+ *
  * @module @t4r71/dsh-prompt-plan/config
  */
 
@@ -121,26 +130,92 @@ export function resolvedConfig(source: unknown): ResolvedConfig {
   }
 }
 
-/** The directory the settings service reports for a namespace, if any. */
+/**
+ * The directory the settings service reports for a namespace, as a VALUE.
+ *
+ * `ok: false` carries a sentence naming exactly WHAT is missing, so a caller can
+ * report a configuration gap instead of degrading into an undefined path. It is a
+ * value and not an exception because a composition with no settings service is a
+ * legitimate composition — the failure to avoid is the SILENT one.
+ */
+export type SettingsDirectoryLookup =
+  | { readonly ok: true; readonly directory: string }
+  | { readonly ok: false; readonly problem: string }
+
+/**
+ * The shape this module reads off the settings service.
+ *
+ * `directory` IS TYPED `unknown` ON PURPOSE, and that is the fix rather than a
+ * loosening. MEASURED against the host this package runs on —
+ * `@deepseek-ai/dsh-settings@0.2.0-rc.2`, both the copy extracted from
+ * `M:\DSH-T4\resources\app.asar` and the identical one in this package's own
+ * `node_modules` — `describe()` returns descriptors carrying exactly
+ * `{ applies, autoGenerate, base, ns, revision, schema, secrets, user, value }`,
+ * and the identifier `directory` occurs ZERO times in the whole package. An
+ * earlier revision of this function read that member unconditionally through a
+ * `directory?: string` type, so it answered `undefined` on every host it ever
+ * ran on, with nothing in any log to say so: the plugin then reported an
+ * unreadable rule file it had in fact never been told the path of. Typing it
+ * `unknown` is what makes the absence REPORTABLE instead of invisible.
+ */
 export interface SettingsDirectorySource {
   /** The settings service, when mounted. */
-  readonly describe: () => readonly { readonly ns: string; readonly directory?: string }[]
+  readonly describe: () => readonly { readonly ns?: unknown; readonly directory?: unknown }[]
+}
+
+/** The one member name this lookup reads, kept for the diagnostic sentence. */
+const DIRECTORY_MEMBER = 'directory'
+
+/** Render a service failure as one clause, whatever was thrown. */
+function reasonOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+/** List the members a descriptor actually carries, so a missing one is named against what IS there. */
+function membersOf(row: object): string {
+  const names = Object.keys(row).sort()
+  return names.length === 0 ? '(no members)' : names.join(', ')
 }
 
 /**
  * Resolve the directory this row's settings live in.
  *
  * This is the one read that keeps the rule file and the artifacts out of the
- * package and inside the profile: the settings service knows which directory
- * declared the entry, and this plugin asks it rather than guessing from
- * `__dirname`. A composition with no settings service answers `undefined`, and
- * the caller then requires an explicit absolute path instead of inventing one.
+ * package and inside the profile: the settings service is asked where the entry
+ * was declared rather than the plugin guessing from `__dirname`. Every way that
+ * read can fail is returned as its own sentence — no service, a refusing
+ * `describe()`, no row for this namespace, or a row carrying no usable
+ * `directory` — because the failure this replaced was an `undefined` that
+ * travelled all the way to a cleared pin without ever saying why.
  * @param settings - the settings service, or `undefined`.
  * @param namespace - the row id.
- * @returns the directory, or `undefined`.
+ * @returns the directory, or the problem that prevented reading one.
  */
-export function settingsDirectoryOf(settings: SettingsDirectorySource | undefined, namespace: string): string | undefined {
-  if (settings === undefined) return undefined
-  const row = settings.describe().find(entry => entry.ns === namespace)
-  return row?.directory
+export function settingsDirectoryOf(settings: SettingsDirectorySource | undefined, namespace: string): SettingsDirectoryLookup {
+  const ns = JSON.stringify(namespace)
+  if (settings === undefined) {
+    return { ok: false, problem: `the settings service is not mounted in this composition, so no directory was read for ns ${ns}` }
+  }
+  let rows: readonly { readonly ns?: unknown; readonly directory?: unknown }[]
+  try {
+    rows = settings.describe()
+  } catch (error) {
+    return { ok: false, problem: `the settings service refused describe() for ns ${ns}: ${reasonOf(error)}` }
+  }
+  if (!Array.isArray(rows)) {
+    return { ok: false, problem: `the settings service describe() returned ${typeof rows} instead of an array for ns ${ns}` }
+  }
+  const row = rows.find(entry => entry !== null && typeof entry === 'object' && entry.ns === namespace)
+  if (row === undefined) {
+    return { ok: false, problem: `the settings service reports no entry with ns ${ns}, so there is no directory to read for it` }
+  }
+  const directory = row[DIRECTORY_MEMBER]
+  if (typeof directory === 'string' && directory.length > 0) return { ok: true, directory }
+  if (typeof directory === 'string') {
+    return { ok: false, problem: `the settings service entry for ns ${ns} carries an EMPTY ${JSON.stringify(DIRECTORY_MEMBER)} member` }
+  }
+  return {
+    ok: false,
+    problem: `the settings service entry for ns ${ns} carries no ${JSON.stringify(DIRECTORY_MEMBER)} member (it reports ${membersOf(row)}), so a rule file path that is not absolute cannot be located`,
+  }
 }

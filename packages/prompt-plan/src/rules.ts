@@ -374,6 +374,49 @@ function readTransform(source: Record<string, unknown>, where: string, path: str
   return value.map((entry, index) => readTransformOp(entry, `${where}: action.transform[${index}]`, path))
 }
 
+/**
+ * Read the `allowEmpty` member of a `replace` action.
+ *
+ * IT IS REFUSED ON EVERY OTHER KIND, deliberately. The member answers "is this
+ * replacement allowed to write into a section whose text the deployment emptied
+ * on purpose", and no other action has that question: `delete` needs no opt-in to
+ * remove nothing, and `prepend`/`append`/`wrap` keep the matched section and add
+ * sections of their own beside it. Accepting the switch on those kinds would ship
+ * an operator a setting that can never fire — this package's rule file already
+ * refuses `splice` outside `replace` for the same reason.
+ * @param source - the action mapping.
+ * @param where - the diagnostic's subject.
+ * @param path - the rule file, for the refusal.
+ * @returns the member's value, or undefined when absent.
+ */
+function readAllowEmpty(source: Record<string, unknown>, where: string, path: string): boolean | undefined {
+  const value = source.allowEmpty
+  if (value === undefined) return undefined
+  if (typeof value !== 'boolean') {
+    throw new RuleFileError(`${where}: "action.allowEmpty" must be a boolean (received ${JSON.stringify(value)})`, path)
+  }
+  return value
+}
+
+/**
+ * Refuse an `allowEmpty` on an action kind that has no empty-section question.
+ *
+ * The refusal exists so the operator hears about the switch instead of writing a
+ * setting that silently does nothing — see {@link readAllowEmpty}.
+ * @param action - the action the kind compiles to, when it is accepted.
+ * @param source - the action mapping, read only for the member.
+ * @param where - the diagnostic's subject.
+ * @param path - the rule file, for the refusal.
+ * @returns the action, unchanged.
+ */
+function assertNoAllowEmpty<T extends Action>(action: T, source: Record<string, unknown>, where: string, path: string): T {
+  readAllowEmpty(source, where, path)
+  if (source.allowEmpty !== undefined) {
+    throw new RuleFileError(`${where}: "action.allowEmpty" is only meaningful on a "replace" action (this one is "${action.kind}")`, path)
+  }
+  return action
+}
+
 /** Read and validate one rule. */
 function readRule(raw: unknown, index: number, path: string): Rule {
   const where = `rules[${index}]`
@@ -408,15 +451,24 @@ function readRule(raw: unknown, index: number, path: string): Rule {
       if (splice === true && fragments.length === 0) {
         throw new RuleFileError(`${where}: "action.splice" is only meaningful with "fragments"`, path)
       }
-      action = { kind: 'replace', ...text === undefined ? {} : { text }, fragments, ...splice === undefined ? {} : { splice } }
+      // The empty-section guard's single opt-in, read here so a rule file that
+      // spells it can reach the action; absent means the guard is ON.
+      const allowEmpty = readAllowEmpty(actionRaw, where, path)
+      action = {
+        kind: 'replace',
+        ...text === undefined ? {} : { text },
+        fragments,
+        ...splice === undefined ? {} : { splice },
+        ...allowEmpty === undefined ? {} : { allowEmpty },
+      }
       break
     }
     case 'delete':
-      action = { kind: 'delete' }
+      action = assertNoAllowEmpty({ kind: 'delete' }, actionRaw, where, path)
       break
     case 'prepend':
     case 'append':
-      action = { kind: actionKind, text: text ?? '' }
+      action = assertNoAllowEmpty({ kind: actionKind, text: text ?? '' }, actionRaw, where, path)
       break
     case 'wrap': {
       const prefix = optionalText(actionRaw, 'prefix', `${where}: action`, path)
@@ -424,14 +476,17 @@ function readRule(raw: unknown, index: number, path: string): Rule {
       if (prefix === undefined && suffix === undefined) {
         throw new RuleFileError(`${where}: a "wrap" action needs "prefix", "suffix", or both`, path)
       }
-      action = { kind: 'wrap', ...prefix === undefined ? {} : { prefix }, ...suffix === undefined ? {} : { suffix } }
+      action = assertNoAllowEmpty(
+        { kind: 'wrap', ...prefix === undefined ? {} : { prefix }, ...suffix === undefined ? {} : { suffix } },
+        actionRaw, where, path,
+      )
       break
     }
     case 'transform': {
       if (text !== undefined) {
         throw new RuleFileError(`${where}: a "transform" action takes "transform" operations, not "text"`, path)
       }
-      action = { kind: 'transform', transform: readTransform(actionRaw, where, path) }
+      action = assertNoAllowEmpty({ kind: 'transform', transform: readTransform(actionRaw, where, path) }, actionRaw, where, path)
       break
     }
     default: {
@@ -503,10 +558,17 @@ export interface LoadRuleFileOptions {
   readonly hash: (text: string) => string
 }
 
+/**
+ * How a load failed, so the caller can word its own line without matching the
+ * sentence. `unconfigured` is the one that is NOT an operator typo: there is no
+ * path to look at, so a message that quotes a path has nothing to quote.
+ */
+export type RuleFileFailureKind = 'unconfigured' | 'missing' | 'unreadable' | 'malformed'
+
 /** The outcome of loading a rule file. */
 export type RuleFileLoad =
   | { readonly ok: true; readonly ruleSet: RuleSet }
-  | { readonly ok: false; readonly path: string; readonly problem: string }
+  | { readonly ok: false; readonly path: string; readonly problem: string; readonly kind: RuleFileFailureKind }
 
 /**
  * Resolve which file a configuration points at.
@@ -529,6 +591,30 @@ export function ruleFilePath(options: LoadRuleFileOptions): string | undefined {
 }
 
 /**
+ * The sentence for the ONE failure that is a configuration gap rather than a
+ * disk fault: no path to read at all.
+ *
+ * It exists because the failure it replaces was invisible. When the settings
+ * lookup silently answered `undefined`, `loadRuleFile` reported "no rules file
+ * path is configured", the caller turned that into a cleared pin, and rewrite
+ * mode then ran with no rules in force and nothing in the log naming the cause —
+ * the observation window showed mode `rewrite` on every line and `:rules` on
+ * none. The sentence therefore names the MISSING thing, says what follows from it,
+ * and says what to do about it, so this state can only be reached loudly.
+ * @param problem - what the settings lookup reported, verbatim.
+ * @returns the line to log.
+ */
+export function describeUnresolvedRulePath(problem: string): string {
+  return [
+    'rewrite mode cannot read a rule file: CONFIGURATION MISSING.',
+    `what is missing: ${problem}.`,
+    `and no absolute path was configured either (config.rulesFile is empty), so there is nothing to read.`,
+    `consequence: no rule set is in force for this subject and its pin is cleared, so every assembly it makes is returned UNCHANGED — this is a degradation, not a clean observation.`,
+    `fix: set config.rulesFile to an absolute path, or make the settings service report a directory for this row.`,
+  ].join(' ')
+}
+
+/**
  * Read and validate the rule file.
  *
  * A missing file and an unreadable file are DIFFERENT outcomes for the caller:
@@ -541,33 +627,36 @@ export function ruleFilePath(options: LoadRuleFileOptions): string | undefined {
 export async function loadRuleFile(options: LoadRuleFileOptions): Promise<RuleFileLoad> {
   const path = ruleFilePath(options)
   if (path === undefined) {
-    return { ok: false, path: '', problem: 'no rules file path is configured and this row has no settings directory to derive one from' }
+    // NOT a missing file: nothing was ever looked for. The caller separates this
+    // from `missing` by `kind` so it can name the configuration gap instead of
+    // reporting a read that never happened.
+    return { ok: false, path: '', problem: 'no rules file path is configured and no settings directory was readable to derive one from', kind: 'unconfigured' }
   }
   let text: string
   try {
     text = await readFile(path, 'utf8')
   } catch (error) {
     const code = (error as { code?: string }).code
-    if (code === 'ENOENT') return { ok: false, path, problem: 'MISSING' }
+    if (code === 'ENOENT') return { ok: false, path, problem: 'MISSING', kind: 'missing' }
     const reason = error instanceof Error ? error.message : String(error)
-    return { ok: false, path, problem: `could not be read: ${reason}` }
+    return { ok: false, path, problem: `could not be read: ${reason}`, kind: 'unreadable' }
   }
   let document: unknown
   try {
     document = parseYamlSubset(text)
   } catch (error) {
-    if (error instanceof YamlSubsetError) return { ok: false, path, problem: error.message }
+    if (error instanceof YamlSubsetError) return { ok: false, path, problem: error.message, kind: 'malformed' }
     const reason = error instanceof Error ? error.message : String(error)
-    return { ok: false, path, problem: `could not be parsed: ${reason}` }
+    return { ok: false, path, problem: `could not be parsed: ${reason}`, kind: 'malformed' }
   }
   try {
     const ruleSet = validateRuleSet(document, path)
     return { ok: true, ruleSet: { ...ruleSet, sha256: options.hash(text) } }
   } catch (error) {
     if (error instanceof RuleFileError) {
-      return { ok: false, path, problem: error.message.startsWith(path) ? error.message.slice(path.length + 2) : error.message }
+      return { ok: false, path, problem: error.message.startsWith(path) ? error.message.slice(path.length + 2) : error.message, kind: 'malformed' }
     }
     const reason = error instanceof Error ? error.message : String(error)
-    return { ok: false, path, problem: reason }
+    return { ok: false, path, problem: reason, kind: 'malformed' }
   }
 }

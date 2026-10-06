@@ -61,7 +61,7 @@ import { detectCompleteShape, detectCompleteRegistry } from './sections.ts'
 import { logStripReports } from './strip-report.ts'
 import { completeRefusal, completeRegistrationRefusal, readSectionList } from './sections.ts'
 import type { SectionRecord } from './sections.ts'
-import { loadRuleFile, ruleFilePath } from './rules.ts'
+import { describeUnresolvedRulePath, loadRuleFile, ruleFilePath } from './rules.ts'
 import type { RuleSet } from './rules.ts'
 import {
   applyToolNames,
@@ -224,6 +224,16 @@ export class PromptPlan {
   private readonly settingsDirectory: string | undefined
 
   /**
+   * Why `settingsDirectory` is undefined, when it is.
+   *
+   * Kept beside the directory rather than folded into it because the two answer
+   * different questions and both end up in a log line: "what directory" and "why
+   * not". Undefined exactly when there IS a directory, so a non-undefined value
+   * here is always a real configuration gap.
+   */
+  private readonly settingsDirectoryProblem: string | undefined
+
+  /**
    * The RESOLVED rule file path, kept from mount.
    *
    * Kept for the same reason `settingsDirectory` is: it is the base a relative
@@ -257,10 +267,22 @@ export class PromptPlan {
       // an error to propagate into a waterfall.
       this.presetRegistry = undefined
     }
-    this.settingsDirectory = settingsDirectoryOf(
-      ctx.get('settings') as { describe: () => readonly { ns: string; directory?: string }[] } | undefined,
+    // The lookup REPORTS; it cannot silently answer undefined. When it fails, the
+    // reason is kept and printed, and every later step that depends on the
+    // directory says what it lost — see reloadRules below.
+    const lookup = settingsDirectoryOf(
+      ctx.get('settings') as { describe: () => readonly { ns?: unknown; directory?: unknown }[] } | undefined,
       PROMPT_PLAN_ROW_ID,
     )
+    this.settingsDirectory = lookup.ok ? lookup.directory : undefined
+    this.settingsDirectoryProblem = lookup.ok ? undefined : lookup.problem
+    if (this.settingsDirectoryProblem !== undefined && this.resolved.mode === 'rewrite' && this.resolved.rulesFile.length === 0) {
+      // Both bases are gone AND there is nothing absolute to read: the rule file
+      // cannot be found by any route. This is the exact state that used to run
+      // silently, so it is reported at the moment it is known, not only later when
+      // a load fails on it.
+      ctx.logger?.error('prompt-plan: %s', describeUnresolvedRulePath(this.settingsDirectoryProblem))
+    }
     const paths = resolvePaths(this.resolved, this.settingsDirectory)
     this.rulesFilePath = paths.rulesFile
     this.observer = new Observer({
@@ -278,12 +300,13 @@ export class PromptPlan {
     // and the purity.jsonl lines written beside it can be tied to one revision of
     // the criterion without inspecting the installed package.
     ctx.logger?.info(
-      'prompt-plan: mounted; mode %s; purity criteria %s; rule file %s; artifacts %s; settings dir %s',
+      'prompt-plan: mounted; mode %s; purity criteria %s; rule file %s; artifacts %s; settings dir %s; settings dir problem %s',
       this.resolved.mode,
       String(PURITY_CRITERIA),
       paths.rulesFile ?? '(unresolved)',
       paths.artifactDir,
       this.settingsDirectory ?? '(unresolved)',
+      this.settingsDirectoryProblem ?? '(none — the directory was read)',
     )
     // THE PIN, and when it is taken.
     //
@@ -350,7 +373,14 @@ export class PromptPlan {
     })
     if (!load.ok) {
       this.clearPin(options.session)
-      if (load.problem === 'MISSING') {
+      if (load.kind === 'unconfigured') {
+        // The gap is in the CONFIGURATION, not on the disk, so the line names the
+        // missing thing rather than a path it never had. Logged at error level even
+        // in observe mode: an observation window that silently rewrote nothing
+        // because it never found the rules is exactly the false clean bill this
+        // replaces.
+        ctx.logger?.error('prompt-plan: %s', describeUnresolvedRulePath(this.settingsDirectoryProblem ?? 'the settings service reported no directory for this row'))
+      } else if (load.kind === 'missing') {
         ctx.logger?.warn('prompt-plan: no rule file at %s; rewrite mode will refuse every assembly until one exists', load.path)
       } else {
         ctx.logger?.error('prompt-plan: the rule file at %s %s', load.path, load.problem)
@@ -571,6 +601,7 @@ export class PromptPlan {
       detectCompleteShape(outcome.sections).detected || incomingShape.detected,
       outcome.trace,
       this.resolved.mode === 'rewrite' ? pin?.ruleSet : undefined,
+      session,
     )
     if (outcome.sections === before) return produced
     return { ...(produced as Record<string, unknown>), sections: outcome.sections }
@@ -645,10 +676,11 @@ export class PromptPlan {
     completeShape: boolean,
     trace: readonly RuleTrace[],
     ruleSet: RuleSet | undefined,
+    sessionId: string | undefined,
   ): void {
     if (!this.resolved.observe || this.observer === undefined) return
     const rendered = trace.map(entry =>
-      `${entry.id} [${entry.match}] -> ${entry.action}; matched ${entry.matched.length === 0 ? '(none)' : entry.matched.map(name => JSON.stringify(name)).join(', ')}; sections ${entry.sectionsBefore} -> ${entry.sectionsAfter}`)
+      `${entry.id} [${entry.match}] -> ${entry.action}; matched ${entry.matched.length === 0 ? '(none)' : entry.matched.map(name => JSON.stringify(name)).join(', ')}; sections ${entry.sectionsBefore} -> ${entry.sectionsAfter}${entry.skippedEmpty === 0 ? '' : `; SKIPPED ${String(entry.skippedEmpty)} empty section(s) — the replacement was not written (set "action.allowEmpty: true" on this rule to write into an empty section)`}`)
     void this.observer.record(
       before,
       after,
@@ -657,6 +689,7 @@ export class PromptPlan {
       this.resolved.fullText,
       ruleSet === undefined ? undefined : { path: ruleSet.path, sha256: ruleSet.sha256 },
       rendered,
+      sessionId,
     ).catch((error: unknown) => {
       // An artifact write that fails must never fail the turn: the prompt is
       // already correct, and losing an observation line is not worth an error

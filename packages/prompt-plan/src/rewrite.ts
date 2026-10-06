@@ -58,6 +58,17 @@ export interface RuleTrace {
   readonly action: string
   readonly sectionsBefore: number
   readonly sectionsAfter: number
+  /**
+   * How many of the sections this rule matched were the EMPTY ones the guard
+   * held back — the count of matches on which the rule deliberately did nothing.
+   *
+   * WRITTEN ON EVERY LINE, including the zeroes, so "this rule skipped an empty
+   * section" and "this rule had no empty section to skip" are two different
+   * readings of the artifact rather than one reading and one silent omission.
+   * Zero on a line whose rule matched nothing at all, which `matched` already
+   * reports; the two are not confusable because a skip requires a match.
+   */
+  readonly skippedEmpty: number
 }
 
 /** A refusal from the pass. */
@@ -73,15 +84,21 @@ export type RewriteOutcome =
 
 /**
  * Describe one rule's action for the trace and the error text.
+ *
+ * An action carrying `allowEmpty` SAYS SO on the line, because that switch is the
+ * one thing that makes a replacement write into a section the deployment emptied
+ * on purpose — a reader comparing two observation windows needs to see the rule's
+ * own intent without opening the rule file.
  * @param action - the resolved action.
  * @returns a short human description.
  */
 function describeAction(action: Action): string {
+  const optIn = action.allowEmpty === true ? ', allowEmpty' : ''
   switch (action.kind) {
     case 'replace':
       return action.fragments !== undefined && action.fragments.length > 0
-        ? `replace with ${action.fragments.length} fragment(s)${action.splice === true ? ', spliced to the tail' : ''}`
-        : `replace text (${(action.text ?? '').length} chars)`
+        ? `replace with ${action.fragments.length} fragment(s)${action.splice === true ? ', spliced to the tail' : ''}${optIn}`
+        : `replace text (${(action.text ?? '').length} chars)${optIn}`
     case 'delete':
       return 'delete'
     case 'prepend':
@@ -194,6 +211,7 @@ export function applyRules(sections: readonly SectionRecord[], rules: readonly C
         action: describeAction(rule.action),
         sectionsBefore: current.length,
         sectionsAfter: current.length,
+        skippedEmpty: 0,
       })
       continue
     }
@@ -203,6 +221,12 @@ export function applyRules(sections: readonly SectionRecord[], rules: readonly C
     const next: SectionRecord[] = []
     const spliced: SectionRecord[] = []
     const matchedSet = new Set(matchedIndices)
+    // Whether the rule actually did something. A rule whose ONLY matches were the
+    // empty sections the guard held back is not a change, and counting it as one
+    // would make `changed` — and therefore the "did this assembly move at all"
+    // reading a caller takes off the result — say yes to a no-op.
+    let touched = false
+    let skippedEmpty = 0
     for (let index = 0; index < current.length; index += 1) {
       const section = current[index]
       if (section === undefined) continue
@@ -211,11 +235,13 @@ export function applyRules(sections: readonly SectionRecord[], rules: readonly C
         continue
       }
       const outcome = applyAction(section, index, rule.action, section.interpolate)
+      if (outcome.skippedEmpty === true) skippedEmpty += 1
+      else touched = true
       if (outcome.splice) spliced.push(...outcome.sections)
       else next.push(...outcome.sections)
     }
     current = [...next, ...spliced]
-    changed = true
+    if (touched) changed = true
 
     trace.push({
       id: rule.id,
@@ -224,6 +250,7 @@ export function applyRules(sections: readonly SectionRecord[], rules: readonly C
       action: describeAction(rule.action),
       sectionsBefore: before,
       sectionsAfter: current.length,
+      skippedEmpty,
     })
   }
 

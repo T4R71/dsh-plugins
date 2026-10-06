@@ -59,6 +59,17 @@
  * {@link PURITY_CRITERIA} in every record states which criterion graded it, so a
  * later reader can tell a v1 line from a v2 one without guessing.
  *
+ * EVERY LINE NAMES ITS SUBJECT. The files are ONE stream shared by every session
+ * the plugin serves, and the ordinal is ONE counter across that stream, so without
+ * a subject on the line there is no way to tell which session an assembly belonged
+ * to — the two facts a rule is authored from, "what does THIS session's prompt
+ * carry" and "how often does the deployment carry this section", stop being
+ * separable. `sessionId` is written on every line this revision produces:
+ * `sections.jsonl`, `sections-text.jsonl`, `purity.jsonl`, and the `:rules`
+ * companion line. `null` means the assembly genuinely carried no subject; an
+ * ABSENT member means the line was written before this field existed, which is a
+ * different fact and must not be read as `null`.
+ *
  * @module @t4r71/dsh-prompt-plan/observe
  */
 
@@ -77,6 +88,32 @@ export const ARTIFACT_NAMES = {
   purity: 'purity.jsonl',
   readme: 'README.txt',
 } as const
+
+/**
+ * The member that attributes a line to its session, and the two questions the
+ * ordinal is and is not able to answer.
+ *
+ * ONE COUNTER, ONE STREAM, MANY SESSIONS. The ordinal is allocated from a single
+ * counter per artifact directory, resumed at mount from the highest ordinal the
+ * log already holds, and it is unique across the whole directory for the life of
+ * the directory. MEASURED on the desktop window this was written against: 7719
+ * `sections.jsonl` assemblies, ordinals 0..7718, zero gaps, zero duplicates,
+ * zero backward steps, 7719 `purity.jsonl` lines with exactly the same ordinal
+ * set, and every `:rules` companion ordinal present in the main log. So
+ * "ordinal 4242" identifies ONE assembly, and `baseline.json` can cross-reference
+ * one — and nothing more than that. It does NOT identify a session, and it does
+ * not restart per session: several sessions interleave into the one stream, so
+ * two adjacent ordinals are frequently two different sessions, and a session's
+ * own assemblies are a SCATTERED SUBSET of the range. That is why the counter is
+ * deliberately NOT made per-session: keyed per session it would restart at 0 for
+ * every new session, and "ordinal 0" would then name one assembly per session
+ * instead of one assembly, which breaks the one thing the ordinal is used for —
+ * the cross-reference from the baseline index, a UNION over the whole directory
+ * with no session in it. Per-session numbering is `sessionId` plus a dense
+ * sequence, which is a derived view a reader can build from these lines and is
+ * not worth a second counter to maintain.
+ */
+export const SESSION_ID_FIELD = 'sessionId'
 
 /** One section's accumulated entry in the baseline index. */
 export interface BaselineEntry {
@@ -124,6 +161,14 @@ export interface Baseline {
 export interface AssemblyRecord {
   readonly ordinal: number
   readonly at: string
+  /**
+   * The session this assembly belonged to, or `null` when it had no subject.
+   *
+   * Always present on a line this revision writes. See {@link SESSION_ID_FIELD}
+   * for why an absent member is a THIRD state, and for what the ordinal does and
+   * does not identify.
+   */
+  readonly sessionId: string | null
   readonly mode: string
   readonly sectionCount: number
   readonly completeShape: boolean
@@ -154,6 +199,8 @@ export const PURITY_GRADED_MEMBERS = SAME_DIGEST_MEMBERS
 export interface PurityRecord {
   readonly ordinal: number
   readonly at: string
+  /** The session this assembly belonged to, or `null` when it had no subject. */
+  readonly sessionId: string | null
   /**
    * Which criterion graded this line. `2` is current; an absent member means
    * the line predates the member (criterion 1). See {@link PURITY_CRITERIA}.
@@ -204,8 +251,26 @@ Written by @t4r71/dsh-prompt-plan while it sat on the system-prompt/assemble
 waterfall. In observe mode the plugin changes NOTHING; every file here describes
 an assembly that went to the model unmodified.
 
+WHICH SESSION A LINE BELONGS TO — READ THIS FIRST
+  Every file here is ONE stream shared by every session the plugin served, and
+  "ordinal" is ONE counter across that stream, not a per-session number. So
+  ordinal 4242 identifies exactly one assembly — that is what makes it usable as
+  a cross-reference — but it does NOT say which session it was, and two adjacent
+  lines are frequently two different sessions, because sessions interleave.
+
+  "sessionId" on a line is the answer: the session that assembly belonged to, or
+  null when the assembly carried no subject at all. It is written on every line
+  of sections.jsonl, sections-text.jsonl, purity.jsonl and the ":rules"
+  companion lines. An ABSENT "sessionId" member is a third state: that line was
+  written before this field existed. Do not read a missing member as null.
+
+  To get a session's own sequence, filter by sessionId and read the ordinals in
+  order; they will be sparse and increasing. The counter is deliberately NOT
+  restarted per session, because a per-session ordinal could not be used as the
+  cross-reference baseline.json is built from.
+
 sections.jsonl
-  One line per assembly. Fields: ordinal, at, mode, sectionCount,
+  One line per assembly. Fields: ordinal, at, sessionId, mode, sectionCount,
   completeShape, and "sections" — an array of { index, name, textLength,
   textSha256, textPreview, interpolate? }. The full text is NOT here; see
   sections-text.jsonl. "index" is the position in the assembly array and is
@@ -214,7 +279,8 @@ sections.jsonl
   interpolate only), so array position is the only placement fact on the wire.
 
 sections-text.jsonl
-  The same lines with each section's full "text" in place of its preview and
+  The same lines — same ordinal, at, sessionId, mode, sectionCount and
+  completeShape — with each section's full "text" in place of its preview and
   hash. Large; read it with a filter, not whole.
 
 baseline.json
@@ -235,8 +301,8 @@ baseline.json
   a rule "required: false" when the section is conditional.
 
 purity.jsonl
-  One line per assembly: { ordinal, at, criteria, sameReference, sameSections,
-  countBefore, countAfter, ok, failures, firstDifference? }.
+  One line per assembly: { ordinal, at, sessionId, criteria, sameReference,
+  sameSections, countBefore, countAfter, ok, failures, firstDifference? }.
 
   "criteria" says WHICH CRITERION GRADED THE LINE, and a reader of a file that
   spans a package upgrade has to look at it before comparing "ok" across lines:
@@ -382,6 +448,9 @@ export class Observer {
    * @param fullText - whether to also write the full-text artifact.
    * @param ruleFile - the rule file in force, when there was one.
    * @param ruleTrace - a rendered per-rule trace, when rewrite mode produced one.
+   * @param sessionId - the session this assembly belonged to; `undefined` means it
+   *   carried no subject, and is recorded as `null` rather than omitted, so a
+   *   reader can tell "no subject" from "older line, before the field existed".
    */
   record(
     before: readonly SectionRecord[],
@@ -391,10 +460,14 @@ export class Observer {
     fullText: boolean,
     ruleFile: { path: string; sha256: string } | undefined,
     ruleTrace: readonly string[],
+    sessionId: string | undefined,
   ): Promise<void> {
     const ordinal = this.ordinal
     this.ordinal += 1
     const at = new Date().toISOString()
+    // Normalised ONCE, here, so all four lines that follow attribute the assembly
+    // to the same subject by construction rather than by four spellings of it.
+    const subject: string | null = sessionId ?? null
     const beforeDigests = digestSections(before)
     const afterDigests = digestSections(after)
     // THE CRITERION (PURITY_CRITERIA 2): the digest lists, and nothing else.
@@ -413,6 +486,7 @@ export class Observer {
     const purity: PurityRecord = {
       ordinal,
       at,
+      [SESSION_ID_FIELD]: subject,
       criteria: PURITY_CRITERIA,
       sameReference,
       sameSections,
@@ -439,6 +513,7 @@ export class Observer {
     const record: AssemblyRecord = {
       ordinal,
       at,
+      [SESSION_ID_FIELD]: subject,
       mode: this.options.mode,
       sectionCount: after.length,
       completeShape,
@@ -470,7 +545,7 @@ export class Observer {
       if (ruleTrace.length > 0) {
         await appendFile(
           join(directory, ARTIFACT_NAMES.sections),
-          JSON.stringify({ ordinal, at, mode: `${this.options.mode}:rules`, ruleFile, trace: ruleTrace }) + '\n',
+          JSON.stringify({ ordinal, at, [SESSION_ID_FIELD]: subject, mode: `${this.options.mode}:rules`, ruleFile, trace: ruleTrace }) + '\n',
           'utf8',
         )
       }

@@ -26,6 +26,23 @@ no rules.
 | Rule file | `<profile directory>/prompt-plan.rules.yaml` | `config.rulesFile`, absolute or relative to that directory |
 | Observation artifacts | `<profile directory>/prompt-plan-observations/` | `config.artifactDir`, absolute |
 
+The profile directory is read from the **settings service**, not guessed from
+`__dirname`. That read **does not work on the host this package currently runs
+on**, and the plugin now says so instead of degrading quietly:
+`@deepseek-ai/dsh-settings@0.2.0-rc.2` returns descriptors carrying `{ applies,
+autoGenerate, base, ns, revision, schema, secrets, user, value }` and **no
+`directory` member at all** — the identifier occurs zero times in that package —
+so the lookup found nothing and previously answered `undefined` with nothing
+logged.
+
+What that used to cost: `ruleFilePath()` returned `undefined`, the loader
+reported "no rules file path is configured", the caller cleared the pin, and
+**rewrite mode then ran with no rules in force while every observation line still
+said `rewrite`** and no `:rules` trace line was ever written. The plugin now
+reports a `CONFIGURATION MISSING` line at mount and again on every refused load,
+naming the member that is missing, the consequence, and the fix. Until the host
+reports a directory, **set `config.rulesFile` to an absolute path** — an absolute
+path bypasses the lookup entirely and is not reported as a gap.
 On the desktop deployment measured here, the profile directory is
 `M:\\DSH-T4\\home\\profiles\\desktop`, so a freshly installed package with no
 configuration at all resolves to
@@ -46,11 +63,17 @@ Five files in the artifact directory, all append-only except the baseline:
 
 | File | One line per | Contents |
 | --- | --- | --- |
-| `sections.jsonl` | assembly | ordinal, timestamp, mode, section count, complete-shape flag, and every section's digest |
+| `sections.jsonl` | assembly | ordinal, timestamp, **sessionId**, mode, section count, complete-shape flag, and every section's digest |
 | `sections-text.jsonl` | assembly | the same with each section's **full text** (opt-in: `config.fullText`) |
 | `baseline.json` | — | the accumulated index: one entry per section **name** |
-| `purity.jsonl` | assembly | the evidence that the handler changed nothing |
+| `purity.jsonl` | assembly | the evidence that the handler changed nothing, attributed to its **sessionId** |
 | `README.txt` | — | the same explanation, written beside the data |
+
+These files are **one stream shared by every session** the plugin serves, so read
+`sessionId` before comparing any two lines. It is the session an assembly
+belonged to, or `null` when the assembly carried no subject; it is written on
+every line, including the `:rules` companion lines. An **absent** `sessionId`
+member means that line predates the field and is not the same fact as `null`.
 
 A section's digest is `{ index, name, textLength, textSha256, textPreview }`.
 `index` is the position in the assembly array and is **placement evidence only**:
@@ -69,7 +92,15 @@ mount the observer reads the index already in the directory and continues its
 counters, so a second run adds to the first run's names instead of publishing an
 index that covers only its own assemblies. The ordinal counter resumes one past
 the highest ordinal in `sections.jsonl`, so a line's ordinal identifies exactly
-one assembly for the life of the directory. An index whose `mode` differs from
+one assembly for the life of the directory.
+
+That counter is deliberately **not** per-session. It is one sequence across the
+whole directory — sessions interleave into it, so two adjacent lines are often two
+different sessions and one session's lines are a scattered subset. Keyed per
+session it would restart at 0 for every new session, and `baseline.json`, which
+is a union over the directory with no session in it, could no longer name one
+assembly by ordinal. For a single session's own sequence, filter by `sessionId`
+and read the ordinals in order; they will be sparse and increasing. An index whose `mode` differs from
 the running mode is discarded rather than merged — an observe baseline and a
 rewrite baseline must not be confused. Read `seen` against `distinctTexts`: a name seen many times
 with one distinct text is static, which is what a replacement rule usually wants.
@@ -163,6 +194,20 @@ rules:
       fragments:
         - text: "MCP servers available in this session are described below."
     required: false
+
+  # ---- writing into a section the deployment emptied on purpose ----
+  # Off by default. See "An empty section is not a place to write" below; opt in
+  # only when the emptiness is not a deployment decision you would contradict.
+  - id: fill-ptc-only
+    match:
+      kind: exact
+      value: tools:ptc-only
+    action:
+      kind: replace
+      allowEmpty: true
+      text: |
+        `run_code` is the only tool you may call directly.
+    required: false
 ```
 
 ### Matching and actions
@@ -175,8 +220,9 @@ rules:
 
 | `action.kind` | Members | Effect |
 | --- | --- | --- |
-| `replace` | `text` | the matched section keeps its name and gets new text |
+| `replace` | `text` | the matched section keeps its name and gets new text — **unless it was empty**, see below |
 | `replace` | `fragments[]`, optional `splice` | the matched section is dropped; each fragment becomes a section named `<matched>~<index>~<n>`; with `splice: true` those fragments are appended after every surviving section instead of taking the matched position |
+| `replace` | `allowEmpty` (default `false`) | write into the matched section even when its text is empty. No other kind accepts it |
 | `delete` | — | the section is removed |
 | `prepend` | `text` | a section named `<matched>~<index>~pre` is inserted before it |
 | `append` | `text` | a section named `<matched>~<index>~post` is inserted after it |
@@ -191,6 +237,10 @@ rules:
 | `all` | `true` | rewrite every match; `false` rewrites only the first |
 | `note` | — | free text, carried into diagnostics |
 
+`allowEmpty` lives on the **action**, not on the rule — next to `splice`, which
+is the other `replace`-only switch — because it is a statement about what that one
+replacement does rather than about the rule's lifetime.
+
 **`required: true` is the default on purpose.** A rule that silently stopped
 matching is the failure this package is most likely to suffer: template sections
 come and go with the composition, and a section merely absent from one assembly
@@ -201,6 +251,35 @@ fix. Set `required: false` on a rule aimed at a conditional section.
 Rules apply in file order, and each rule sees the previous rule's output —
 including the fragments it created, whose names are deterministic. Reordering the
 file can therefore change the result.
+
+### An empty section is not a place to write
+
+`replace` **skips a section whose text is empty**, and says so in the rule trace:
+the empty section is left exactly as it arrived, and the `:rules` line carries
+`SKIPPED n empty section(s)` together with the fix. Both forms are covered — the
+`text` form and the `fragments` form — because both write into the same place.
+
+The reason is that upstream empties a section **on purpose**, per deployment:
+
+| Section | Empty when | Who empties it |
+| --- | --- | --- |
+| `tools:ptc-only` | the deployment is not in PTC mode | `dsh-tools`, `collapseSection` — its own comment reads "both renders empty: native calls do execute there, so the rule is false" |
+| `context:file-reference` | no `read` tool is mounted | `dsh-file-reference-local` |
+| `harness:identity` | `includeHarnessIdentity: false` | `dsh-system-prompt` |
+
+and `dsh-system-prompt` then **drops every empty section** (`.filter(text =>
+text.length > 0)`). So an empty section is the owning module saying "this
+deployment does not want this", and a rewrite that fills it puts a statement into
+the prompt that nothing in the running composition stands behind. Measured before
+this guard existed: an empty `tools:ptc-only` came back as a 65-character
+assertion, in an assembly where the section had been collapsed to `""` precisely
+because that assertion was **false**.
+
+When the emptiness really is not a decision you would be contradicting, write
+`allowEmpty: true` on the action. It is refused on every other kind, so a rule
+file cannot carry a switch that could never fire, and the trace then prints
+`allowEmpty` so the intent is visible in an observation window rather than only
+in the rule file.
 
 ### What this package carries that upstream owns
 
@@ -254,7 +333,7 @@ collections, duplicate keys.
 - id: prompt-plan
   name: '@t4r71/dsh-prompt-plan'
   config:
-    rulesFile: ''        # '' -> <profile dir>/prompt-plan.rules.yaml
+    rulesFile: ''        # '' -> <profile dir>/prompt-plan.rules.yaml; use an ABSOLUTE path until the host reports a settings directory
     mode: observe        # observe | rewrite
     artifactDir: ''      # '' -> <profile dir>/prompt-plan-observations
     fullText: false      # also write sections-text.jsonl
@@ -297,7 +376,7 @@ system prompt. Guarding behaviour belongs to `@t4r71/dsh-guard`.
 | Path | Role |
 | --- | --- |
 | `src/index.ts` | The plugin class and the waterfall listener |
-| `src/config.ts` | The Loader-entry `Config`, all fields volatile, and the settings-directory read |
+| `src/config.ts` | The Loader-entry `Config`, all fields volatile, and the settings-directory read, which returns the REASON it has no directory instead of `undefined` |
 | `src/sections.ts` | The three upstream invariants, the API-shape gate, and the complete-shape test |
 | `src/digest.ts` | Section digests and list comparison |
 | `src/naming.ts` | The three match kinds, their compiler, and the nearest-name hint |
