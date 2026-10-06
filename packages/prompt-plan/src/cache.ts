@@ -77,6 +77,18 @@ export const DEFAULT_LEDGER_LINES = 2000
 export const DEFAULT_LEDGER_KEEP = 4
 
 /**
+ * How many lines from the end of the prefix ledger a restart reads to recover
+ * each subject's last fingerprint.
+ *
+ * A bound rather than a full scan: the ledger can hold 2000 lines per file times
+ * five files, and reading all of it would put that work in front of startup. 200
+ * lines is enough to find the last line of every subject that is still active —
+ * a subject whose last line is older than that has not assembled anything in a
+ * long while, and losing its memory costs exactly one `first: true`.
+ */
+export const RESTORE_SCAN_LINES = 200
+
+/**
  * How many identical fingerprints may pass before one is written anyway.
  *
  * A ledger that only ever records changes cannot be told apart from a ledger
@@ -119,7 +131,7 @@ cache-prefix.jsonl
   file.
 
   Fields: format, ordinal, at, sessionId, promptSha256, sectionCount,
-  ruleSetSha256, first, changed, repeat, previousPromptSha256,
+  ruleSetSha256, first, changed, restored, repeat, previousPromptSha256,
   previousRuleSetSha256, previousOrdinal, previousAt, assembliesSince,
   ruleSetChanged, changedSectionCount, firstChangedIndex, changedSections.
 
@@ -146,6 +158,28 @@ cache-prefix.jsonl
   applies: a change WITH it is this package reading a new rule file, a change
   WITHOUT it is something else writing to the prompt.
 
+  ACROSS A RESTART. The fingerprint memory is resumed from this file's tail when
+  the plugin mounts, so a prompt that changed while the process was down is
+  reported as a change rather than filed as a fresh baseline — without that, every
+  restart would make each subject look new and the first post-restart line would
+  say first:true, a silent MISS in the one thing this ledger exists to report.
+  That line carries "restored": true and names the hash it compared against in
+  previousPromptSha256.
+
+  Two limits, both inherent:
+    - changedSections and changedSectionCount are ABSENT on that line, because no
+      per-section digests are stored here and none can be reconstructed. The
+      verdict is unaffected (changed and ruleSetChanged come from the two hashes,
+      which do survive); only the per-section naming is missing. The host log says
+      so rather than reporting "0 sections differ".
+    - a change made entirely while the process was down is timestamped at the
+      restart, not at the edit. Still reported, but its time is when it was first
+      observed — inherent to observing from inside the process.
+
+  At most the last 200 lines are read for the resume, so a large ledger cannot
+  slow startup. A subject whose last line fell outside that window simply loses
+  its memory and costs one first:true.
+
 cache-usage.jsonl
   One line per model request, from the session's own "assistant/message" event —
   the only event in the session log that carries token accounting at all. Fields:
@@ -156,8 +190,13 @@ cache-usage.jsonl
   "cacheHitRate" is cacheReadTokens / (inputTokens + cacheReadTokens +
   cacheWriteTokens) — the three counts are disjoint (see TokenUsage in
   @deepseek-ai/dsh-llm), so that denominator is billed input tokens. null when
-  the denominator is zero or the cache fields are absent; it is never rounded up
-  to 1.
+  the denominator is zero or the adapter reported no HIT count; it is never
+  rounded up to 1.
+
+  A missing cacheWriteTokens is NOT one of those refusals. DeepSeek's adapter maps
+  cache_read_input_tokens and never reports a write count, so treating "no write
+  count" as "cannot compute" made this column null on every live request. The two
+  absences mean different things and are handled differently — see cacheHitRate.
 
   This ledger starts EMPTY and stays useless until a session with this plugin
   mounted makes a model call. The requests a session made before the plugin was
@@ -230,19 +269,36 @@ export function readUsage(value: unknown): UsageCounts | undefined {
 /**
  * The share of billed input tokens that came from the provider's cache.
  *
- * The denominator is the sum of the three DISJOINT input counts — see
- * `TokenUsage` in `@deepseek-ai/dsh-llm/lib/types/types.d.ts:152-174`, where
- * `inputTokens` is uncached input only and the two cache fields are reported
- * separately, so their sum is the billed prompt. Undefined when the denominator
- * is zero or the adapter reported no cache fields: a rate computed from a
- * missing field would be a fabricated number, and the UI's own `cacheHitPercent`
- * makes the same refusal for the same reason.
+ * The denominator is the sum of the DISJOINT input counts — see `TokenUsage` in
+ * `@deepseek-ai/dsh-llm`, where `inputTokens` is uncached input only and the
+ * cache fields are reported separately, so their sum is the billed prompt.
+ * `totalTokens` confirms the reading on real DeepSeek traffic:
+ * `inputTokens + cacheReadTokens + outputTokens === totalTokens`, with
+ * `cacheWriteTokens` absent from the sum entirely.
+ *
+ * THE TWO CACHE FIELDS ARE NOT ALIKE WHEN MISSING, and an earlier revision of
+ * this function wrongly demanded both:
+ *   - `cacheReadTokens` absent means the adapter reported NO hit information at
+ *     all, so no rate can be derived and none is invented.
+ *   - `cacheWriteTokens` absent only means the adapter does not report cache
+ *     WRITES. The DeepSeek adapter is exactly this case: its `updateUsage` maps
+ *     `cache_read_input_tokens` but never sets a write count, because DeepSeek
+ *     does not bill cache creation separately. Demanding it made the rate
+ *     `undefined` on every real request, which is not caution but a dead metric.
+ *
+ * A missing write count is therefore treated as zero, matching what the host
+ * itself does: `@deepseek-ai/dsh-token-meter`'s usage fold is
+ * `bucketsFrom = (usage) => ({ uncachedInputTokens: usage.inputTokens,
+ * cacheReadTokens: usage.cacheReadTokens ?? 0, cacheWriteTokens:
+ * usage.cacheWriteTokens ?? 0 })`, and the UI's `cacheHitPercent` reads those
+ * buckets. An earlier revision of this comment claimed the UI made "the same
+ * refusal"; it does not, and the claim was false.
  * @param usage - the normalised counts.
  * @returns the rate in [0, 1], or undefined when it cannot be computed.
  */
 export function cacheHitRate(usage: UsageCounts): number | undefined {
-  if (usage.cacheReadTokens === undefined || usage.cacheWriteTokens === undefined) return undefined
-  const billed = usage.inputTokens + usage.cacheReadTokens + usage.cacheWriteTokens
+  if (usage.cacheReadTokens === undefined) return undefined
+  const billed = usage.inputTokens + usage.cacheReadTokens + (usage.cacheWriteTokens ?? 0)
   if (billed <= 0) return undefined
   // Four decimals: enough to see a drop, not a claim of precision the provider
   // does not provide.
@@ -416,6 +472,16 @@ export interface PrefixRecord {
   /** True when this subject had no previous fingerprint — the run's baseline for it. */
   readonly first: boolean
   readonly changed: boolean
+  /**
+   * True when the previous state came from an EARLIER RUN rather than from this
+   * process's own memory.
+   *
+   * Marks the one line per subject that follows a restart. `changed` on such a
+   * line is still trustworthy — it compares the hashes the previous run left
+   * against this assembly — but `changedSections` is absent by construction,
+   * because the ledger stores no per-section digests. See {@link RestoredSubject}.
+   */
+  readonly restored?: boolean
   /** How many consecutive assemblies (including this one) carried this fingerprint. */
   readonly repeat: number
   readonly previousPromptSha256?: string
@@ -570,6 +636,94 @@ function lastOrdinalSync(path: string): number {
 }
 
 /**
+ * What a restart can recover about one subject from the prefix ledger.
+ *
+ * ONLY THE TWO HASHES. The ledger records no per-section digests, so the
+ * `changedSections` naming — which is built from `diffSections(previous.digests,
+ * digests)` — cannot be reconstructed across a restart, and this type therefore
+ * carries no `digests`. Storing them in every line would have cost roughly
+ * 4.3 KB per line (~35 MB at the 2000x5 cap) to name sections on the one line
+ * that follows a restart; carrying a sidecar file would have cost a second
+ * write path. Neither is worth it, because the QUESTION this feature answers —
+ * "did we move the prefix, or did the provider?" — is decided by the two hashes:
+ *
+ *   promptSha256 changed, ruleSetSha256 changed with it -> our rule revision
+ *   promptSha256 changed, ruleSetSha256 unchanged        -> something else wrote
+ *
+ * Missing `changedSections` on a post-restart line is a gap in the DETAIL, not
+ * in the VERDICT. The line says `changed: true` and `restored: true`, which is
+ * the part that matters.
+ */
+interface RestoredSubject {
+  readonly promptSha256: string
+  readonly ruleSetSha256: string | undefined
+}
+
+/**
+ * Recover the last recorded fingerprint per subject from the tail of the prefix
+ * ledger.
+ *
+ * WHY THIS EXISTS. The fingerprint memory used to be in-process only, so a
+ * restart made every subject look brand new: the first assembly after a restart
+ * was written as `first: true`, and a prompt that had CHANGED across the restart
+ * was written as a baseline rather than as a change. That is a silent MISS, and
+ * a miss is the one failure this feature cannot afford — its whole purpose is
+ * that a moved prefix is seen. The machine this runs on restarts often (plugin
+ * reinstalls, power loss), so the blind window was the common case, not the
+ * corner case.
+ *
+ * WHAT IT CANNOT DO, and no restart-logic can: it compares the last recorded
+ * state against the next assembly, so a change that happened entirely while the
+ * process was DOWN (a rule file edited between runs) is attributed to the first
+ * line after the restart rather than to the moment it happened. The change is
+ * still REPORTED — with the old hash named in `previousPromptSha256` — but its
+ * time is the restart, not the edit. That is inherent to observing from inside
+ * the process.
+ *
+ * Bounded on purpose: it reads at most {@link RESTORE_SCAN_LINES} lines from the
+ * end, so a huge ledger cannot make startup slow. A subject whose last line fell
+ * outside that window is simply not restored, which costs one `first: true` and
+ * nothing else.
+ * @param path - the prefix ledger.
+ * @returns the last fingerprint seen per subject id, oldest first.
+ */
+function restoreSubjectsSync(path: string): Map<string | null, RestoredSubject> {
+  const restored = new Map<string | null, RestoredSubject>()
+  let lines: string[]
+  try {
+    lines = readFileSync(path, 'utf8').split('\n')
+  } catch {
+    return restored
+  }
+  let examined = 0
+  for (let index = lines.length - 1; index >= 0 && examined < RESTORE_SCAN_LINES; index -= 1, examined += 1) {
+    const line = lines[index]
+    if (line === undefined || line.length === 0) continue
+    let record: { sessionId?: unknown; promptSha256?: unknown; ruleSetSha256?: unknown }
+    try {
+      record = JSON.parse(line) as typeof record
+    } catch {
+      // Torn tail: the writer was killed mid-append. Keep looking further back,
+      // the same way lastOrdinalSync does.
+      continue
+    }
+    const sessionId = record.sessionId
+    if (typeof sessionId !== 'string' && sessionId !== null) continue
+    const promptSha256 = record.promptSha256
+    if (typeof promptSha256 !== 'string' || promptSha256.length === 0) continue
+    // Scanning BACKWARDS, so the first line seen for a subject is its newest;
+    // later iterations must not overwrite it.
+    if (restored.has(sessionId)) continue
+    const ruleSet = record.ruleSetSha256
+    restored.set(sessionId, {
+      promptSha256,
+      ruleSetSha256: typeof ruleSet === 'string' ? ruleSet : undefined,
+    })
+  }
+  return restored
+}
+
+/**
  * The two capped ledgers, and the fingerprint memory they are compared against.
  *
  * One instance per mounted plugin when `config.cacheDiag` is true — and NO
@@ -579,6 +733,17 @@ function lastOrdinalSync(path: string): number {
 export class CacheLedger {
   private readonly options: CacheLedgerOptions
   private readonly subjects = new Map<string | null, SubjectState>()
+  /**
+   * What the previous run left behind, per subject.
+   *
+   * Kept SEPARATE from {@link subjects} rather than seeded into it, because the
+   * two hold different things and only the hashes survive a restart: a restored
+   * entry has no `digests`, no `repeat` and no `previous`, and an assembly that
+   * compares against one must not pretend otherwise. The first assembly for a
+   * restored subject reads its hashes here, then writes a full `subjects` entry
+   * and clears this one.
+   */
+  private readonly restored = new Map<string | null, RestoredSubject>()
   private readonly prefixState: LedgerState = { lines: 0 }
   private readonly usageState: LedgerState = { lines: 0 }
   private nextPrefixOrdinal = 0
@@ -603,6 +768,15 @@ export class CacheLedger {
     this.usageState.lines = countLinesSync(this.pathOf(CACHE_ARTIFACT_NAMES.usage, ''))
     this.nextPrefixOrdinal = lastOrdinalSync(this.pathOf(CACHE_ARTIFACT_NAMES.prefix, '')) + 1
     this.nextUsageOrdinal = lastOrdinalSync(this.pathOf(CACHE_ARTIFACT_NAMES.usage, '')) + 1
+    // The fingerprint memory is resumed here too, for the same reason and with a
+    // sharper consequence: without it a restart makes every subject look new, and
+    // a prompt that changed ACROSS the restart is recorded as `first: true`
+    // instead of as a change — a silent miss in the one thing this feature is for.
+    // See restoreSubjectsSync. A restored subject carries no digests, so the line
+    // that follows a restart names no sections; it still reports the change.
+    for (const [key, value] of restoreSubjectsSync(this.pathOf(CACHE_ARTIFACT_NAMES.prefix, ''))) {
+      this.restored.set(key, value)
+    }
   }
 
   /** One ledger's path, with an optional rotation suffix. */
@@ -634,8 +808,14 @@ export class CacheLedger {
     const digests = digestSections(input.sections)
     const promptSha256 = promptFingerprint(digests)
     const previous = this.subjects.get(key)
-    const first = previous === undefined
-    const changed = previous !== undefined && previous.promptSha256 !== promptSha256
+    // A restart leaves hashes but no digests. Treat that as the previous state for
+    // the two questions it can answer — "is this the first one" and "did the
+    // fingerprint move" — and NOT as a source of section detail. See RestoredSubject.
+    const carried = previous === undefined ? this.restored.get(key) : undefined
+    const first = previous === undefined && carried === undefined
+    const changed = previous !== undefined
+      ? previous.promptSha256 !== promptSha256
+      : carried !== undefined && carried.promptSha256 !== promptSha256
     const repeat = previous !== undefined && previous.promptSha256 === promptSha256 ? previous.repeat + 1 : 1
     // Assemblies of this subject since the last line written for it, whatever the
     // reason that line was written. This is the counter the heartbeat reads: a
@@ -657,20 +837,31 @@ export class CacheLedger {
 
     let diff: SectionDiff | undefined
     let ruleSetChanged: boolean | undefined
-    if (changed && previous !== undefined) {
-      diff = diffSections(previous.digests, digests)
-      ruleSetChanged = previous.ruleSetSha256 !== input.ruleSetSha256
+    if (changed) {
+      // The rule-set comparison works off whichever previous state exists: a
+      // restored hash answers it as well as an in-memory one.
+      const previousRuleSet = previous === undefined ? carried?.ruleSetSha256 : previous.ruleSetSha256
+      ruleSetChanged = previousRuleSet !== input.ruleSetSha256
+      // Only an in-process previous state carries digests, so a post-restart line
+      // reports the change without naming the sections. Say so rather than
+      // reporting "0 sections differ", which would be a false detail.
+      if (previous !== undefined) {
+        diff = diffSections(previous.digests, digests)
+      }
+      const where = `${String(ordinal)}${input.sessionId === undefined ? '' : ` (session ${JSON.stringify(input.sessionId)})`}`
+      const detail = diff === undefined
+        ? 'the section-level detail is unavailable because this is the first assembly after a restart; compare this line against previousOrdinal for the sections'
+        : `${String(diff.changedCount)} section(s) differ (${diff.changes.map(entry => `${entry.kind} ${JSON.stringify(entry.name)}`).join(', ') || 'no named section'}), the earliest at index ${diff.firstChangedIndex === null ? '(none)' : String(diff.firstChangedIndex)}`
       if (ruleSetChanged) {
         this.options.report(
-          `prompt-plan: the assembled prompt changed at assembly ${String(ordinal)}${input.sessionId === undefined ? '' : ` (session ${JSON.stringify(input.sessionId)})`} — `
-          + `the rule set changed too (${(previous.ruleSetSha256 ?? '(none)').slice(0, 12)} -> ${(input.ruleSetSha256 ?? '(none)').slice(0, 12)}), so this is a rule revision ` +
+          `prompt-plan: the assembled prompt changed at assembly ${where} — `
+          + `the rule set changed too (${(previousRuleSet ?? '(none)').slice(0, 12)} -> ${(input.ruleSetSha256 ?? '(none)').slice(0, 12)}), so this is a rule revision ` +
           'taking effect, not something outside this package writing to the prompt',
         )
       } else {
         this.options.report(
-          `prompt-plan: the assembled prompt changed at assembly ${String(ordinal)}${input.sessionId === undefined ? '' : ` (session ${JSON.stringify(input.sessionId)})`} — `
-          + `${String(diff.changedCount)} section(s) differ (${diff.changes.map(entry => `${entry.kind} ${JSON.stringify(entry.name)}`).join(', ') || 'no named section'}), `
-          + `the earliest at index ${diff.firstChangedIndex === null ? '(none)' : String(diff.firstChangedIndex)}, and the RULE SET DID NOT CHANGE. `
+          `prompt-plan: the assembled prompt changed at assembly ${where} — `
+          + `${detail}, and the RULE SET DID NOT CHANGE. `
           + 'Something other than this package\'s rules wrote to the prompt. This is REPORTED, never prevented: the changed prompt has already been sent.',
         )
       }
@@ -688,17 +879,24 @@ export class CacheLedger {
           first,
           changed,
           repeat,
-          ...previous?.previous === undefined ? {} : {
-            previousPromptSha256: previous.previous.promptSha256,
-            previousRuleSetSha256: previous.previous.ruleSetSha256 ?? null,
-            previousOrdinal: previous.previous.ordinal,
-            ...previous.previousAt === undefined ? {} : { previousAt: previous.previousAt },
-            // Assemblies of this subject between the two lines, this one included.
-            // With a heartbeat this is the number a reader needs to know how much
-            // the ledger did not write down — and `repeat` above cannot answer it,
-            // because a change resets `repeat`.
-            assembliesSince: sinceLine,
-          },
+          ...carried === undefined ? {} : { restored: true },
+          // A restored state has no `previous` record, so the comparison is named
+          // by the hashes the previous run left rather than by an ordinal.
+          ...previous?.previous === undefined
+            ? carried === undefined || !changed
+              ? {}
+              : { previousPromptSha256: carried.promptSha256, previousRuleSetSha256: carried.ruleSetSha256 ?? null }
+            : {
+                previousPromptSha256: previous.previous.promptSha256,
+                previousRuleSetSha256: previous.previous.ruleSetSha256 ?? null,
+                previousOrdinal: previous.previous.ordinal,
+                ...previous.previousAt === undefined ? {} : { previousAt: previous.previousAt },
+                // Assemblies of this subject between the two lines, this one included.
+                // With a heartbeat this is the number a reader needs to know how much
+                // the ledger did not write down — and `repeat` above cannot answer it,
+                // because a change resets `repeat`.
+                assembliesSince: sinceLine,
+              },
           ...ruleSetChanged === undefined ? {} : { ruleSetChanged },
           ...diff === undefined ? {} : {
             changedSectionCount: diff.changedCount,
@@ -731,6 +929,10 @@ export class CacheLedger {
         : { ordinal: record.ordinal, promptSha256, ruleSetSha256: input.ruleSetSha256 },
       previousAt: record === undefined ? previous?.previousAt : at,
     })
+    // The restored state has been folded into `subjects`, so it must not be read
+    // again: leaving it would make the NEXT assembly compare against the
+    // pre-restart hash instead of the one just computed.
+    this.restored.delete(key)
 
     if (record !== undefined) this.append(CACHE_ARTIFACT_NAMES.prefix, JSON.stringify(record), this.prefixState)
     return record

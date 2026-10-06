@@ -162,6 +162,40 @@ cacheWriteTokens)`. The three counts are **disjoint** (see `TokenUsage` in
 is billed input tokens. It is `null` — never `1` — when the adapter reported no
 cache fields or the denominator is zero.
 
+**A missing `cacheWriteTokens` is not one of those refusals.** DeepSeek's adapter
+maps `cache_read_input_tokens` and never reports a write count, so treating "no
+write count" as "cannot compute" made this column `null` on **every live request**.
+The two absences mean different things: a missing **read** count means nothing is
+known about hits, so no rate is invented; a missing **write** count is zero for the
+denominator only. The host reads the fields the same way —
+`@deepseek-ai/dsh-token-meter`'s `bucketsFrom` is `cacheReadTokens ?? 0` and
+`cacheWriteTokens ?? 0`.
+
+### Across a restart
+
+The fingerprint memory is **resumed from the ledger tail** when the plugin mounts,
+so a prompt that changed while the process was down is still reported as a change
+rather than filed as a fresh baseline. Without that, every restart would make each
+subject look new and the first post-restart line would say `first: true` — a silent
+**miss** in the one thing this feature exists to report. That line carries
+`restored: true` and names the hash it compared against.
+
+Two limits are inherent and are stated rather than hidden:
+
+- **No section detail on that line.** The ledger stores no per-section digests, so
+  `changedSections` and `changedSectionCount` are **absent** on the first line after
+  a restart. The verdict is unaffected — `changed` and `ruleSetChanged` come from
+  the two hashes, which do survive — only the per-section *naming* is missing. The
+  host log says so rather than reporting "0 sections differ".
+- **A change made entirely while the process was down is timestamped at the
+  restart**, not at the edit. It is still reported and `previousPromptSha256` names
+  the old hash, but its time is when it was first observed. That is inherent to
+  observing from inside the process.
+
+The resume reads at most `RESTORE_SCAN_LINES` (200) lines from the end, so a large
+ledger cannot slow startup; a subject whose last line fell outside that window
+loses its memory and costs exactly one `first: true`.
+
 ### What these two files can and cannot conclude
 
 **A hit-rate drop on a request whose fingerprint changed a moment earlier is

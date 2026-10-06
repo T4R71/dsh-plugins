@@ -11,8 +11,10 @@
  *   2. the second seam is `assistant/message`, because the assembly waterfall
  *      runs before any usage exists; the ledger reads the adapter's own four
  *      counts off that event and computes the hit rate from a disjoint
- *      denominator, refusing to invent one when the adapter reported no cache
- *      fields;
+ *      denominator. It refuses to invent a rate only when the adapter reported no
+ *      HIT count — a missing WRITE count is zero for the denominator, because
+ *      DeepSeek never reports writes and demanding one made the rate undefined on
+ *      every real request;
  *   3. the ledgers are CAPPED: at most N lines per file, then rotation, with the
  *      oldest file deleted and nothing ever lost from the newest;
  *   4. nothing here gates. A changed prefix is recorded and the assembly is
@@ -202,11 +204,32 @@ test('the four counts are read from the event, and a payload missing the require
   const noCache = readUsage({ inputTokens: 1, outputTokens: 2 })
   assert.ok(noCache !== undefined)
   assert.equal(noCache.cacheReadTokens, undefined, 'absent stays absent; it is not coerced to 0')
+  // The READ count is the one whose absence is fatal: without it nothing is known
+  // about hits, so no rate is invented.
   assert.equal(cacheHitRate(noCache), undefined)
   const zeroCache = readUsage({ inputTokens: 1, outputTokens: 2, cacheReadTokens: 0, cacheWriteTokens: 0 })
   assert.ok(zeroCache !== undefined)
   assert.equal(zeroCache.cacheReadTokens, 0, 'an explicit zero is kept as zero, and the two are told apart')
   assert.equal(cacheHitRate(zeroCache), 0)
+})
+
+test('a missing cache WRITE count yields a rate, not undefined (the DeepSeek shape)', () => {
+  // The real DeepSeek adapter maps `cache_read_input_tokens` and never sets a
+  // write count, so every live request looks like this. An earlier revision
+  // demanded both cache fields and therefore returned undefined on every request,
+  // which silently disabled the metric it exists to report.
+  const deepseek = readUsage({ inputTokens: 720, outputTokens: 453, cacheReadTokens: 128768 })
+  assert.ok(deepseek !== undefined)
+  assert.equal(deepseek.cacheReadTokens, 128768)
+  assert.equal(deepseek.cacheWriteTokens, undefined, 'the write count is still recorded as absent, not as 0')
+  // billed = 720 + 128768 (+ 0) = 129488; 128768/129488 = 0.99443...
+  assert.equal(cacheHitRate(deepseek), 0.9944, 'a missing write count is zero for the denominator only')
+
+  // The two absences must stay distinguishable, or "adapter reports no writes"
+  // and "adapter reports no hits" would collapse into one fact.
+  const noRead = readUsage({ inputTokens: 720, outputTokens: 453 })
+  assert.ok(noRead !== undefined)
+  assert.equal(cacheHitRate(noRead), undefined, 'a missing READ count still refuses')
 })
 
 test('the hit rate uses the disjoint denominator and refuses to invent one', () => {
@@ -294,6 +317,86 @@ test('the prefix ledger resumes its ordinal across a restart instead of renumber
 
   const records = await second.read('prefix')
   assert.deepEqual(records.map(record => record.ordinal), [0, 1, 2], 'one counter across the directory, resumed from the file')
+})
+
+test('a prompt that CHANGED across a restart is reported as a change, not as a baseline', async () => {
+  // The miss this guards against: the fingerprint memory used to be in-process
+  // only, so the first assembly after a restart was written `first: true` even
+  // when the fingerprint had moved — a silent MISS in the one thing this feature
+  // exists to report. The machine this runs on restarts often, so the blind
+  // window was the common case, not the corner case.
+  const dir = tempDir()
+  const reports: string[] = []
+  const options = { directory: dir, lines: 100, keep: 2, heartbeat: 0, alwaysRecordPrefix: false, report: (m: string) => reports.push(m) }
+  const moved = [{ name: 'persona', text: 'BBB', interpolate: undefined }]
+  const movedAgain = [{ name: 'persona', text: 'CCC', interpolate: undefined }]
+
+  const first = new CacheLedger(options)
+  first.observe({ sessionId: 'S', sections: BASE_SECTIONS, ruleSetSha256: 'R1' })
+  await first.drain()
+
+  // Restart 1: the prompt moved, the rule set did not — an OUTSIDE change.
+  const second = new CacheLedger(options)
+  second.observe({ sessionId: 'S', sections: moved, ruleSetSha256: 'R1' })
+  await second.drain()
+
+  // Restart 2: the prompt moved AGAIN (a new text, so this is a fresh change and
+  // not a silent no-op) and the rule set moved with it — this package reading a
+  // new rule file.
+  const third = new CacheLedger(options)
+  third.observe({ sessionId: 'S', sections: movedAgain, ruleSetSha256: 'R2' })
+  await third.drain()
+
+  const records = await third.read('prefix')
+  assert.equal(records.length, 3)
+  assert.equal(records[0]?.first, true, 'the first run establishes the baseline')
+  assert.equal(records[0]?.changed, false)
+
+  // The point of the whole test: the post-restart line is a CHANGE.
+  assert.equal(records[1]?.first, false, 'a restart does not make a known subject new again')
+  assert.equal(records[1]?.changed, true, 'and a moved fingerprint is not filed as a baseline')
+  assert.equal(records[1]?.restored, true, 'the line says its previous state came from an earlier run')
+  assert.equal(records[1]?.ruleSetChanged, false, 'the rule set did NOT move, so something else wrote to the prompt')
+  assert.equal(records[1]?.previousPromptSha256, records[0]?.promptSha256, 'and it names the hash it compared against')
+
+  assert.equal(records[2]?.changed, true)
+  assert.equal(records[2]?.restored, true)
+  assert.equal(records[2]?.ruleSetChanged, true, 'here the rule set moved with it, so it was this package')
+
+  // Section-level detail cannot survive a restart (the ledger stores no per-section
+  // digests), so it must be ABSENT rather than reported as "0 sections differ".
+  assert.equal(records[1]?.changedSections, undefined, 'no invented section list')
+  assert.equal(records[1]?.changedSectionCount, undefined)
+
+  assert.equal(reports.length, 2, 'both changes were reported to the host log')
+  assert.match(String(reports[0]), /RULE SET DID NOT CHANGE/, 'the outside change is attributed correctly')
+  assert.match(String(reports[0]), /first assembly after a restart/, 'and the missing detail is explained rather than silently absent')
+  assert.match(String(reports[1]), /rule set changed too/, 'the rule revision is attributed correctly')
+})
+
+test('a subject restored from a restart is compared against the restored hash only once', async () => {
+  // The restored state is consumed by the first assembly that reads it. If it
+  // were left in place, every later assembly would compare against the
+  // pre-restart hash instead of the one just computed, and a steady prompt would
+  // report a change forever.
+  const dir = tempDir()
+  const options = { directory: dir, lines: 100, keep: 2, heartbeat: 0, alwaysRecordPrefix: false, report: () => undefined }
+
+  const first = new CacheLedger(options)
+  first.observe({ sessionId: 'S', sections: BASE_SECTIONS, ruleSetSha256: undefined })
+  await first.drain()
+
+  const second = new CacheLedger(options)
+  const moved = [{ name: 'persona', text: 'MOVED', interpolate: undefined }]
+  second.observe({ sessionId: 'S', sections: moved, ruleSetSha256: undefined })
+  // The same prompt again IN THE SAME RUN must be silent, not another change.
+  const again = second.observe({ sessionId: 'S', sections: moved, ruleSetSha256: undefined })
+  await second.drain()
+
+  assert.equal(again, undefined, 'the second identical assembly writes nothing')
+  const records = await second.read('prefix')
+  assert.equal(records.length, 2, 'exactly one baseline and one change')
+  assert.equal(records[1]?.changed, true)
 })
 
 test('the subject memory is capped, so a host that opens sessions forever does not grow a map forever', () => {
