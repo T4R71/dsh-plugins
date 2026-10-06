@@ -115,6 +115,118 @@ by coincidence — so both are written per assembly. Any assembly where they
 disagree gets `ok: false` in `purity.jsonl` **and** an error-level line in the
 host log, so an observe window cannot pass unnoticed while writing.
 
+## Cache-stability diagnostics (`cacheDiag`, off by default)
+
+Two ledgers that answer one question: **a cache hit rate dropped — did we move the
+prompt prefix, or is it the provider?** Both are written only when
+`config.cacheDiag` is `true`, and both live in the same artifact directory as the
+observation files.
+
+| File | One line per | Contents |
+| --- | --- | --- |
+| `cache-prefix.jsonl` | assembly whose fingerprint **changed**, plus a heartbeat | the prompt fingerprint, the rule set's hash, and every section that moved |
+| `cache-usage.jsonl` | model request | the four counts the adapter reported, and the hit rate they imply |
+
+**The prompt fingerprint** identifies the assembled system prompt: per section,
+its array index, name, text length, text `sha256`, and one bit for `interpolate`.
+It is taken **after** every other listener on the waterfall has run, on the value
+this handler is about to return — i.e. on what the model is actually sent.
+
+A fingerprint that moved is **reported, not prevented**, and the report names
+what moved:
+
+```
+prompt-plan: the assembled prompt changed at assembly 12 (session "abc") —
+1 section(s) differ (text "persona"), the earliest at index 0, and the RULE SET DID NOT CHANGE.
+Something other than this package's rules wrote to the prompt. This is REPORTED, never
+prevented: the changed prompt has already been sent.
+```
+
+`ruleSetChanged` is the field that decides which explanation applies: a change
+**with** it is this package reading a new rule file (a rule revision taking
+effect at the next pin), a change **without** it is something else writing to the
+prompt. The ledger carries **only hashes** — never section text; to see what a
+section said, look its digest up in `sections.jsonl` (or `sections-text.jsonl`
+with `config.fullText: true`).
+
+**The usage ledger** is fed from a second seam — the `session/event` feed, on
+`assistant/message`. It has to be a second seam: `system-prompt/assemble` runs
+*before* the request is dispatched, so no usage exists at that point, and the
+adapter's report arrives later as a session event. `assistant/message` is the only
+event in the log that carries token accounting at all. A request whose adapter
+reported no usage is not recorded as a row of zeros — there is no line for it.
+
+`cacheHitRate` is `cacheReadTokens / (inputTokens + cacheReadTokens +
+cacheWriteTokens)`. The three counts are **disjoint** (see `TokenUsage` in
+`@deepseek-ai/dsh-llm`: `inputTokens` is uncached input only), so that denominator
+is billed input tokens. It is `null` — never `1` — when the adapter reported no
+cache fields or the denominator is zero.
+
+### What these two files can and cannot conclude
+
+**A hit-rate drop on a request whose fingerprint changed a moment earlier is
+attributable to the system prompt — that is, to this process.** That is the
+positive result, and it is the only one.
+
+**A hit-rate drop with an UNCHANGED fingerprint does not make the provider
+guilty.** A provider KV cache hits on the longest common token **prefix of the
+whole request**: system prompt **and** message history **and** tool schemas. These
+files fingerprint the **system prompt only**. So an unchanged fingerprint
+*excludes* the system prompt and nothing else — a diverging message history, a
+changed tool result, a cache TTL expiry and a provider-side eviction all remain
+possible, and **none of them appears in either file**.
+
+`firstChangedIndex` bounds the claim further: sections before that index are
+byte-identical and in the same order, which is the only part of the prefix this
+fingerprint can vouch for. Everything from there on may have moved.
+
+### What "detecting injection" does and does not mean here
+
+The fingerprint makes a prompt modification **visible and attributable**. It does
+**not** prevent one, and it cannot:
+
+- it is taken **after** every other listener has run, so by the time a change is
+  visible the modified prompt **has already been sent**. Nothing here can stop a
+  prompt from being modified — that is the assembly chain upstream, not this
+  package;
+- an **unchanged** fingerprint proves nothing: it is a hash of the assembled
+  sections, so an injection that reproduces a previous prompt byte for byte, or
+  one arriving through a channel this fingerprint does not cover (tool schemas,
+  `contexts`, the message history), is invisible to it;
+- nothing here is a **gate**. A changed prefix is logged and recorded and the
+  assembly is returned exactly as it would have been without the diagnostics —
+  there is a test that asserts precisely that. Refusing an assembly because its
+  prefix moved would cost a turn and save nothing, since the prefix has already
+  moved by then.
+
+The honest one-line summary: **it is an attribution log, not a defence.**
+
+### Both ledgers are capped
+
+Each ledger holds at most `config.cacheLedgerLines` lines, then rotates:
+`cache-prefix.jsonl` → `.1` → `.2` … up to `config.cacheLedgerKeep` copies, with
+the oldest deleted. The defaults (2000 lines × 5 files per ledger) put a hard
+ceiling of **10 000 lines per ledger**, and a line is a few hundred bytes of
+numbers and 64-character hex digests. Nothing here grows without bound, and no
+section text is ever written to it. A count below 1 configured by hand is clamped
+to 1 rather than honoured, because an unbounded diagnostic is exactly the failure
+this feature must not reproduce.
+
+On a steady state where nothing changes, the ledger is **not** silent and not a
+line per turn: a heartbeat line is written every `config.cacheHeartbeat` (default
+200) assemblies of a subject, so "nothing changed" is a positive statement rather
+than an empty file that could equally mean "the listener died".
+
+### Reading the two together
+
+Both files share the artifact directory and each line carries an ISO timestamp,
+its own `ordinal`, and the `sessionId` it belongs to (`null` when the assembly or
+the event had no subject). To attribute a drop: find the `cache-usage.jsonl` line
+whose hit rate fell, then look in `cache-prefix.jsonl` for a changed line of the
+same `sessionId` immediately before it on the clock. A change there is the answer;
+no change there means the cause is outside the system prompt and outside these
+files.
+
 ## Rule file
 
 YAML, **parsed by this package** — see "Why there is no YAML dependency" below.
@@ -338,7 +450,18 @@ collections, duplicate keys.
     artifactDir: ''      # '' -> <profile dir>/prompt-plan-observations
     fullText: false      # also write sections-text.jsonl
     observe: true        # false stops writing any artifact
+    cacheDiag: false     # the cache-stability ledgers; see below. OFF by default
+    cacheLedgerLines: 2000   # lines per cache ledger file before it rotates
+    cacheLedgerKeep: 4       # rotated copies kept, .1 ... .n
+    cacheHeartbeat: 200      # assemblies between heartbeat lines; 0 = changes only
+    cacheRecordEveryAssembly: false   # true = a prefix line per assembly, not only on change
 ```
+
+`cacheDiag` is independent of `observe`: with `observe: false` and `cacheDiag:
+true` the observation artifacts stop and the two cache ledgers keep going. With
+`cacheDiag` false (the default) nothing in this section runs at all — no second
+listener, no directory read, no file — and the mount line says so, so "not
+running" is distinguishable from "running and found nothing".
 
 The row id `prompt-plan` is the Loader entry id and therefore the settings
 namespace, so a profile-level `cordis.patch.yml` can change any of these without
@@ -386,6 +509,7 @@ system prompt. Guarding behaviour belongs to `@t4r71/dsh-guard`.
 | `src/yaml.ts` | The YAML subset reader |
 | `src/transform.ts` | The declarative, shape-preserving transforms a rule applies to a section's text instead of replacing it |
 | `src/observe.ts` | The five artifacts and the purity record |
+| `src/cache.ts` | The capped cache-stability ledgers: the prompt fingerprint, the section diff, and the per-request usage record |
 
 ## Building
 

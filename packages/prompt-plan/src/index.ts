@@ -50,6 +50,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-settings'
 import type {} from '@deepseek-ai/dsh-system-prompt'
+import { CacheLedger, CACHE_ARTIFACT_NAMES, describeUsage, ruleSetHashOf } from './cache.ts'
 import { Config as ConfigSchema, PROMPT_PLAN_ROW_ID, settingsDirectoryOf } from './config.ts'
 import type { Config, ResolvedConfig } from './config.ts'
 import { resolvedConfig } from './config.ts'
@@ -74,6 +75,7 @@ import {
 import type { ToolNamesApplication, ToolNamesLogLine, ToolNamesSource } from './tool-names.ts'
 
 export * from './actions.ts'
+export * from './cache.ts'
 export * from './config.ts'
 export * from './digest.ts'
 export * from './naming.ts'
@@ -166,6 +168,22 @@ function logToolNamesPin(logger: {
   for (const line of lines) logger[line.level]('%s', line.message)
 }
 
+/**
+ * The session id a `session/event` listener was handed.
+ *
+ * Read structurally and defensively: the id is a branded string on the session
+ * (`Session.id`, `dsh-session/lib/types/index.d.ts:123`), but this is a
+ * diagnostic attribution and an unreadable session must yield `null` — the
+ * ledger's own "no subject" — rather than an exception inside the event feed.
+ * @param session - the session the event carried.
+ * @returns its id, or undefined when one cannot be read.
+ */
+function subjectIdOf(session: unknown): string | undefined {
+  if (session === null || typeof session !== 'object') return undefined
+  const id = (session as { id?: unknown }).id
+  return typeof id === 'string' && id.length > 0 ? id : undefined
+}
+
 /** The plugin class. */
 export class PromptPlan {
   /**
@@ -198,6 +216,15 @@ export class PromptPlan {
 
   private resolved: ResolvedConfig
   private observer: Observer | undefined
+  /**
+   * The cache-stability ledgers, or undefined when `config.cacheDiag` is false.
+   *
+   * Undefined is the DEFAULT and it is not a degenerate case: with no ledger
+   * there is no second listener on `session/event` and no second artifact
+   * directory, so a deployment that is not chasing a cache problem pays nothing
+   * for this feature existing.
+   */
+  private ledger: CacheLedger | undefined
   /**
    * The pin an assembly uses when it carries no session, and the revision every
    * session that already existed at mount was given.
@@ -296,6 +323,19 @@ export class PromptPlan {
         )
       },
     })
+    // The cache ledgers, in the same directory as the observation artifacts:
+    // the two are read together, and a second directory would be a second place
+    // an operator has to know about. Installed ONLY when asked for.
+    this.ledger = this.resolved.cacheDiag
+      ? new CacheLedger({
+          directory: paths.artifactDir,
+          lines: this.resolved.cacheLedgerLines,
+          keep: this.resolved.cacheLedgerKeep,
+          heartbeat: this.resolved.cacheHeartbeat,
+          alwaysRecordPrefix: this.resolved.cacheRecordEveryAssembly,
+          report: (message) => { ctx.logger?.warn('%s', message) },
+        })
+      : undefined
     // The mount line. It carries the purity criterion in force, so a host log
     // and the purity.jsonl lines written beside it can be tied to one revision of
     // the criterion without inspecting the installed package.
@@ -307,6 +347,16 @@ export class PromptPlan {
       paths.artifactDir,
       this.settingsDirectory ?? '(unresolved)',
       this.settingsDirectoryProblem ?? '(none — the directory was read)',
+    )
+    // The cache line, and its silence when the feature is off: a reader of the
+    // log must be able to tell "the diagnostics are not running" from "they are
+    // running and found nothing", and only a line in one case and none in the
+    // other does that without inference. The line carries the CAPS, so the bound
+    // this feature promises is on the record rather than only in the README.
+    ctx.logger?.info(
+      'prompt-plan: cache diagnostics %s%s',
+      this.ledger === undefined ? 'off (config.cacheDiag is false)' : 'on',
+      this.ledger === undefined ? '' : `; ledgers ${CACHE_ARTIFACT_NAMES.prefix} and ${CACHE_ARTIFACT_NAMES.usage} in the artifact directory, ${this.ledger.summary()}`,
     )
     // THE PIN, and when it is taken.
     //
@@ -344,10 +394,41 @@ export class PromptPlan {
       return await this.handle(ctx, assembly, produced, context) as typeof produced
     }, { global: true })
 
+    // The second seam, and the reason it is a second one: THIS listener's
+    // waterfall context never carries token accounting. `assemble` is called
+    // before the request is dispatched, so no usage exists yet, and the adapter's
+    // report arrives later as an `assistant/message` session event. That event is
+    // the only place a per-request ledger can be built from, and
+    // `SessionEventMap['assistant/message'].usage` is exactly the adapter's own
+    // four counts — see `describeUsage` in `./cache.ts`.
+    //
+    // Registered only when the ledger is on, so a deployment that did not ask
+    // for the diagnostic adds no listener to the event feed.
+    if (this.ledger !== undefined) {
+      ctx.on('session/event', (session, event) => {
+        try {
+          const described = describeUsage(event)
+          if (described === undefined) return
+          this.ledger?.observeUsage({
+            sessionId: subjectIdOf(session),
+            turn: described.turn,
+            step: described.step,
+            usage: described.usage,
+            interrupted: described.interrupted,
+          })
+        } catch {
+          // A listener that throws here would be an error in the middle of the
+          // session event feed, in front of every other observer. The accounting
+          // is diagnostic; it never gets to fail a turn.
+        }
+      })
+    }
+
     // A clean shutdown must not lose a queued artifact write. The waterfall
     // handler never awaits the disk (that would put filesystem latency in front
     // of every model turn), so the drain happens here.
     ctx.effect(() => () => { void this.observer?.drain() }, 'prompt-plan: drain observation artifacts')
+    ctx.effect(() => () => { void this.ledger?.drain() }, 'prompt-plan: drain the cache ledgers')
   }
 
   /**
@@ -603,6 +684,22 @@ export class PromptPlan {
       this.resolved.mode === 'rewrite' ? pin?.ruleSet : undefined,
       session,
     )
+    // The cache fingerprint, taken on what THIS handler is about to return — the
+    // value the model will actually be sent, after every other listener has run.
+    // Deliberately after `this.record`: the observation artifacts describe what
+    // reached the seam, and this describes what left it.
+    //
+    // It never gates. A changed prefix is already a changed prefix by the time it
+    // is visible here, so refusing the assembly would cost a turn and save
+    // nothing; the ledger and the log line are the whole output of this call.
+    if (this.ledger !== undefined) {
+      const ruleSet = pin?.ruleSet
+      this.ledger.observe({
+        sessionId: session,
+        sections: outcome.sections,
+        ruleSetSha256: ruleSetHashOf(this.resolved.mode === 'rewrite' ? ruleSet : undefined),
+      })
+    }
     if (outcome.sections === before) return produced
     return { ...(produced as Record<string, unknown>), sections: outcome.sections }
   }

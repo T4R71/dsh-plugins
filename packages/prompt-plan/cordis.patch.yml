@@ -28,3 +28,9 @@
         # write the baseline from it, and only then switch to 'rewrite'.
         mode: observe
         artifactDir: ''
+        # The cache-stability diagnostics (cache-prefix.jsonl + cache-usage.jsonl).
+        # OFF on purpose: it is a second listener and a second pair of files, and
+        # an operator who is not chasing a cache problem should pay neither. Turn
+        # it on while investigating a hit-rate drop; see the README section
+        # "Cache-stability diagnostics" for what it can and cannot conclude.
+        cacheDiag: false

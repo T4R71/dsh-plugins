@@ -29,6 +29,14 @@
 
 import type { Volatile } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
+import { DEFAULT_HEARTBEAT_ASSEMBLIES, DEFAULT_LEDGER_KEEP, DEFAULT_LEDGER_LINES } from './cache.ts'
+
+/** The schema default for {@link Config.cacheLedgerLines}, named where it is used. */
+export const CACHE_LEDGER_LINES_DEFAULT = DEFAULT_LEDGER_LINES
+/** The schema default for {@link Config.cacheLedgerKeep}, named where it is used. */
+export const CACHE_LEDGER_KEEP_DEFAULT = DEFAULT_LEDGER_KEEP
+/** The schema default for {@link Config.cacheHeartbeat}, named where it is used. */
+export const CACHE_HEARTBEAT_DEFAULT = DEFAULT_HEARTBEAT_ASSEMBLIES
 
 /** This package's row id in `cordis.patch.yml`; also its settings namespace. */
 export const PROMPT_PLAN_ROW_ID = 'prompt-plan'
@@ -64,6 +72,41 @@ export interface Config {
   fullText?: Volatile<boolean>
   /** Whether to keep writing anything at all. Default `true`. */
   observe?: Volatile<boolean>
+  /**
+   * Whether to run the cache-stability diagnostics. Default `false`.
+   *
+   * OFF by default and independent of `observe`, because it is a second pair of
+   * files with a second listener and an operator who is not chasing a cache
+   * problem should pay neither. See `src/cache.ts` for what it writes and for
+   * the boundary of what it can conclude.
+   */
+  cacheDiag?: Volatile<boolean>
+  /**
+   * Lines per cache ledger file before it rotates. Default 2000.
+   *
+   * Load-bearing, not a nicety: the ledger must be a bounded file, and this is
+   * the bound. Each line is a few hundred bytes of numbers and 64-character hex
+   * digests — never section text.
+   */
+  cacheLedgerLines?: Volatile<number>
+  /** Rotated copies kept per ledger, `.1` … `.n`. Default 4. */
+  cacheLedgerKeep?: Volatile<number>
+  /**
+   * Assemblies between heartbeat lines. Default 200; `0` records changes only.
+   *
+   * Only `cacheDiag: true` reads this.
+   */
+  cacheHeartbeat?: Volatile<number>
+  /**
+   * Write a prefix line for EVERY assembly instead of only on change. Default
+   * `false`.
+   *
+   * The diagnostic's whole point is that a hit-rate drop can be read against a
+   * change; with this off, an unchanged run is asserted by the heartbeat rather
+   * than by a line per assembly, which is the difference between a bounded file
+   * and a log of every turn.
+   */
+  cacheRecordEveryAssembly?: Volatile<boolean>
 }
 
 /**
@@ -80,6 +123,11 @@ export const Config = z.object({
   artifactDir: z.string().default('').volatile(),
   fullText: z.boolean().default(false).volatile(),
   observe: z.boolean().default(true).volatile(),
+  cacheDiag: z.boolean().default(false).volatile(),
+  cacheLedgerLines: z.number().default(CACHE_LEDGER_LINES_DEFAULT).volatile(),
+  cacheLedgerKeep: z.number().default(CACHE_LEDGER_KEEP_DEFAULT).volatile(),
+  cacheHeartbeat: z.number().default(CACHE_HEARTBEAT_DEFAULT).volatile(),
+  cacheRecordEveryAssembly: z.boolean().default(false).volatile(),
 })
 
 /**
@@ -109,6 +157,12 @@ export interface ResolvedConfig {
   readonly artifactDir: string
   readonly fullText: boolean
   readonly observe: boolean
+  /** Whether the cache-stability diagnostics run at all. Default `false`. */
+  readonly cacheDiag: boolean
+  readonly cacheLedgerLines: number
+  readonly cacheLedgerKeep: number
+  readonly cacheHeartbeat: number
+  readonly cacheRecordEveryAssembly: boolean
 }
 
 /**
@@ -127,7 +181,39 @@ export function resolvedConfig(source: unknown): ResolvedConfig {
     artifactDir: unwrap<string>(record.artifactDir) ?? '',
     fullText: unwrap<boolean>(record.fullText) ?? false,
     observe: unwrap<boolean>(record.observe) ?? true,
+    // The diagnostics are OFF unless asked for. A schema default is not enough
+    // here: `resolvedConfig` also reads a settings document that never went
+    // through the schema, and a diagnostic that switched itself on would change
+    // what every existing deployment writes.
+    cacheDiag: unwrap<boolean>(record.cacheDiag) ?? false,
+    cacheLedgerLines: positive(unwrap<number>(record.cacheLedgerLines), DEFAULT_LEDGER_LINES),
+    cacheLedgerKeep: positive(unwrap<number>(record.cacheLedgerKeep), DEFAULT_LEDGER_KEEP),
+    cacheHeartbeat: nonNegative(unwrap<number>(record.cacheHeartbeat), DEFAULT_HEARTBEAT_ASSEMBLIES),
+    cacheRecordEveryAssembly: unwrap<boolean>(record.cacheRecordEveryAssembly) ?? false,
   }
+}
+
+/**
+ * One numeric field, clamped to a value the ledger can actually use.
+ *
+ * A cap of zero lines, a negative rotation depth or a fractional heartbeat would
+ * each turn a bounded file into either an unbounded one or a rotation that never
+ * fires, which is the exact failure this feature is required not to have. The
+ * clamp is here rather than in the schema so a hand-edited settings document
+ * gets the same treatment as a validated one.
+ * @param value - the configured number, if any.
+ * @param fallback - the default to use when it is absent or not a number.
+ * @returns a positive integer.
+ */
+function positive(value: number | undefined, fallback: number): number {
+  if (value === undefined || !Number.isFinite(value)) return fallback
+  return Math.max(1, Math.floor(value))
+}
+
+/** As {@link positive}, but zero is a legal value (the heartbeat's "off"). */
+function nonNegative(value: number | undefined, fallback: number): number {
+  if (value === undefined || !Number.isFinite(value)) return fallback
+  return Math.max(0, Math.floor(value))
 }
 
 /**
