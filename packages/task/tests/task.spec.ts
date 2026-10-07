@@ -614,8 +614,72 @@ it('run 的节点 preset 没声明 agentOptions 时 request 里没有这个键�
     '省略 agentOptions 必须让这个键缺席，派发请求与改动前逐字段一致')
 })
 
-it('归一：run 声明 nodes 时先写树再派活，一次调用完成建节点+派活+绑定', async () => {
-  // 这条原先钉的是 2026-09-30 的改动（dispatch 自己也能写节点）。dispatch 撤掉之后，
+/**
+ * 内核 `preset` 槽（0.2.0-rc.2 起逐次派发支持）。
+ *
+ * 这一格与 `persona` / `toolFilter` 是**两件事**：后两者在父的面里做减法，
+ * `preset` 换掉整个面 —— 孩子因此能拿到父从来没有过的工具。所以它必须原样落到
+ * `startContinuable` 的那个 request 上，而不是被本包自己的表吃掉。
+ */
+it('run 把节点 preset 的内核 preset 名放进 request——孩子显式声明要装哪一支面', async () => {
+  const seen: unknown[] = []
+  let captured: Captured | undefined
+  const ctx = {
+    tools: { register: (d: Captured) => { captured = d; return () => {} } },
+    get: (key: string) => key === 'taskTree'
+      ? { read: () => [], write: async () => {}, step: async () => {}, bind: async () => {} }
+      : undefined,
+    subagents: {
+      resolveMaxDepth: () => 3,
+      startContinuable: async (spec: unknown) => { seen.push(spec); return { childId: 'child-9' } },
+    },
+    userQuestions: { ask: async () => ({ answers: [] }) },
+    systemPrompt: { section: () => () => {} },
+    on: () => () => {},
+  }
+  // 表里的**角色名**是 `recon`，交给内核的是**另一支** preset 名 `recon-face`：
+  // 两者故意不同名，这样「透传的是查表结果而不是模型点的那个名字」才被真的钉住。
+  apply(ctx as never, {
+    provider: 'default',
+    presets: { recon: { persona: 'R', preset: 'recon-face', deny: ['task'] } },
+  })
+  await run(captured as Captured, { action: 'run', run: 'r1', nodes: [{ id: 'n1', prompt: 'go', preset: 'recon' }] }, caller)
+  const spec = seen[0] as { request: Record<string, unknown> }
+  assert.strictEqual(spec.request.preset, 'recon-face',
+    '交给内核的必须是查表得到的 preset 名，不是模型点的角色名')
+  // 声明选面、围栏收窄面，两个动作正交，谁都不许吞掉谁。
+  assert.deepStrictEqual(spec.request.toolFilter, { deny: ['task'] })
+  // `deny` 会按 `toolSectionsForFilter` 折成一段丢弃指令前置在 persona 上，
+  // 所以这里断言的是「身份段本身还在」，而不是逐字相等。
+  assert.ok(String(spec.request.persona).endsWith('R'))
+})
+
+it('没声明内核 preset 时 request 里没有这个键——省略就是继承父的面', async () => {
+  const seen: unknown[] = []
+  let captured: Captured | undefined
+  const ctx = {
+    tools: { register: (d: Captured) => { captured = d; return () => {} } },
+    get: (key: string) => key === 'taskTree'
+      ? { read: () => [], write: async () => {}, step: async () => {}, bind: async () => {} }
+      : undefined,
+    subagents: {
+      resolveMaxDepth: () => 3,
+      startContinuable: async (spec: unknown) => { seen.push(spec); return { childId: 'child-9' } },
+    },
+    userQuestions: { ask: async () => ({ answers: [] }) },
+    systemPrompt: { section: () => () => {} },
+    on: () => () => {},
+  }
+  apply(ctx as never, { provider: 'default', presets: { recon: { persona: 'R' } } })
+  await run(captured as Captured, { action: 'run', run: 'r1', nodes: [{ id: 'n1', prompt: 'go', preset: 'recon' }] }, caller)
+  const spec = seen[0] as { request: Record<string, unknown> }
+  // 物化出来的 `''` 会被宿主当成一个 preset id 去查表并当场抛 not-found ——
+  // 「继承父」这条默认路径会因此变成硬错误。
+  assert.strictEqual(Object.hasOwn(spec.request, 'preset'), false,
+    '省略 preset 必须让这个键缺席，派发请求与改动前逐字段一致')
+})
+
+it('归一：run 声明 nodes 时先写树再派活，一次调用完成建节点+派活+绑定', async () => {  // 这条原先钉的是 2026-09-30 的改动（dispatch 自己也能写节点）。dispatch 撤掉之后，
   // 「建节点 + 派活 + 绑定」成了 run 的**唯一**形态，所以这条迁移是收紧而不是放宽：
   // 顺序仍是硬约束——bind 要求节点已存在，所以 write 必须早于 startContinuable；
   // 下面的 order 数组就是那个顺序的一手证据。

@@ -21,8 +21,10 @@
  *
  * ## 派发怎么走：一律直连子代理
  *
- * 逐次派发**不支持预设名**（`SubagentStartRequest` 没有 `preset` 槽），所以预设名是本包
- * 自建的一张表（见 `./presets.ts`）。
+ * 逐次派发**支持预设名**（0.2.0-rc.2 起 `SubagentStartRequest` 有 `preset?: string` 槽），
+ * 所以预设名有两层含义、别混：本包自建的那张表（见 `./presets.ts`）管「角色名 → 一组槽」，
+ * 其中 `PresetSpec.preset` 那一格才是**交给内核的 preset 名**（孩子显式要装哪一支面）。
+ * 表里省略 `preset` 时行为与加它之前逐字段一致：孩子照旧 `composeFrom` 继承父的 revision。
  *
  * **唯一的路是 `ctx.subagents`**（Agent Teams 已于 2026-10-02 整条摘掉）：派发配方逐字对齐内置 `tool-subagent`
  * （`dsh-tool-subagent/lib/index.js:509-532`）：`parent` 取 `exec.agent`，`persona` / `toolFilter` /
@@ -485,6 +487,8 @@ export interface PresetSpecField {
   deny?: string[]
   maxDepth?: number
   agentOptions?: PresetAgentOptionsField
+  /** 内核 preset 名（{@link PresetSpec.preset}）。省略即孩子继承父的面。 */
+  preset?: string
 }
 
 /**
@@ -547,6 +551,11 @@ export const Config: z<{ provider: string; defaultRules?: string; presets: Dict<
       reasoningEffort: z.string(),
       maxTokens: z.natural(),
     }).default(undefined as unknown as PresetAgentOptionsField),
+    // 内核 preset 名。**实测过**（`schem2.mjs`：`z.string()` 的省略保持 `undefined`、
+    // `hasOwn` 为 false），所以不需要 `agentOptions` 那种 `.default(undefined)` 的写法 ——
+    // 那一格要那么写是因为嵌套对象**会**被物化成 `{}`，而标量字符串不会。
+    // 物化成 `''` 的后果在这里格外重：`''` 会被宿主当成一个 preset id 去查表并当场抛。
+    preset: z.string(),
   })).default({}),
   /**
    * 后端账本（自动放行流水线）落盘的文件位置。空串（默认）走 {@link ledgerPathFor}
@@ -1783,7 +1792,7 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
       ? encodeDropDirective(drops, preset.persona ?? '')
       : preset.persona
     // 派发**只有直连一条路**（Agent Teams 已于 2026-10-02 整条摘掉）：
-    // persona / toolFilter / maxDepth / agentOptions 四个槽由下面的 request 一次交齐。
+    // persona / toolFilter / maxDepth / agentOptions / preset 五个槽由下面的 request 一次交齐。
     const maxDepth = ctx.subagents.resolveMaxDepth(preset.maxDepth)
     const request: Omit<SubagentStartRequest, 'label' | 'signal' | 'outputSchema'> = {
       ...spec.label !== undefined ? { label: spec.label } : {},
@@ -1797,6 +1806,10 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
       parent,
       ...persona !== undefined ? { persona } : {},
       ...preset.toolFilter !== undefined ? { toolFilter: preset.toolFilter } : {},
+      // **面本身**走这里，是唯一能让孩子拿到父从来没有过的工具的那个槽。
+      // 注意取的是 `preset.preset`（表里那格查出来的内核名），不是 `spec.preset`
+      // （调用方点的**角色名**）：两者可能不同名，把角色名直接交给内核会让查表失败。
+      ...preset.preset !== undefined ? { preset: preset.preset } : {},
       ...maxDepth !== undefined ? { maxDepth } : {},
       // 角色固定的档位走这里。宿主那侧是**逐字段覆盖**父的
       // `provider/model/reasoningEffort/maxTokens`，所以只写 `reasoningEffort` 时

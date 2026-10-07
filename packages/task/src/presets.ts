@@ -1,16 +1,23 @@
 /**
- * 预设表：预设名 → persona + 工具围栏。
+ * 预设表：预设名 → persona + 工具围栏 + **内核 preset 名**。
  *
- * 为什么必须自建这张表：0.1.7 的子代理运行时**逐次派发不支持预设名**。
- * `SubagentStartRequest`（`dsh-subagent/lib/typert.host.js:779`）的字段是
- * `{ label?, prompt, parent, signal, agentOptions?, outputSchema?, maxDepth?, toolFilter?, persona? }`
- * —— 只有 `persona` 与 `toolFilter` 两个身份槽，**没有 `preset`**，子代理经 `composeFrom`
- * 继承父的 revision。所以「预设名」只能是本包自己的概念：表存在本行的 settings 命名空间里，
- * 派发时查表，把结果平铺进 start request。
+ * **0.2.0-rc.2 起，逐次派发支持预设名了。** `SubagentStartRequest` 多了一个
+ * `preset?: string` 槽（宿主 `packages/subagent/subagent/src/types.ts` 的
+ * `readonly preset?: string`），宿主据此把**显式声明的**那一支 preset 装进孩子的
+ * 创建窗口 —— 在同一刻派出的两个子代理因此可以拿到两个不同的工具面。这跟本包原先
+ * 「只能靠 persona + toolFilter 在父的面上做减法」是两件事：
  *
- * 内置的 `tool-subagent`（`dsh-tool-subagent/lib/index.js:258-269`、`:516-519`）自己也是这么做的，
- * 只是它的 `persona` / `toolFilter` 挂在**行配置**上、每个行只能给一套；本包把它们提到
- * **逐次可选的预设名**上，这是「收成一个 `task`」与「多个 `tool-subagent` 行」的唯一实质差别。
+ * - `persona` / `toolFilter` 是**减法**：父已经有的面，孩子在里面挑一部分。
+ * - `preset` 是**面本身**：它带着自己那一组 plugin 行与自己的工具表进来，
+ *   所以是唯一能**加上**父从来没有过的工具的那个槽。
+ *
+ * 本包仍然自建这张表，理由变了：表要负责把**身份名**（`recon` / `impl` / …）映射成
+ * 派发时真正生效的那些槽，其中 `PresetSpec.preset` 是新增的那一格 —— 它在表里是
+ * **可选的**，省略时行为与加它之前逐字段一致（子代理照旧 `composeFrom` 继承父的 revision）。
+ *
+ * 内置的 `tool-subagent`（`dsh-tool-subagent/lib/index.js`）也在自己的行配置上开了
+ * `preset` 一格，但它一行只能给一套；本包把它提到**逐次可选的预设名**上，这是
+ * 「收成一个 `task`」与「多个 `tool-subagent` 行」的唯一实质差别。
  *
  * @module @t4r71/dsh-task/presets
  */
@@ -63,6 +70,22 @@ export interface PresetSpec {
    * 派发请求与加它之前逐字段一致。
    */
   readonly agentOptions?: PresetAgentOptions
+  /**
+   * 内核侧的 preset 名：孩子**显式声明**要装哪一支工具面。
+   *
+   * 与 `toolFilter` 是**两件不同的事**，不是同一条路的不同写法：
+   * - `toolFilter` 在父的面里做减法（`tools.restrict` 是纯减法，只删不加）；
+   * - `preset` 换掉整个面 —— 它带着那一支自己的 plugin 行与工具表进来，所以
+   *   这一格是**唯一能让孩子拿到父从来没有过的工具**的通道。
+   *
+   * 省略时的语义**与加这一格之前逐字段一致**：孩子走 `composeFrom` 继承父的 revision。
+   * 这是刻意的 —— 现有配置一个字节都不用改，行为不会漂。
+   *
+   * 名字必须在内核 `agentPresetRegistry` 里真的注册过：没注册会让**派发当场抛**
+   * （`agent-preset/not-found`），而不是静默退化成继承父。宁可一次派发失败，
+   * 也不要一次笔误变成一次权限提升。
+   */
+  readonly preset?: string
 }
 
 /**
@@ -81,7 +104,7 @@ export interface PresetAgentOptions {
 }
 
 /**
- * 查表结果，形状与 `SubagentStartRequest` 的四个可选成员逐字对应。
+ * 查表结果，形状与 `SubagentStartRequest` 的五个可选成员逐字对应。
  *
  * `agentOptions` 只有**直连通道**塞得进去（request 里有这个槽）；名册通道的请求体
  * 逐字只有 `{ name, description, prompt, context, provider, signal }`，装不下它 ——
@@ -94,6 +117,8 @@ export interface ResolvedPreset {
   readonly maxDepth?: number
   readonly drop?: readonly string[]
   readonly agentOptions?: PresetAgentOptions
+  /** 内核 preset 名。省略即孩子继承父的面（与加这一格之前逐字段一致）。 */
+  readonly preset?: string
 }
 
 /** 工具说明段的名字前缀。各工具插件把自己的说明注册成 `${TOOL_SECTION_PREFIX}${工具名}`。 */
@@ -242,6 +267,9 @@ export function resolvePreset(
     // 多出一个空对象虽然当前无害，但会让「省略 = 继承父的路由」与「显式给空 = ???」
     // 在输出里长得一样 —— 本文件已经因为物化栽过一次（见 EmptyPresetFilterError 的来由）。
     ...spec.agentOptions !== undefined ? { agentOptions: { ...spec.agentOptions } } : {},
+    // 同一处理：省略就是**不带这个键**，让宿主走 `composeFrom` 继承父。
+    // 物化成 `''` 会被宿主当成一个 preset id 去查表，然后当场抛 not-found。
+    ...spec.preset !== undefined ? { preset: spec.preset } : {},
   }
 }
 

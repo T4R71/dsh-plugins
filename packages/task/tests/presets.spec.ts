@@ -196,3 +196,49 @@ it('resolvePreset 透传 drop', () => {
   // 空数组不产生字段：空 drop 与"没写 drop"是同一件事。
   assert.deepStrictEqual(resolvePreset({ scout: { drop: [] } }, 'scout'), {})
 })
+
+/**
+ * 内核 `preset` 那一格（0.2.0-rc.2 起逐次派发支持）。
+ *
+ * 这一格与 `toolFilter` 是**两件不同的事**：`toolFilter` 在父的面里做减法，
+ * `preset` 换掉整个面（孩子因此能拿到父从来没有过的工具）。测试要钉住的正是这个区别 ——
+ * 两者同时写时必须**各自都进结果**，不能互相吞掉。
+ */
+it('resolvePreset 透传内核 preset 名', () => {
+  assert.deepStrictEqual(
+    resolvePreset({ recon: { preset: 'recon', persona: 'r' } }, 'recon'),
+    { persona: 'r', preset: 'recon' },
+  )
+})
+
+it('省略 preset 时结果里没有这个键——省略就是继承父的面', () => {
+  // 与 agentOptions 同一条判据：物化出来的 `''` 会被宿主当成一个 preset id 去查表，
+  // 然后当场抛 not-found —— 「继承父」这条默认路径会因此变成硬错误。
+  const resolved = resolvePreset({ lead: { persona: 'l' } }, 'lead')
+  assert.deepStrictEqual(resolved, { persona: 'l' })
+  assert.strictEqual(Object.hasOwn(resolved, 'preset'), false)
+})
+
+it('preset 与 toolFilter 可以同时给出，互不吞掉', () => {
+  // 声明选面、围栏收窄面，是两个正交的动作。
+  assert.deepStrictEqual(
+    resolvePreset({ impl: { preset: 'impl', deny: ['task'] } }, 'impl'),
+    { preset: 'impl', toolFilter: { deny: ['task'] } },
+  )
+})
+
+it('Config schema 收下 preset，且省略时不物化', () => {
+  const parsed = Config({
+    provider: 'spawn',
+    presets: {
+      recon: { persona: 'r', preset: 'recon-face' },
+      impl: { persona: 'i' },
+    },
+  })
+  // ① schema 少这一格的话，配置表里写下的 preset 会被悄悄吃掉，孩子静默继承父的面。
+  assert.strictEqual(parsed.presets['recon']?.preset, 'recon-face')
+  assert.deepStrictEqual(resolvePreset(parsed.presets, 'recon'), { persona: 'r', preset: 'recon-face' })
+  // ② 省略的保持缺席，而不是被物化成空串。
+  assert.strictEqual(parsed.presets['impl']?.preset, undefined)
+  assert.deepStrictEqual(resolvePreset(parsed.presets, 'impl'), { persona: 'i' })
+})
