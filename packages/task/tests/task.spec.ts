@@ -170,7 +170,13 @@ function ledgerFileAbsent(file: string): boolean {
  *   （或直接给一个 `taskRuns` 服务）、父 Agent 是谁。
  * @returns 被注册的工具定义、调用记录、目录查询记录，以及可变的会话历史。
  */
-function harness(options: { tree?: boolean; children?: readonly (string | { readonly id: string; readonly createdAt: number; readonly mode: 'one-shot' | 'continuable' | 'unknown'; readonly label?: string })[]; answers?: { id: string; selected: string[] }[]; presets?: Record<string, { persona?: string; allow?: string[]; deny?: string[]; maxDepth?: number; drop?: string[]; agentOptions?: { provider?: string; model?: string; reasoningEffort?: string; maxTokens?: number } }>; defaultRules?: string; runsFile?: string; worktreesFile?: string; worktreeGoal?: string; worktreeVerify?: string; worktreeMergeVerify?: string; worktreePrepare?: string; worktreeAuto?: boolean; parentAgent?: Record<string, unknown>; descendants?: readonly { readonly id: string; readonly activity?: 'running' | 'inactive'; readonly kind?: 'child' | 'diagnostic'; readonly reason?: 'corrupt' | 'unsupported' | 'unavailable' }[]; descendantsThrow?: boolean; sessionStore?: readonly string[]; sessionStoreService?: boolean; beforeStart?: () => void;
+function harness(options: { tree?: boolean; children?: readonly (string | { readonly id: string; readonly createdAt: number; readonly mode: 'one-shot' | 'continuable' | 'unknown'; readonly label?: string })[]; answers?: { id: string; selected: string[] }[]; presets?: Record<string, { persona?: string; allow?: string[]; deny?: string[]; maxDepth?: number; drop?: string[]; preset?: string; agentOptions?: { provider?: string; model?: string; reasoningEffort?: string; maxTokens?: number } }>; defaultRules?: string; runsFile?: string; worktreesFile?: string; worktreeGoal?: string; worktreeVerify?: string; worktreeMergeVerify?: string; worktreePrepare?: string; worktreeAuto?: boolean; parentAgent?: Record<string, unknown>; descendants?: readonly { readonly id: string; readonly activity?: 'running' | 'inactive'; readonly kind?: 'child' | 'diagnostic'; readonly reason?: 'corrupt' | 'unsupported' | 'unavailable' }[]; descendantsThrow?: boolean; sessionStore?: readonly string[]; sessionStoreService?: boolean; beforeStart?: () => void;
+  /**
+   * 这个部署装没装内核的预设名册（`ctx.get('agentPresets')`）。**默认不装** ——
+   * rosterless 是合法部署，本包在它上面必须退回 persona + toolFilter 的减法并把降级留痕。
+   * 给了就是「装了名册」，行的形状照内核 `list()`：至少 `id`，坏了的那一行多一个 `broken`。
+   */
+  agentPresets?: readonly (string | { readonly id: string; readonly broken?: string })[]
   /**
    * 「第一次装配」的落点：宿主在 `startContinuable` **内部**就把孩子材料化、并按它的身份
    * 装配一次系统提示词 —— 那一次发生在**返回值之前**。假宿主在这里补上同一步。
@@ -296,6 +302,17 @@ function harness(options: { tree?: boolean; children?: readonly (string | { read
         if (options.sessionStoreService === false) return undefined
         const live = new Set(options.sessionStore ?? children.map(entry => typeof entry === 'string' ? entry : entry.id))
         return { get: (id: string) => live.has(id) ? { id } : undefined }
+      }
+      // 内核预设名册。**默认缺席**（返回 undefined）：rosterless 部署是合法的一种，
+      // 而且是本项最要盯住的那一条降级路 —— 默认给一个名册会让所有既有的派发用例
+      // 悄悄换到另一条通道上，那些用例钉的 persona/toolFilter 就全部失去落点。
+      if (key === 'agentPresets' && options.agentPresets !== undefined) {
+        return {
+          // 形状照内核 `agent-preset-registry` 的 `list()`：纯读、不抛、每行至少 `id`。
+          list: async () => options.agentPresets?.map(entry => typeof entry === 'string'
+            ? { id: entry }
+            : entry),
+        }
       }
       return undefined
     },
@@ -546,21 +563,242 @@ it('run 把节点 preset 的 persona 与 toolFilter 平铺进 request，并包�
   // run 的返回值形状：只有 run 与 dispatched，**没有** node / task_id 这两个键。
   assert.strictEqual('node' in result, false, 'run has no node key — the binding is registered by the plugin itself')
   assert.strictEqual('task_id' in result, false, 'run has no task_id key either')
-  assert.deepStrictEqual(result, { status: 'running', run: 'r1', dispatched: ['n1'] })
+  // 这个假上下文**没有** `agentPresets`（rosterless 部署，见 harness 的注释）：身份交不出去，
+  // 于是返回值里必须多出这一格留痕 —— 它正是「走的不是预设通道」的一手证据。
+  assert.deepStrictEqual(result, {
+    status: 'running',
+    run: 'r1',
+    dispatched: ['n1'],
+    presetFallback: 'preset "reader" was declared but no agent-preset roster is loaded; falling back to persona + toolFilter',
+  })
   const spec = seen[0] as { provider: string; request: Record<string, unknown> }
   assert.strictEqual(spec.provider, 'default')
   assert.strictEqual(spec.request.persona, 'P')
   assert.deepStrictEqual(spec.request.toolFilter, { allow: ['read'] })
   assert.strictEqual(spec.request.maxDepth, 3)
   assert.strictEqual((spec.request.parent as { session?: { id?: string } })?.session?.id, 'sess-1')
+  // **两条通道互斥**：没走成预设，`preset` 这个槽就一个字节都不许出现在请求里。
+  // 内核侧对「声明了 preset 却没有名册」是当场抛（`child-agent.ts:341-346`，
+  // rosterless 只有在这种「不声明」的姿态下才走得通）。
+  assert.strictEqual(Object.hasOwn(spec.request, 'preset'), false,
+    '降级时绝不能把 preset 一起交出去 —— 那会让一次派发当场炸在内核里')
 })
 
 /**
- * per-角色的 `agentOptions`：角色固定自己的思考强度或模型路由。
+ * 名册在册 → 身份**整支**交给内核的预设树，减法那套一个字都不用。
  *
- * 这一组钉的是**直连通道**。名册通道塞不进这个槽（见下一条），
- * 所以「声明了它」这件事必须真的走到直连、并且在返回值里说清楚。
+ * 与下一条（rosterless）是一对：同一个角色名，装到的面完全不同。
+ * 这里钉三件事：交出去的是**查表结果**（角色名 `recon` → 预设名 `recon-face`）、
+ * persona/toolFilter **一个都不带**（内核 `child-agent.ts:360-366` 与
+ * `@deepseek-ai/dsh-persona` 注册的是同一个段名，两个都给就是当场抛）、
+ * 以及返回值里**没有**降级留痕。
  */
+it('run 把节点 preset 的内核 preset 名放进 request——孩子显式声明要装哪一支面', async () => {
+  const seen: unknown[] = []
+  let captured: Captured | undefined
+  const ctx = {
+    tools: { register: (d: Captured) => { captured = d; return () => {} } },
+    get: (key: string) => {
+      if (key === 'taskTree') {
+        return { read: () => [], write: async () => {}, step: async () => {}, bind: async () => {} }
+      }
+      if (key === 'agentPresets') {
+        return { list: async () => [{ id: 'recon-face' }, { id: 'lead' }] }
+      }
+      return undefined
+    },
+    subagents: {
+      resolveMaxDepth: () => 3,
+      startContinuable: async (spec: unknown) => { seen.push(spec); return { childId: 'child-9' } },
+    },
+    userQuestions: { ask: async () => ({ answers: [] }) },
+    systemPrompt: { section: () => () => {} },
+    on: () => () => {},
+  }
+  // 表里的**角色名**是 `recon`，交给内核的是**另一支** preset 名 `recon-face`：
+  // 两者故意不同名，这样「透传的是查表结果而不是模型点的那个名字」才被真的钉住。
+  apply(ctx as never, {
+    provider: 'default',
+    presets: { recon: { persona: 'R', preset: 'recon-face', deny: ['task'], agentOptions: { reasoningEffort: 'low' } } },
+  })
+  const result = await run(captured as Captured, {
+    action: 'run',
+    run: 'r1',
+    nodes: [{ id: 'n1', prompt: 'go', preset: 'recon' }],
+  }, caller)
+  const spec = seen[0] as { request: Record<string, unknown> }
+  assert.strictEqual(spec.request.preset, 'recon-face',
+    '交给内核的必须是查表得到的 preset 名，不是模型点的角色名')
+  // **互斥**：预设换掉的是整支面，persona/toolFilter 再交一份不是"更保险"，是当场抛。
+  assert.strictEqual(Object.hasOwn(spec.request, 'persona'), false,
+    '走预设时不许再交 persona —— 同名段在同一个 scope 层会撞上宿主的注册')
+  assert.strictEqual(Object.hasOwn(spec.request, 'toolFilter'), false, '工具面由那一支自己的 plugin 行决定')
+  // `agentOptions` 与身份通道无关：两条路都照传（`continuation.ts:121-126` 一次算三样）。
+  assert.deepStrictEqual(spec.request.agentOptions, { reasoningEffort: 'low' })
+  assert.strictEqual(Object.hasOwn(result, 'presetFallback'), false, '没降级就不留痕')
+})
+
+it('名册在册但名字不在册 → 退回减法，且把「不在册」这件事带进返回值', async () => {
+  const seen: unknown[] = []
+  let captured: Captured | undefined
+  const ctx = {
+    tools: { register: (d: Captured) => { captured = d; return () => {} } },
+    get: (key: string) => {
+      if (key === 'taskTree') {
+        return { read: () => [], write: async () => {}, step: async () => {}, bind: async () => {} }
+      }
+      if (key === 'agentPresets') return { list: async () => [{ id: 'lead' }, { id: 'impl' }] }
+      return undefined
+    },
+    subagents: {
+      resolveMaxDepth: () => undefined,
+      startContinuable: async (spec: unknown) => { seen.push(spec); return { childId: 'child-9' } },
+    },
+    userQuestions: { ask: async () => ({ answers: [] }) },
+    systemPrompt: { section: () => () => {} },
+    on: () => () => {},
+  }
+  apply(ctx as never, { provider: 'default', presets: { recon: { persona: 'R' } } })
+  const result = await run(captured as Captured, {
+    action: 'run',
+    run: 'r1',
+    nodes: [{ id: 'n1', prompt: 'go', preset: 'recon' }],
+  }, caller)
+  const spec = seen[0] as { request: Record<string, unknown> }
+  assert.strictEqual(Object.hasOwn(spec.request, 'preset'), false, '不在册 ⇒ 一个字节都不交给内核')
+  assert.strictEqual(spec.request.persona, 'R', '退回 persona + toolFilter 那条老路')
+  assert.match(String((result as { presetFallback?: string }).presetFallback),
+    /preset "recon" is not in the agent-preset roster \(available: impl, lead\)/)
+  // 派发本身照常成功 —— 降级不是失败，它只是"装的是另一张面"这件事被说出来了。
+  assert.deepStrictEqual(result.dispatched, ['n1'])
+})
+
+it('名册读不动（list 抛）时照样派得出去，只是留痕写明名册读不动', async () => {
+  const seen: unknown[] = []
+  let captured: Captured | undefined
+  const ctx = {
+    tools: { register: (d: Captured) => { captured = d; return () => {} } },
+    get: (key: string) => {
+      if (key === 'taskTree') {
+        return { read: () => [], write: async () => {}, step: async () => {}, bind: async () => {} }
+      }
+      if (key === 'agentPresets') {
+        return { list: async () => { throw new Error('registry exploded') } }
+      }
+      return undefined
+    },
+    subagents: {
+      resolveMaxDepth: () => undefined,
+      startContinuable: async (spec: unknown) => { seen.push(spec); return { childId: 'child-9' } },
+    },
+    userQuestions: { ask: async () => ({ answers: [] }) },
+    systemPrompt: { section: () => () => {} },
+    on: () => () => {},
+  }
+  apply(ctx as never, { provider: 'default', presets: { recon: { persona: 'R' } } })
+  const result = await run(captured as Captured, {
+    action: 'run',
+    run: 'r1',
+    nodes: [{ id: 'n1', prompt: 'go', preset: 'recon' }],
+  }, caller)
+  assert.match(String((result as { presetFallback?: string }).presetFallback), /registry exploded/)
+  assert.strictEqual((seen[0] as { request: Record<string, unknown> }).request.persona, 'R')
+})
+
+it('harness 里装了名册时走预设通道：请求里只有 preset，返回值里没有留痕', async () => {
+  // 与上面几条内联假 ctx 的用例互补：这一条走的是**完整 harness**（真树 + 真账本 + 真派发），
+  // 钉的是「换成真链路之后通道判定没有漂」。
+  const h = harness({ tree: true, agentPresets: ['lead', 'recon'], presets: { recon: { persona: 'R', allow: ['read'] } } })
+  const result = await run(h.tool, {
+    action: 'run',
+    run: 'r1',
+    nodes: [{ id: 'A', prompt: 'a', preset: 'recon' }],
+  }, caller)
+  assert.deepStrictEqual(result, { status: 'running', run: 'r1', dispatched: ['A'] })
+  const spec = h.starts[0] as { request: Record<string, unknown> }
+  assert.strictEqual(spec.request.preset, 'recon')
+  assert.strictEqual(Object.hasOwn(spec.request, 'persona'), false)
+  assert.strictEqual(Object.hasOwn(spec.request, 'toolFilter'), false)
+})
+
+it('降级留痕按原因去重、保声明顺序——同一个原因不许在返回值里说几遍', async () => {
+  const h = harness({ tree: true, presets: { recon: { persona: 'R' } } })
+  const result = await run(h.tool, {
+    action: 'run',
+    run: 'r1',
+    nodes: [
+      { id: 'A', prompt: 'a', preset: 'recon' },
+      { id: 'B', prompt: 'b', preset: 'recon' },
+    ],
+  }, caller)
+  assert.deepStrictEqual(result.dispatched, ['A', 'B'])
+  const trace = String((result as { presetFallback?: string }).presetFallback)
+  assert.strictEqual(trace.split(' ｜ ').length, 1, '同一个原因只留一句：' + trace)
+})
+
+it('降级**不进树**：节点的 detail 照旧只有那一行事实，降级只走返回值', async () => {
+  // 判据的理由：detail 是给人读节点状态的（「已派发」/「等待依赖：A」/「派发失败：…」），
+  // 把一句英文降级原因拼上去，会让每一次 rosterless 派发都在面板上多一长串噪声；
+  // 而这条留痕的读者是**调用方**（模型），它的落点就是返回值。
+  const h = harness({ tree: true, presets: { recon: { persona: 'R' } } })
+  const result = await run(h.tool, {
+    action: 'run',
+    run: 'r1',
+    nodes: [{ id: 'A', prompt: 'a', preset: 'recon' }],
+  }, caller)
+  assert.equal(typeof result.presetFallback, 'string', '这一档必须真的走了降级')
+  const detail = String(h.treeNodes.find(node => node.id === 'A')?.detail)
+  assert.strictEqual(detail, '起点：无依赖，立即派发', '降级不许改写节点 detail')
+  assert.strictEqual(detail.includes('falling back'), false, '那一长串英文一个字都不许进树')
+})
+
+it('表里没写 preset 这一格时按角色键自己问名册 —— 声明选面与围栏收窄是两回事', async () => {
+  // 这一条钉的是 `PresetSpec.preset` 那一格的**省略语义**：`presets: { recon: { persona: 'R' } }`
+  // 里没写 preset，但角色名本身就是预设名，所以名册里有一支叫 `recon` 的面时照样走预设通道。
+  const seen: unknown[] = []
+  let captured: Captured | undefined
+  const ctx = {
+    tools: { register: (d: Captured) => { captured = d; return () => {} } },
+    get: (key: string) => {
+      if (key === 'taskTree') {
+        return { read: () => [], write: async () => {}, step: async () => {}, bind: async () => {} }
+      }
+      if (key === 'agentPresets') return { list: async () => [{ id: 'recon' }, { id: 'lead' }] }
+      return undefined
+    },
+    subagents: {
+      resolveMaxDepth: () => undefined,
+      startContinuable: async (spec: unknown) => { seen.push(spec); return { childId: 'child-9' } },
+    },
+    userQuestions: { ask: async () => ({ answers: [] }) },
+    systemPrompt: { section: () => () => {} },
+    on: () => () => {},
+  }
+  apply(ctx as never, { provider: 'default', presets: { recon: { persona: 'R', deny: ['task'] } } })
+  const result = await run(captured as Captured, {
+    action: 'run',
+    run: 'r1',
+    nodes: [{ id: 'n1', prompt: 'go', preset: 'recon' }],
+  }, caller)
+  const spec = seen[0] as { request: Record<string, unknown> }
+  assert.strictEqual(spec.request.preset, 'recon', '省略那一格 ⇒ 角色键自己就是预设名')
+  assert.strictEqual(Object.hasOwn(spec.request, 'toolFilter'), false,
+    '在册 ⇒ 围栏也交给预设树，本包不再叠一层')
+  assert.strictEqual(Object.hasOwn(result, 'presetFallback'), false)
+})
+
+it('降级留痕这一格必须在输出声明里报备 —— 它是「为什么装的不是预设面」的唯一落点', async () => {
+  // 与 commit/merge 那两条同一个判据（见 `assertAllKeysDeclared`）：没报备的话宿主把整份
+  // 回执判成非法，调用方看到的是一句校验报错 —— 而它**盖掉**的正是这条留痕。
+  const h = harness({ tree: true, presets: { recon: { persona: 'R' } } })
+  const value = await run(h.tool, {
+    action: 'run',
+    run: 'r1',
+    nodes: [{ id: 'A', prompt: 'a', preset: 'recon' }],
+  }, caller)
+  assert.equal(typeof value.presetFallback, 'string', '这一档必须真的走到降级')
+  assertAllKeysDeclared(h.tool, value)
+})
 it('run 把节点 preset 的 agentOptions 放进 request——角色自己钉住档位', async () => {
   const seen: unknown[] = []
   let captured: Captured | undefined
@@ -615,46 +853,14 @@ it('run 的节点 preset 没声明 agentOptions 时 request 里没有这个键�
 })
 
 /**
- * 内核 `preset` 槽（0.2.0-rc.2 起逐次派发支持）。
+ * 名册缺席（rosterless 部署）时 `preset` 槽**一个字节都不交给内核**。
  *
- * 这一格与 `persona` / `toolFilter` 是**两件事**：后两者在父的面里做减法，
- * `preset` 换掉整个面 —— 孩子因此能拿到父从来没有过的工具。所以它必须原样落到
- * `startContinuable` 的那个 request 上，而不是被本包自己的表吃掉。
+ * 这一条不是"锦上添花"的边界：内核 `applyChildComposition`（`child-agent.ts:341-346`）
+ * 对「声明了 preset、却没有名册」是**当场抛**的，而 rosterless 是合法部署 ——
+ * 本包因此必须在这里把它接住。判据是 hasOwn 而不是 `=== undefined`：
+ * 物化出来的 `''` 会被宿主当成一个 preset id 去查表并当场抛 not-found。
  */
-it('run 把节点 preset 的内核 preset 名放进 request——孩子显式声明要装哪一支面', async () => {
-  const seen: unknown[] = []
-  let captured: Captured | undefined
-  const ctx = {
-    tools: { register: (d: Captured) => { captured = d; return () => {} } },
-    get: (key: string) => key === 'taskTree'
-      ? { read: () => [], write: async () => {}, step: async () => {}, bind: async () => {} }
-      : undefined,
-    subagents: {
-      resolveMaxDepth: () => 3,
-      startContinuable: async (spec: unknown) => { seen.push(spec); return { childId: 'child-9' } },
-    },
-    userQuestions: { ask: async () => ({ answers: [] }) },
-    systemPrompt: { section: () => () => {} },
-    on: () => () => {},
-  }
-  // 表里的**角色名**是 `recon`，交给内核的是**另一支** preset 名 `recon-face`：
-  // 两者故意不同名，这样「透传的是查表结果而不是模型点的那个名字」才被真的钉住。
-  apply(ctx as never, {
-    provider: 'default',
-    presets: { recon: { persona: 'R', preset: 'recon-face', deny: ['task'] } },
-  })
-  await run(captured as Captured, { action: 'run', run: 'r1', nodes: [{ id: 'n1', prompt: 'go', preset: 'recon' }] }, caller)
-  const spec = seen[0] as { request: Record<string, unknown> }
-  assert.strictEqual(spec.request.preset, 'recon-face',
-    '交给内核的必须是查表得到的 preset 名，不是模型点的角色名')
-  // 声明选面、围栏收窄面，两个动作正交，谁都不许吞掉谁。
-  assert.deepStrictEqual(spec.request.toolFilter, { deny: ['task'] })
-  // `deny` 会按 `toolSectionsForFilter` 折成一段丢弃指令前置在 persona 上，
-  // 所以这里断言的是「身份段本身还在」，而不是逐字相等。
-  assert.ok(String(spec.request.persona).endsWith('R'))
-})
-
-it('没声明内核 preset 时 request 里没有这个键——省略就是继承父的面', async () => {
+it('名册缺席时 request 里没有 preset 这个键——rosterless 部署靠这一格才派得出去', async () => {
   const seen: unknown[] = []
   let captured: Captured | undefined
   const ctx = {
@@ -673,10 +879,9 @@ it('没声明内核 preset 时 request 里没有这个键——省略就是继�
   apply(ctx as never, { provider: 'default', presets: { recon: { persona: 'R' } } })
   await run(captured as Captured, { action: 'run', run: 'r1', nodes: [{ id: 'n1', prompt: 'go', preset: 'recon' }] }, caller)
   const spec = seen[0] as { request: Record<string, unknown> }
-  // 物化出来的 `''` 会被宿主当成一个 preset id 去查表并当场抛 not-found ——
-  // 「继承父」这条默认路径会因此变成硬错误。
   assert.strictEqual(Object.hasOwn(spec.request, 'preset'), false,
-    '省略 preset 必须让这个键缺席，派发请求与改动前逐字段一致')
+    'rosterless 时必须退回 persona + toolFilter，绝不能把 preset 一起交出去')
+  assert.strictEqual(spec.request.persona, 'R', '退回的那条路照旧把 persona 交出去')
 })
 
 it('归一：run 声明 nodes 时先写树再派活，一次调用完成建节点+派活+绑定', async () => {  // 这条原先钉的是 2026-09-30 的改动（dispatch 自己也能写节点）。dispatch 撤掉之后，
@@ -723,7 +928,14 @@ it('归一：run 声明 nodes 时先写树再派活，一次调用完成建节�
     'write must precede bind, and bind must be followed by the in_progress promotion',
   )
   // run 的返回值不报节点：绑给自己派出去的孩子这件事由插件登记，中枢只看 dispatched。
-  assert.deepStrictEqual(result, { status: 'running', run: 'r1', dispatched: ['n1'] })
+  // 这个假上下文没有名册（rosterless），所以一并钉住那一格降级留痕 ——
+  // 它必须与 dispatched 平级地出现，而不是把 dispatched 的形状改掉。
+  assert.deepStrictEqual(result, {
+    status: 'running',
+    run: 'r1',
+    dispatched: ['n1'],
+    presetFallback: 'preset "reader" was declared but no agent-preset roster is loaded; falling back to persona + toolFilter',
+  })
 })
 
 it('派发把节点推成 in_progress——参数描述承诺的迁移必须真发生', async () => {

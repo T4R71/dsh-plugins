@@ -12,8 +12,12 @@
  *   所以是唯一能**加上**父从来没有过的工具的那个槽。
  *
  * 本包仍然自建这张表，理由变了：表要负责把**身份名**（`recon` / `impl` / …）映射成
- * 派发时真正生效的那些槽，其中 `PresetSpec.preset` 是新增的那一格 —— 它在表里是
- * **可选的**，省略时行为与加它之前逐字段一致（子代理照旧 `composeFrom` 继承父的 revision）。
+ * 派发时真正生效的那些槽，其中 `PresetSpec.preset` 是那一格 —— 它在表里**可选**，
+ * **省略即取角色名本身**（`presets.<角色>` 的键就是默认的面名）。
+ *
+ * 一次派发最终走哪条通道交身份，由 {@link chooseIdentityChannel} 在派发那一刻问名册决定：
+ * 名册在册 ⇒ 只交 `preset`（**不交 persona** —— 两条身份段同名同层会让宿主当场抛）；
+ * 名册缺席、或角色不在册 ⇒ 退回老的 persona + toolFilter 平铺，并在返回值里留一行降级痕迹。
  *
  * 内置的 `tool-subagent`（`dsh-tool-subagent/lib/index.js`）也在自己的行配置上开了
  * `preset` 一格，但它一行只能给一套；本包把它提到**逐次可选的预设名**上，这是
@@ -78,12 +82,19 @@ export interface PresetSpec {
    * - `preset` 换掉整个面 —— 它带着那一支自己的 plugin 行与工具表进来，所以
    *   这一格是**唯一能让孩子拿到父从来没有过的工具**的通道。
    *
-   * 省略时的语义**与加这一格之前逐字段一致**：孩子走 `composeFrom` 继承父的 revision。
-   * 这是刻意的 —— 现有配置一个字节都不用改，行为不会漂。
+   * **省略即取角色名自己**（`presets.<角色>` 里那个键）：写 `presets: { recon: {} }`
+   * 与写 `presets: { recon: { preset: 'recon' } }` 是同一个意思。要让孩子装一支**别名的**
+   * 面（角色叫 `recon`、面叫 `recon-face`）才需要显式给出这一格。
    *
-   * 名字必须在内核 `agentPresetRegistry` 里真的注册过：没注册会让**派发当场抛**
-   * （`agent-preset/not-found`），而不是静默退化成继承父。宁可一次派发失败，
-   * 也不要一次笔误变成一次权限提升。
+   * 这一格只是**意图**：真交不交得出去由派发那一刻的名册决定（{@link chooseIdentityChannel}）。
+   * 名册缺席、或这个名字不在册，派发**不抛错** —— 它退回 persona + toolFilter 的老路，
+   * 并在返回值里留一行降级痕迹。理由：rosterless 部署（承载面在 host 平面上）本来就不需要
+   * 声明，把一次笔误升级成一次派发失败反而挡住了那些部署唯一走得通的路；
+   * 而宿主侧对**已声明**的未知 id 是直接抛的（`agent-preset/not-found`），
+   * 所以「声明了却不在册」这件事必须在到达宿主之前就被本包接住。
+   *
+   * 名字在内核 `agentPresetRegistry` 里真的注册过时才生效（`list()` 里查得到，
+   * 且那一行没有被 `broken` 标掉）。
    */
   readonly preset?: string
 }
@@ -104,12 +115,16 @@ export interface PresetAgentOptions {
 }
 
 /**
- * 查表结果，形状与 `SubagentStartRequest` 的五个可选成员逐字对应。
+ * 查表结果，形状与 `SubagentStartRequest` 的可选成员逐字对应。
  *
- * `agentOptions` 只有**直连通道**塞得进去（request 里有这个槽）；名册通道的请求体
- * 逐字只有 `{ name, description, prompt, context, provider, signal }`，装不下它 ——
- * 所以 `dispatchTo` 遇到「声明了 agentOptions 却要走名册」时会降级到直连并留痕，
- * 而不是静默丢掉（丢掉的话，「角色固定强度」就成了一条看不见的失效）。
+ * **两条通道都收 `agentOptions`**，它不是选通道的依据：内核对
+ * `resolveChildAgentOptions(parent, request.agentOptions, childDepth, childPresetAgentOptions(parent, request.preset))`
+ * （`subagent/src/continuation.ts:121-126`）一次算三样 —— 请求体里那一格照旧读，
+ * 预设自己声明的档位由 `agentOptionsFor(declaredPreset ?? composedPreset(parent))` 现查
+ * （`subagent/src/child-agent.ts:107-111`）。
+ * 层序是「父 → requested → preset 声明」（`child-agent.ts:151-169`），preset 最强 ——
+ * 也就是说走预设时 `agentOptions` 不但传得进去，还优先于调用方那一格。
+ * 所以这里**不存在**因为身份通道而丢档位的情况，也没有对应的降级。
  */
 export interface ResolvedPreset {
   readonly persona?: string
@@ -117,8 +132,118 @@ export interface ResolvedPreset {
   readonly maxDepth?: number
   readonly drop?: readonly string[]
   readonly agentOptions?: PresetAgentOptions
-  /** 内核 preset 名。省略即孩子继承父的面（与加这一格之前逐字段一致）。 */
+  /**
+   * 解析出来的面容器：内核 preset 名。
+   *
+   * 与 `PresetSpec.preset` 不同，这里**不会缺席**（只要身份名解析出来了）——
+   * `resolvePreset` 把「没写」补成生效的角色名自己。真交不交得出去另说：
+   * 派发那一刻由 {@link chooseIdentityChannel} 问名册，问不到就走
+   * `persona` + `toolFilter` 那条老路。
+   */
   readonly preset?: string
+}
+
+/**
+ * 名册服务的最小面：**只读地问一次「这个名字在不在册」**。
+ *
+ * 与 `UserQuestionsSurface`（`index.ts`）同一种写法：本包**不 import**
+ * `@deepseek-ai/dsh-agent-preset-registry`。那是宿主的运行时依赖，写进本包的
+ * public 类型面会让声明文件生成报 TS2883（同一个理由见 {@link PresetAgentOptions}）；
+ * 而且 rosterless 部署（把预设树整块省掉的那些）根本没有这个服务 ——
+ * 编译期硬依赖会让本包在那些部署里装不上。
+ *
+ * 本包**机会式**消费它：拿得到就按名字走 preset 通道，拿不到就降级。
+ * 但降级必须**显式留痕**，不许静默 —— 静默失效的面正是本项要消灭的东西。
+ */
+export interface AgentPresetRosterPort {
+  /**
+   * 名册里现有的每一支。
+   *
+   * 实现见内核 `agent-preset-registry/src/index.ts` 的 `list()`：**纯读**，
+   * 每一行现算 `diagnostic` 并挂 `broken`（装载失败被记进那一行的字符串里，不是抛出来）。
+   *
+   * **调用时机有一条硬约束**（内核那份 JSDoc 写着的）：`diagnostic` 在行还在等
+   * Host 服务时会 `await this.owner.loader.await()`，所以调用方**不能跑在某个 Host 行自己的
+   * 激活过程里** —— 那会等自己，形成死锁。本包只在一件事上调用它：**派发那一刻**
+   * （工具执行期、或结算之后的自动放行），两者都在行激活之外，正是这份 JSDoc 允许的位置。
+   * @returns 名册快照；至少含 `id`。
+   */
+  list(): Promise<readonly { readonly id: string; readonly broken?: string }[]>
+}
+
+/** 交身份的两条通道。 */
+export type IdentityChannel =
+  | {
+      /** 名册在册：把孩子**整支面**交给宿主，`preset` 是唯一要传的那个槽。 */
+      readonly kind: 'preset'
+      /** 真正要交给宿主的 preset id。 */
+      readonly id: string
+    }
+  | {
+      /** 名册那条路走不通：退回 `persona` + `toolFilter` 的减法。 */
+      readonly kind: 'fallback'
+      /** 为什么退。 */
+      readonly reason: 'roster-absent' | 'not-in-roster' | 'roster-entry-broken'
+      /** 给人看的一行原因（含真实报错或可用名字），进返回值留痕。 */
+      readonly detail: string
+    }
+
+/**
+ * 决定这次派发走哪条通道交身份。
+ *
+ * **为什么是「问名册」而不是「直接交出去试试」**：宿主对**已声明**的未知 id 是直接抛的
+ * （`child-agent.ts` 的 `retain()` → `agent-preset/not-found`），而「无 roster 却声明了
+ * preset」更狠 —— 当场抛 `child preset "X" was declared but no agent-preset roster is
+ * composed`。两条都不会静默退化，但都会把一次**配置笔误**升级成一次**派发失败**，
+ * 而 rosterless 部署里「声明的名字问不到」是**常态而非错误**。所以判断必须在这里做：
+ * 名册问得到且名字在册才走 preset，否则退回减法。
+ *
+ * `roster.list()` 自己抛也归 `roster-absent`：拿不到名册与没有名册，对本函数是同一件事。
+ * @param roster - 名册服务；`undefined` 表示这个部署没装。
+ * @param wanted - 想交出去的名字；`undefined` 表示这次派发**没有任何身份**（纯减法）。
+ * @returns 选定的通道；`wanted` 缺席时返回 `undefined`（无身份可言，也就无降级可言）。
+ */
+export async function chooseIdentityChannel(
+  roster: AgentPresetRosterPort | undefined,
+  wanted: string | undefined,
+): Promise<IdentityChannel | undefined> {
+  if (wanted === undefined) return undefined
+  if (roster === undefined) {
+    return {
+      kind: 'fallback',
+      reason: 'roster-absent',
+      detail: `preset "${wanted}" was declared but no agent-preset roster is loaded; falling back to persona + toolFilter`,
+    }
+  }
+  let known: readonly { readonly id: string; readonly broken?: string }[]
+  try {
+    known = await roster.list()
+  } catch (error) {
+    return {
+      kind: 'fallback',
+      reason: 'roster-absent',
+      detail: `agent-preset roster could not be read (${String(error)}); falling back to persona + toolFilter`,
+    }
+  }
+  const entry = known.find(item => item.id === wanted)
+  if (entry === undefined) {
+    const available = known.map(item => item.id).sort()
+    return {
+      kind: 'fallback',
+      reason: 'not-in-roster',
+      detail: `preset "${wanted}" is not in the agent-preset roster (available: ${available.length > 0 ? available.join(', ') : '(none)'}); falling back to persona + toolFilter`,
+    }
+  }
+  // `broken` 那一行**装不起来**（内核 `list()` 里现算出来的诊断）：交出去只会让孩子
+  // 在装配时炸掉，而且是在孩子自己的作用域里炸 —— 比在这里退回减法难查得多。
+  if (entry.broken !== undefined) {
+    return {
+      kind: 'fallback',
+      reason: 'roster-entry-broken',
+      detail: `preset "${wanted}" is registered but broken (${entry.broken}); falling back to persona + toolFilter`,
+    }
+  }
+  return { kind: 'preset', id: entry.id }
 }
 
 /** 工具说明段的名字前缀。各工具插件把自己的说明注册成 `${TOOL_SECTION_PREFIX}${工具名}`。 */
@@ -218,7 +343,7 @@ export class EmptyPresetFilterError extends Error {
 }
 
 /**
- * 把一个预设名解析成 start request 的三个可选成员。
+ * 把一个预设名解析成 start request 的可选成员，外加那一格**生效的 preset 名**。
  *
  * `undefined` 走的是 `fallback`（默认 `'lead'`）——**不再是「继承父代理」**：实测过一次
  * 无 preset 的派发，子会话的首段逐字是父的 persona（含"总纲（用户至上）"与已废弃的
@@ -226,7 +351,8 @@ export class EmptyPresetFilterError extends Error {
  * 没点名就按中枢那一支走。
  *
  * `fallback` 本身也不在表里时返回 `{}`（真·继承父）——那是配置残缺，不是本函数的兜底设计。
- * 查不到**显式给的**名字一律抛 {@link UnknownPresetError}。
+ * 查不到**显式给的**名字一律抛 {@link UnknownPresetError}。这唯一一条「返回 `{}`」的路
+ * 是 `preset` 唯一会缺席的场合：没有身份名，也就没有预设名可言。
  * @param presets - 本行 Config 里的身份表。
  * @param name - 模型给的身份名，或 undefined。
  * @param fallback - 没给名字时用的身份名。
@@ -267,9 +393,11 @@ export function resolvePreset(
     // 多出一个空对象虽然当前无害，但会让「省略 = 继承父的路由」与「显式给空 = ???」
     // 在输出里长得一样 —— 本文件已经因为物化栽过一次（见 EmptyPresetFilterError 的来由）。
     ...spec.agentOptions !== undefined ? { agentOptions: { ...spec.agentOptions } } : {},
-    // 同一处理：省略就是**不带这个键**，让宿主走 `composeFrom` 继承父。
-    // 物化成 `''` 会被宿主当成一个 preset id 去查表，然后当场抛 not-found。
-    ...spec.preset !== undefined ? { preset: spec.preset } : {},
+    // 省略时**取生效的角色键自己**（`target`），不物化成 `''`：物化空串会被宿主当成一个
+    // preset id 去查表，然后当场抛 not-found。取 `target` 而不是按老写法省略这个键，
+    // 是因为「没写这一格」的语义是**用角色名当预设名**，不是「不要身份」——
+    // 要不要真交出去由派发那刻的 {@link chooseIdentityChannel} 问名册决定。
+    preset: spec.preset ?? target,
   }
 }
 

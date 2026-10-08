@@ -9,9 +9,11 @@
 import assert from 'node:assert/strict'
 import { it } from 'node:test'
 import {
+  chooseIdentityChannel,
   EmptyPresetFilterError,
   resolvePreset,
   UnknownPresetError,
+  type AgentPresetRosterPort,
   type PresetSpec,
 } from '../src/presets.ts'
 import { Config } from '../src/index.ts'
@@ -73,7 +75,7 @@ it('显式给空围栏是配置 bug，直接拒——照上游 tools.restrict �
   assert.throws(() => resolvePreset({ empty: { allow: [] } }, 'empty'), EmptyPresetFilterError)
   assert.throws(() => resolvePreset({ empty: { deny: [] } }, 'empty'), EmptyPresetFilterError)
   // 但「两个都没给」与「给了空数组」是两件事：前者合法，后者是 bug。
-  assert.deepStrictEqual(resolvePreset({ ok: {} }, 'ok'), {})
+  assert.deepStrictEqual(resolvePreset({ ok: {} }, 'ok'), { preset: 'ok' })
 })
 
 it('返回的数组是副本——调用方改不动配置表', () => {
@@ -101,7 +103,7 @@ it('省略 allow/deny 的 preset 真的能继承全部工具——物化曾让�
   assert.strictEqual(spec.allow, undefined)
   assert.strictEqual(spec.deny, undefined)
   // 再钉住解析结果：没有 toolFilter，就是继承父的全部工具
-  assert.deepStrictEqual(resolvePreset(parsed.presets, 'lead'), { persona: 'x', maxDepth: 3 })
+  assert.deepStrictEqual(resolvePreset(parsed.presets, 'lead'), { persona: 'x', maxDepth: 3, preset: 'lead' })
 })
 
 it('显式 allow: [] 仍然 fail closed——修 schema 没有顺手放开这条护栏', () => {
@@ -168,8 +170,9 @@ it('没声明 agentOptions 时结果里没有这个键——省略就是继承�
   assert.deepStrictEqual(resolvePreset(TABLE, 'reader'), {
     persona: 'You only read.',
     toolFilter: { allow: ['read', 'grep', 'glob'] },
+    preset: 'reader',
   })
-  assert.deepStrictEqual(resolvePreset({ plain: {} }, 'plain'), {})
+  assert.deepStrictEqual(resolvePreset({ plain: {} }, 'plain'), { preset: 'plain' })
 })
 
 it('Config schema 收下 agentOptions，且省略时不物化', () => {
@@ -188,13 +191,14 @@ it('Config schema 收下 agentOptions，且省略时不物化', () => {
   })
   // ② 省略的保持缺席：既不在 schema 输出里，也不在解析结果里。
   assert.strictEqual(parsed.presets['impl']?.agentOptions, undefined)
-  assert.deepStrictEqual(resolvePreset(parsed.presets, 'impl'), { persona: 'i' })
+  assert.deepStrictEqual(resolvePreset(parsed.presets, 'impl'), { persona: 'i', preset: 'impl' })
 })
 
 it('resolvePreset 透传 drop', () => {
-  assert.deepStrictEqual(resolvePreset({ scout: { drop: ['plan:policy'] } }, 'scout'), { drop: ['plan:policy'] })
+  assert.deepStrictEqual(resolvePreset({ scout: { drop: ['plan:policy'] } }, 'scout'),
+    { drop: ['plan:policy'], preset: 'scout' })
   // 空数组不产生字段：空 drop 与"没写 drop"是同一件事。
-  assert.deepStrictEqual(resolvePreset({ scout: { drop: [] } }, 'scout'), {})
+  assert.deepStrictEqual(resolvePreset({ scout: { drop: [] } }, 'scout'), { preset: 'scout' })
 })
 
 /**
@@ -210,12 +214,23 @@ it('resolvePreset 透传内核 preset 名', () => {
     { persona: 'r', preset: 'recon' },
   )
 })
-
-it('省略 preset 时结果里没有这个键——省略就是继承父的面', () => {
-  // 与 agentOptions 同一条判据：物化出来的 `''` 会被宿主当成一个 preset id 去查表，
-  // 然后当场抛 not-found —— 「继承父」这条默认路径会因此变成硬错误。
+it('省略 preset 时取角色键自己——「没写这一格」是「用角色名当预设名」，不是「不要身份」', () => {
+  // 与 agentOptions 的判据不同：那一格省略就是真·缺席（继承父的路由），
+  // 这一格省略必须**填上角色键**。理由在派发那刻：`preset` 到底交不交得出去由
+  // `chooseIdentityChannel` 问名册决定，而「要不要问」这件事本身需要一个名字 ——
+  // 省略成 `''` 会被宿主当成一个 id 去查表然后当场抛，省略成「键不存在」则等于
+  // 悄悄退回 persona + toolFilter，把 rosterless 与「本来就不打算用预设」混成一种。
   const resolved = resolvePreset({ lead: { persona: 'l' } }, 'lead')
-  assert.deepStrictEqual(resolved, { persona: 'l' })
+  assert.deepStrictEqual(resolved, { persona: 'l', preset: 'lead' })
+})
+
+it('表里写了 preset 时以它为准，不取角色键——角色名与预设名本来就是两件事', () => {
+  assert.strictEqual(resolvePreset({ lead: { preset: 'central' } }, 'lead').preset, 'central')
+})
+
+it('name 与 fallback 都给不出来时 preset 才缺席——那是唯一没有身份可言的场合', () => {
+  const resolved = resolvePreset({ lead: {} }, undefined)
+  assert.deepStrictEqual(resolved, {})
   assert.strictEqual(Object.hasOwn(resolved, 'preset'), false)
 })
 
@@ -238,7 +253,61 @@ it('Config schema 收下 preset，且省略时不物化', () => {
   // ① schema 少这一格的话，配置表里写下的 preset 会被悄悄吃掉，孩子静默继承父的面。
   assert.strictEqual(parsed.presets['recon']?.preset, 'recon-face')
   assert.deepStrictEqual(resolvePreset(parsed.presets, 'recon'), { persona: 'r', preset: 'recon-face' })
-  // ② 省略的保持缺席，而不是被物化成空串。
+  // ② 省略的保持缺席，而不是被物化成空串；解析时按角色键补上。
   assert.strictEqual(parsed.presets['impl']?.preset, undefined)
-  assert.deepStrictEqual(resolvePreset(parsed.presets, 'impl'), { persona: 'i' })
+  assert.deepStrictEqual(resolvePreset(parsed.presets, 'impl'), { persona: 'i', preset: 'impl' })
+})
+
+/**
+ * 交身份的两条通道，四条出口逐条钉住。
+ *
+ * 这一族是**纯函数**测试：`chooseIdentityChannel` 不碰宿主，只问一次名册。
+ * 关键判据是「**问不到就退回减法，并且把原因说清楚**」——
+ * 降级本身合法（rosterless 是正常部署），静默降级才是要消灭的东西。
+ */
+it('名册在册 → 走 preset 通道，交出去的是名册里那一行的 id', async () => {
+  const roster: AgentPresetRosterPort = { list: async () => [{ id: 'lead' }, { id: 'recon' }] }
+  assert.deepStrictEqual(await chooseIdentityChannel(roster, 'recon'), { kind: 'preset', id: 'recon' })
+})
+
+it('没有名册服务 → 退回减法，原因是 roster-absent', async () => {
+  const channel = await chooseIdentityChannel(undefined, 'recon')
+  assert.equal(channel?.kind, 'fallback')
+  assert.equal(channel?.kind === 'fallback' ? channel.reason : undefined, 'roster-absent')
+  assert.match(channel?.kind === 'fallback' ? channel.detail : '', /recon.*no agent-preset roster/s)
+})
+
+it('名字不在册 → 退回减法，并把册子里有的名字列出来（available）', async () => {
+  const roster: AgentPresetRosterPort = { list: async () => [{ id: 'lead' }] }
+  const channel = await chooseIdentityChannel(roster, 'recon')
+  assert.equal(channel?.kind === 'fallback' ? channel.reason : undefined, 'not-in-roster')
+  assert.match(channel?.kind === 'fallback' ? channel.detail : '', /available: lead\b/)
+})
+
+it('册子是空的也要给得出「(none)」——不能只留一个空括号', async () => {
+  const channel = await chooseIdentityChannel({ list: async () => [] }, 'recon')
+  assert.match(channel?.kind === 'fallback' ? channel.detail : '', /available: \(none\)/)
+})
+
+it('名册读不动（list 抛）→ 与没有名册同等对待，原因也是 roster-absent', async () => {
+  const roster: AgentPresetRosterPort = {
+    list: async () => { throw new Error('registry exploded') },
+  }
+  const channel = await chooseIdentityChannel(roster, 'recon')
+  assert.equal(channel?.kind === 'fallback' ? channel.reason : undefined, 'roster-absent')
+  assert.match(channel?.kind === 'fallback' ? channel.detail : '', /registry exploded/)
+})
+
+it('那一行是 broken 的 → 同样退回减法：交出去只会让孩子在装配时炸', async () => {
+  const roster: AgentPresetRosterPort = { list: async () => [{ id: 'recon', broken: 'plugin "x" is missing' }] }
+  const channel = await chooseIdentityChannel(roster, 'recon')
+  assert.equal(channel?.kind === 'fallback' ? channel.reason : undefined, 'roster-entry-broken')
+  assert.match(channel?.kind === 'fallback' ? channel.detail : '', /plugin "x" is missing/)
+})
+
+it('没有任何身份名时返回 undefined——没有身份，也就没有降级可言', async () => {
+  // 这一格与上面那些「降级」不是一回事：`resolvePreset` 返回 `{}` 那条路里
+  // 本来就没有身份要交，留痕会变成一次假警报。
+  assert.strictEqual(await chooseIdentityChannel({ list: async () => [] }, undefined), undefined)
+  assert.strictEqual(await chooseIdentityChannel(undefined, undefined), undefined)
 })
