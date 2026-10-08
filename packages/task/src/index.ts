@@ -24,7 +24,17 @@
  * 逐次派发**支持预设名**（0.2.0-rc.2 起 `SubagentStartRequest` 有 `preset?: string` 槽），
  * 所以预设名有两层含义、别混：本包自建的那张表（见 `./presets.ts`）管「角色名 → 一组槽」，
  * 其中 `PresetSpec.preset` 那一格才是**交给内核的 preset 名**（孩子显式要装哪一支面）。
- * 表里省略 `preset` 时行为与加它之前逐字段一致：孩子照旧 `composeFrom` 继承父的 revision。
+ *
+ * **两条通道，派发那刻问名册定**（{@link chooseIdentityChannel}）：
+ * - 名册在册 ⇒ 只交 `preset`，孩子整支面由预设树装配 —— **同一个请求里不能再有 `persona`**：
+ *   内核 `child-agent.ts:360-366` 会在 child 的 scope 层注册 `deployment:persona-prefix`，
+ *   而预设树里的 `@deepseek-ai/dsh-persona` 注册的正是同一个名字（`persona/src/index.ts:63-68`），
+ *   同层重名直接抛 `prompt section "deployment:persona-prefix" is already registered in this scope`。
+ * - 名册缺席、名字不在册、或那一行 `broken` ⇒ 退回 `persona` + `toolFilter` 的减法，
+ *   并在返回值里留一行 `presetFallback`（rosterless 是合法部署，但它不是静默少交身份的理由）。
+ *
+ * `maxDepth` 与 `agentOptions` **两条通道都照传**：内核一次算三样
+ * （`continuation.ts:121-126`），preset 层的档位反而优先级最高（`child-agent.ts:151-169`）。
  *
  * **唯一的路是 `ctx.subagents`**（Agent Teams 已于 2026-10-02 整条摘掉）：派发配方逐字对齐内置 `tool-subagent`
  * （`dsh-tool-subagent/lib/index.js:509-532`）：`parent` 取 `exec.agent`，`persona` / `toolFilter` /
@@ -87,8 +97,8 @@ import { SessionId } from '@deepseek-ai/dsh-session'
 // 解法是在读取判别式的那一处把联合**放宽成 `string`**（见快照失效那条监听器）：
 // 判别式在运行时本来就是字符串，读它不需要知道联合的全部成员。
 import type { Dict } from '@deepseek-ai/cosmokit'
-import { allowToolSectionFilter, decodeDropDirective, encodeDropDirective, resolvePreset, toolSectionsForFilter } from './presets.ts'
-import type { PresetAgentOptions, PresetSpec } from './presets.ts'
+import { allowToolSectionFilter, chooseIdentityChannel, decodeDropDirective, encodeDropDirective, resolvePreset, toolSectionsForFilter } from './presets.ts'
+import type { AgentPresetRosterPort, IdentityChannel, PresetAgentOptions, PresetSpec } from './presets.ts'
 
 export { PRESETS_FIELD, resolvePreset, UnknownPresetError, EmptyPresetFilterError } from './presets.ts'
 export type { PresetSpec, ResolvedPreset } from './presets.ts'
@@ -487,7 +497,13 @@ export interface PresetSpecField {
   deny?: string[]
   maxDepth?: number
   agentOptions?: PresetAgentOptionsField
-  /** 内核 preset 名（{@link PresetSpec.preset}）。省略即孩子继承父的面。 */
+  /**
+   * 内核 preset 名（{@link PresetSpec.preset}）。**省略即取角色键自己当预设名**，
+   * 不是「不要身份」—— 要不要真交出去由派发那刻的名册决定：
+   * 在册就把这个名字当 `preset` 交给宿主（孩子整支面由预设树装配），
+   * 问不到（rosterless / 不在册 / 那一行坏了）就退回 `persona` + `allow`/`deny` 的减法，
+   * 并在返回值里落一格 `presetFallback` 留痕。
+   */
   preset?: string
 }
 
@@ -522,7 +538,7 @@ export const Config: z<{ provider: string; defaultRules?: string; presets: Dict<
    * 空串（默认）表示这一段不存在，行为与加这一项之前一字不差。
    */
   defaultRules: z.string().default(''),
-  /** 预设名 → persona + 工具围栏 + 深度上限。 */
+  /** 预设名 → persona + 工具围栏 + 深度上限 + 内核 preset 名（`preset`，省略即取角色键自己）。 */
   presets: z.dict(z.object({
     persona: z.string(),
     // `.default(undefined)` 不是装饰：schemastery 会把**省略的**数组物化成 `[]`，
@@ -621,6 +637,7 @@ interface UserQuestionsSurface {
   }): Promise<{ answers: readonly UserQuestionAnswerItem[] }>
 }
 
+/** 名册服务的最小面与通道判定都在 `./presets.ts` 里，这里只是把它挂到 Context 上。 */
 declare module '@deepseek-ai/cordis' {
   interface Context {
     /**
@@ -628,7 +645,54 @@ declare module '@deepseek-ai/cordis' {
      * 而不是返回一个模型会读成「已问过」的空答案。
      */
     userQuestions?: UserQuestionsSurface
+    /**
+     * 可选的预设名册：**rosterless 部署**（把预设树整块省掉的那些）里它缺席。
+     *
+     * 与 `userQuestions` 同一档的软依赖 —— 所以本插件**只机会式消费**它：拿得到就把
+     * 身份名当 preset 交给宿主，拿不到就退回 `persona` + `toolFilter` 的减法。
+     * 但「拿不到」不等于「可以悄悄少交身份」：那条路上每一次降级都会**留痕**，
+     * 见 {@link chooseIdentityChannel} 与派发返回值的 `presetFallback`。
+     *
+     * 反过来也不能 fail-loud 成「没名册就报错」：内核 `child-agent.ts` 的注释写着，
+     * 声明了 preset 却没有名册是**当场抛错**的（`child preset "X" was declared but no
+     * agent-preset roster is composed`），而 rosterless 属于合法部署 —— 把常态升级成
+     * 派发失败，等于让本插件在那些部署里根本不能用。
+     */
+    agentPresets?: AgentPresetRosterPort
   }
+}
+
+/**
+ * 一次节点派发的结果。
+ *
+ * 为什么不直接返回一个 `childId` 字符串：派发那一刻要**问一次名册**才能决定身份走哪条通道
+ * （见 {@link chooseIdentityChannel}），而「这个部署没有名册 / 这个名字不在册」时的降级
+ * 必须留痕 —— 降级本身是正常的（rosterless 是合法部署），但**悄悄**降级不是：调用方会以为
+ * 孩子装的是那一支预设面，实际装的是减法拼出来的另一张面。
+ *
+ * 没降级时 `presetFallback` 这个键**整个省掉**，不写成 undefined：它要随工具返回值出去，
+ * 而返回值过的是无损 JSON 序列化器（理由见 {@link settleDispatch} 里那段注释）。
+ */
+interface DispatchedNode {
+  /** 这一次派出去的孩子。 */
+  readonly childId: string
+  /** 这一次的降级留痕（`chooseIdentityChannel` 给的那句英文原话）；没降级则缺席。 */
+  readonly presetFallback?: string
+}
+
+/**
+ * 一轮「把现在就能派的节点都派出去」的结果。
+ *
+ * `presetFallback` 是**这一轮里所有降级原因的去重合集**（按节点声明顺序，`' ｜ '` 连接）：
+ * 同一轮里几个节点先后降级、原因又一样（rosterless 部署就是这种）时，同一句话重复几遍
+ * 只是噪声；而原因不同（比如一支在册、一支不在）时必须都留着 —— 只报第一条会让调用方
+ * 以为整条流水线都栽在同一个原因上。
+ */
+interface ReleasedNodes {
+  /** 真的派出去的节点 id，顺序 = run 里节点的声明顺序。 */
+  readonly dispatched: string[]
+  /** 这一轮的降级留痕；一个节点都没降级时**整个键省掉**。 */
+  readonly presetFallback?: string
 }
 
 /** 任务树的读取面。**这是本工具对 plan-tree 的唯一依赖**，形状刻意收窄成四个方法。 */
@@ -1755,7 +1819,7 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
    * @param parent - 派发的父 Agent（必须是当刻活着的 Agent 本身）。
    * @param spec - 简报、身份、标签与要绑的节点。
    * @param signal - 调用方的取消信号；自动放行给的是永不取消的那一个。
-   * @returns 工具返回值形态的结果（`settleDispatch` 的产出）。
+   * @returns 工具返回值形态的结果（`settleDispatch` 的产出），降级时多一格 `presetFallback`。
    */
   const dispatchTo = async (
     parent: Agent,
@@ -1774,25 +1838,43 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
       readonly worktree?: WorktreeRecord
     },
     signal: AbortSignal,
-  ): Promise<{ task_id: string; node?: string; status: string; result?: string }> => {
+  ): Promise<{ task_id: string; node?: string; status: string; result?: string; presetFallback?: string }> => {
     assertCanDelegate(parent)
     const preset = resolvePreset(config.presets, spec.preset, DEFAULT_PRESET)
     // **实际生效的 preset 键**：显示层（树标题 / 提问卡片前缀 / label 之外的）一律以它为准，
     // 不以调用方自由填的 `spec.label` 为准 —— 两者不一致时，label 只是个活名，身份是这一支。
     // 与 `resolvePreset` 同一处取值，所以「显示的身份」与「真正跑的身份」不可能再分叉。
     const effectiveKey = spec.preset ?? DEFAULT_PRESET
+    // **交身份走哪条通道，问名册定**（理由整段见 `chooseIdentityChannel` 的 JSDoc）：
+    // 宿主对**已声明**的未知 id 直接抛 `agent-preset/not-found`，"声明了却没有名册"更狠、
+    // 当场抛。两条都会把一次配置笔误升级成一次派发失败，而 rosterless 部署里
+    // 「问不到」是常态 —— 所以判断必须在派发**之前**在这里做完。
+    const channel: IdentityChannel | undefined = await chooseIdentityChannel(ctx.get('agentPresets'), preset.preset)
+    // 降级留痕：只在**本来要交身份、却交不出去**时才有。`channel === undefined` 是
+    // 「表里连身份名都没有」（`resolvePreset` 返回 `{}` 那一路），那不是降级，一个字都不留。
+    const fallbackTrace = channel?.kind === 'fallback' ? channel.detail : undefined
     // 丢弃指令随 persona 一起旅行。`drop` 给了就必须拼，哪怕 persona 本身是空的 ——
     // "只丢段、不加人格"是合法用法。
     // 注意：这里必须用 encodeDropDirective 的返回值当 persona，**不能再叠一次**
     // preset.persona —— 指令文本只能有一份，否则解码只剥掉最前面那条。
     // 丢弃列表 = 手写的 drop + deny 掉的那些工具的说明段。
-    // 只走直连一条路：这份 persona 由下面 request 的那个槽携带。
+    //
+    // **走预设通道时这套一个字都用不上**：预设树自带身份段，而 persona 那一路
+    // 在同一个 scope 层重名注册 `deployment:persona-prefix` 会当场抛
+    // （内核 `child-agent.ts:360-366` 与 `persona/src/index.ts:63-68` 注册的是同一个名字）。
+    // 减法丢弃指令也一样 —— 它本来就是「在父给的面里做减法」，而预设换的是整支面。
     const drops = [...preset.drop ?? [], ...toolSectionsForFilter(preset.toolFilter)]
     const persona = drops.length > 0
       ? encodeDropDirective(drops, preset.persona ?? '')
       : preset.persona
-    // 派发**只有直连一条路**（Agent Teams 已于 2026-10-02 整条摘掉）：
-    // persona / toolFilter / maxDepth / agentOptions / preset 五个槽由下面的 request 一次交齐。
+    // **两条通道互斥**：在册就只交 `preset`（孩子整支面由预设树装配），否则才平铺
+    // persona + toolFilter。两者同时出现不是「更保险」，是**当场抛错**（见上面那段）。
+    //
+    // 取的是 `preset.preset`（表里那格查出来的内核名），不是 `spec.preset`
+    // （调用方点的**角色名**）：两者可能不同名，把角色名直接交给内核会让查表失败。
+    const presetSlot = channel?.kind === 'preset' ? { preset: channel.id } : undefined
+    // `maxDepth` 与 `agentOptions` 两条通道都照传：内核一次算三样
+    // （`continuation.ts:121-126`），且预设自己声明的档位优先级最高（`child-agent.ts:151-169`）。
     const maxDepth = ctx.subagents.resolveMaxDepth(preset.maxDepth)
     const request: Omit<SubagentStartRequest, 'label' | 'signal' | 'outputSchema'> = {
       ...spec.label !== undefined ? { label: spec.label } : {},
@@ -1804,19 +1886,20 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
         spec.concise === true,
       ) }],
       parent,
-      ...persona !== undefined ? { persona } : {},
-      ...preset.toolFilter !== undefined ? { toolFilter: preset.toolFilter } : {},
-      // **面本身**走这里，是唯一能让孩子拿到父从来没有过的工具的那个槽。
-      // 注意取的是 `preset.preset`（表里那格查出来的内核名），不是 `spec.preset`
-      // （调用方点的**角色名**）：两者可能不同名，把角色名直接交给内核会让查表失败。
-      ...preset.preset !== undefined ? { preset: preset.preset } : {},
+      ...(presetSlot ?? {}),
+      ...presetSlot !== undefined ? {} : {
+        ...persona !== undefined ? { persona } : {},
+        ...preset.toolFilter !== undefined ? { toolFilter: preset.toolFilter } : {},
+      },
       ...maxDepth !== undefined ? { maxDepth } : {},
       // 角色固定的档位走这里。宿主那侧是**逐字段覆盖**父的
       // `provider/model/reasoningEffort/maxTokens`，所以只写 `reasoningEffort` 时
       // 路由（provider/model）原样继承父的 —— 最安全的用法，本包不替调用方加默认。
       ...preset.agentOptions !== undefined ? { agentOptions: narrowAgentOptions(preset.agentOptions) } : {},
     }
-    const allowTools = preset.toolFilter?.allow
+    // 白名单遮蔽只在直连通道装：走预设时工具面由那一支自己的 plugin 行决定，
+    // 这里再装一层 `allow` 影子等于拿本包的表去覆盖预设树的选择。
+    const allowTools = presetSlot === undefined ? preset.toolFilter?.allow : undefined
     // **id 先于孩子存在**：宿主允许调用方自己定这一个
     // （`dsh-subagent/lib/index.js:1677` 的 `spec.childId ?? brandString(randomUUID())`），
     // 而这一步是本插件唯一能把三处登记**放到孩子第一次装配之前**的办法。
@@ -1870,7 +1953,11 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
       forgetChild(String(childId))
       registerChild(String(started.childId))
     }
-    return await settleDispatch({ agent: parent }, spec.bind, started.childId)
+    const settled = await settleDispatch({ agent: parent }, spec.bind, started.childId)
+    // 降级留痕**只在真的降级时**多出这一格（见 {@link DispatchedNode}）：`fallbackTrace`
+    // 是 `undefined` 就原样返回，绝不写成 `{ presetFallback: undefined }` —— 返回值过的是
+    // 无损 JSON 序列化器，那个形状会当场炸。
+    return fallbackTrace === undefined ? settled : { ...settled, presetFallback: fallbackTrace }
   }
   /**
    * 本插件**派出过**的子会话（childId = 它自己的 session id）。
@@ -1949,6 +2036,10 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
    * 边界：只有那两种前缀才动（其它 detail 是调用方自己写的，也会在结算时被结论覆盖）；
    * 任何失败都只进日志 —— 这一步跑在派发**成功之后**，一次树写失败绝不能反过来把账本回滚成
    * pending（那样账本会说谎：孩子已经在干了）。
+   *
+   * 降级留痕**不写进这里**：它是「身份没交出去」这件事，落点是**返回值**那一格
+   * `presetFallback`（见 {@link dispatchTo}）。往 detail 上追加会让每一次 rosterless
+   * 派发都在面板上多一长串英文，而那一格是给人读节点状态的。
    * @param sid - 父会话 id。
    * @param node - 刚派出去的那个节点。
    * @param hadUpstream - 这个节点有没有上游结论（有 needs 就有）。
@@ -1989,9 +2080,9 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
    * @param sid - 父会话 id。
    * @param run - 这条节点属于哪条 run（上游结论要按它的节点表找 childId）。
    * @param node - 要派的节点。
-   * @returns 子会话 id；没派出去时为 undefined。
+   * @returns 派出去了就是 `{ childId }`（这一次降级了则多一格 `presetFallback`）；没派出去时 undefined。
    */
-  const dispatchRunNode = async (parent: Agent, sid: string, run: RunRecord, node: RunNodeRecord): Promise<string | undefined> => {
+  const dispatchRunNode = async (parent: Agent, sid: string, run: RunRecord, node: RunNodeRecord): Promise<DispatchedNode | undefined> => {
     // 账本服务**在起孩子之前**拿到手：服务缺席时这一步就抛，绝不留下一个派出去、
     // 却永远记不进账本的节点。回滚与记账用的是同一个句柄。
     const ledger = runs()
@@ -2009,7 +2100,9 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
         if (!written) return undefined
         inflightDispatches.delete(memoKey)
         await writeNodeFact(sid, node.id, node.needs.length > 0 ? DISPATCHED_DETAIL_WITH_UPSTREAM : DISPATCHED_DETAIL)
-        return inflightChild
+        // 没降级可报：这一次根本没有再派发（孩子是上一次派出去的，这里只补了一次账本写入），
+        // 「装了哪张面」是上一次派发那一刻就定下的事实，不该在这里编一个出来。
+        return { childId: inflightChild }
       }
       // 账本里这一格已经不是 pending：表项完成使命（或已被别的路径补上），清掉。
       // 仍然**不新派** —— 这一格已经有主了。
@@ -2059,10 +2152,14 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
         ctx.logger?.warn?.('task run "' + run.id + '": node "' + node.id + '" was dispatched as child '
           + started.task_id + ' but the ledger did not record it; this process will not dispatch it again')
         await writeNodeFact(sid, node.id, INFLIGHT_DETAIL_PREFIX + started.task_id)
-        return started.task_id
+        return { childId: started.task_id }
       }
       await clearStaleDetail(sid, node, node.needs.length > 0)
-      return started.task_id
+      // 降级留痕一路往上带回返回值（理由见 {@link DispatchedNode}）：本函数只负责派发，
+      // 「要不要在面板上留一行」由调用方按自己的返回值形状决定。
+      return started.presetFallback === undefined
+        ? { childId: started.task_id }
+        : { childId: started.task_id, presetFallback: started.presetFallback }
     } catch (error) {
       // 派发失败**必须留痕**：记账回滚成 pending 是对的（孩子根本没起来），但只在宿主日志里
       // 写一行就等于没有 —— 面板上看不出任何区别，「节点一直 pending」会被当成「依赖没满足」。
@@ -2137,18 +2234,27 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
    * @param parent - 当刻活着的父 Agent。
    * @param sid - 父会话 id。
    * @param run - 要评估的 run。
-   * @returns 真的派出去的节点 id，顺序 = run 里节点的声明顺序。
+   * @returns 派出去的节点 id（顺序 = 声明顺序），外加这一轮的降级留痕（若有）。
    */
-  const releaseRun = async (parent: Agent, sid: string, run: RunRecord): Promise<string[]> => {
+  const releaseRun = async (parent: Agent, sid: string, run: RunRecord): Promise<ReleasedNodes> => {
     const byId = new Map(run.nodes.map(node => [node.id, node]))
     const dispatched: string[] = []
+    // 去重保序：见 {@link ReleasedNodes} 对「只报第一条」的取舍说明。
+    const traces: string[] = []
     for (const node of run.nodes) {
       if (node.status !== 'pending') continue
       if (!node.needs.every(need => byId.get(need)?.status === 'completed')) continue
-      const childId = await dispatchRunNode(parent, sid, run, node)
-      if (childId !== undefined) dispatched.push(node.id)
+      const started = await dispatchRunNode(parent, sid, run, node)
+      if (started === undefined) continue
+      dispatched.push(node.id)
+      if (started.presetFallback !== undefined && !traces.includes(started.presetFallback)) {
+        traces.push(started.presetFallback)
+      }
     }
-    return dispatched
+    return {
+      dispatched,
+      ...traces.length === 0 ? {} : { presetFallback: traces.join(' ｜ ') },
+    }
   }
 
   /**
@@ -2249,7 +2355,7 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
             detail: { type: 'string', description: 'plan/run：什么算干完，或卡在哪里。' },
             prompt: { type: 'string', description: 'run：这个节点要干的活，原样交给子代理。run 的节点只要求 id 与 prompt。' },
             needs: { type: 'array', items: { type: 'string' }, description: 'run：前置节点 id，全部 completed 之后本节点由插件自动派出。依赖只驱动后端，不写进树。' },
-            preset: { type: 'string', description: 'run：这个节点的身份名，决定它的 persona 与工具过滤，覆盖顶层 preset。省略则拿 lead 身份——绝不继承你的 persona；未知名字直接报错，不回落。' },
+            preset: { type: 'string', description: 'run：这个节点的身份名，决定它的 persona 与工具过滤，覆盖顶层 preset。省略则拿 lead 身份——绝不继承你的 persona；未知名字直接报错，不回落。这个名字同时是**内核预设名**（`presets.<角色>.preset` 那格可覆盖它）：名字在预设名册里就把身份整个交给预设树装配，问不到就退回 persona + 工具过滤并在返回值里留痕。' },
             label: { type: 'string', description: 'run：这个节点在面板上的短标签。' },
           },
         },
@@ -2262,7 +2368,7 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
       question: { type: 'string', description: 'ask：问用户的问题。' },
       options: { type: 'array', items: { type: 'string' }, description: 'ask：建议答案。' },
       prompt: { type: 'string', description: 'run 的每个节点一项（该节点自己要干的活，原样交给子代理）/ send：子代理收到的简报。' },
-      preset: { type: 'string', description: 'run（顶层默认给全条流水线，节点项给该节点，节点项优先）：身份名，决定子代理的 persona 与工具过滤。省略则拿 lead 身份——绝不继承你的 persona；未知名字直接报错，不回落。' },
+      preset: { type: 'string', description: 'run（顶层默认给全条流水线，节点项给该节点，节点项优先）：身份名，决定子代理的 persona 与工具过滤。省略则拿 lead 身份——绝不继承你的 persona；未知名字直接报错，不回落。这个名字同时是**内核预设名**（`presets.<角色>.preset` 那格可覆盖它）：名字在预设名册里就把身份整个交给预设树装配，问不到就退回 persona + 工具过滤并在返回值里留痕。' },
       label: { type: 'string', description: 'run：短标签，显示在面板上的活名。' },
       bind: { type: 'string', description: '已不从这条工具面接受：节点与 childId 的绑定由插件在派发时自己登记。' },
       run: { type: 'string', description: 'run：这条流水线的 run id，会话内唯一。同一个 run 的起点（needs 为空的那些）会在本次调用里并行派出。三个词的分工：声明新流水线（默认）、`retry=true` 重评估**已存在**那条 run 的待办节点、`resume=<节点 id>` 把**已派出但没干成**的节点交回它原来那个孩子接着干。后两种都要求 run 已经存在。' },
@@ -2321,6 +2427,7 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
           worktrees: { type: 'array', items: { type: 'string' }, description: 'worktree mode=list：在飞的线，每条一行（名字 / 分支 / 检出路径 / 提交数 / 未提交改动数）。' },
           probe: { type: 'string', description: 'probe：这一炮的原始读数（子会话 id、cwd、跑过的命令、每条结果的沙箱自报档位、标记文件在不在）。**原文照抄**，不改写成结论。' },
           output: { type: 'string', description: 'commit / worktree merge：机械验证命令的真实回显。只在「跑过但没过」时带回，用来判断为什么没过；命令没跑起来时报文写在 result 里。' },
+          presetFallback: { type: 'string', description: 'run：这一次派发**降级**了才有的留痕（`preset` 这条身份通道没走成）。rosterless 部署里是常态：`presets.<角色>.preset` 那个名字没名册可问，孩子改用 persona + toolFilter 的减法装面 —— 留痕就是为了让「装的是另一张面」这件事不被当成装成了。一个 run 里多个原因时按 ` ｜ ` 连接；没降级则整个键缺席。' },
           // **必须在这一份里报备**：宿主拿它做回执校验，出现未声明的属性时整份回执被判非法，
           // 调用方看到的是「returned invalid output: value.output is not a declared property」——
           // 而它承载的本来正是「为什么没过」。缺了它，那句报错反而**盖掉**真因。
@@ -2483,7 +2590,9 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
             }
             // 不 store（`store` 是追加，会造出同 id 的重复 run，而 patchRunNode 会打到同 id 的每一条）、
             // 不 write（树上的节点一个都不动）、不重置任何状态 —— 只把**现在就能派**的那些派出去。
-            return { status: 'running', run: existing.id, dispatched: await releaseRun(parent, sid, existing) }
+            // `releaseRun` 的返回值里可能多带一格 `presetFallback`（这一次降级了），
+            // 原样摊进返回值 —— 绝不在这里重新拼，否则「谁降级过」这一个事实就有两份实现。
+            return { status: 'running', run: existing.id, ...await releaseRun(parent, sid, existing) }
           }
           if (args.nodes === undefined || args.nodes.length === 0) throw new Error('task run requires a non-empty `nodes` list')
           // 校验在前：needs 点名不存在的节点、id 重复、依赖成环都在这里拒掉。
@@ -2514,13 +2623,24 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
           await ledger.store(sid, run)
           // 起点（needs 为空）立刻派出，一个 run 里可以有多个起点，并行。
           const dispatched: string[] = []
+          // 与 `releaseRun` 同一套去重保序：同一轮里几个起点降级原因相同就只说一遍。
+          const traces: string[] = []
           for (const node of run.nodes) {
             if (node.needs.length > 0) continue
-            const childId = await dispatchRunNode(parent, sid, run, node)
-            if (childId !== undefined) dispatched.push(node.id)
+            const started = await dispatchRunNode(parent, sid, run, node)
+            if (started === undefined) continue
+            dispatched.push(node.id)
+            if (started.presetFallback !== undefined && !traces.includes(started.presetFallback)) {
+              traces.push(started.presetFallback)
+            }
           }
           // **不通知中枢**：这一次调用只写了树与后端账本，没有任何一条消息投进中枢的会话。
-          return { status: 'running', run: run.id, dispatched }
+          return {
+            status: 'running',
+            run: run.id,
+            dispatched,
+            ...traces.length === 0 ? {} : { presetFallback: traces.join(' ｜ ') },
+          }
         }
         case 'plan': {
           if (args.nodes === undefined || args.nodes.length === 0) throw new Error('task plan requires a non-empty `nodes` list')
