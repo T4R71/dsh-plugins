@@ -199,6 +199,20 @@ const GLOBAL_RULES_SECTION = 'task:global-rules'
 const DEFAULT_PRESET = 'lead'
 
 /**
+ * 问答线程的身份键（`presets.explain`，见 {@link ROLE_LABELS}）。
+ *
+ * 这个常量有**两处**用途，两处都必须是同一个字符串：
+ *   1. `qa_thread` 工具派发时点名的 preset（`dispatchTo` 的 `spec.preset`）；
+ *   2. `dispatchTo` 拿它判「这条孩子是不是问答线程」，只有是才给它拼历史回显
+ *      （见 {@link installAskProxy} 的 `history` 那一格）。
+ *
+ * 为什么判据用**生效键**而不是 `spec.label`：label 是调用方自由填的活名，
+ * 拿它判身份会得到「叫「问答」的 recon 线程被拼了历史」这种错配 ——
+ * 与 {@link ROLE_LABELS} 那段注释里记的显示层错配是同一类问题。
+ */
+const EXPLAIN_PRESET = 'explain'
+
+/**
  * persona 那一段的 section 名。
  *
  * 名字由 `applyChildComposition` 定死（dsh-subagent/lib/index.js），父改不了；
@@ -217,6 +231,18 @@ const PERSONA_SECTION_NAME = 'deployment:persona-prefix'
  * 多一个字段直接拒），所以呈现语义**只能**由 detail 承载。
  */
 const ANSWER_PREFIX = '答：'
+
+/**
+ * 问答线程历史块的锚点标题。**固定字符串**，是「这一段是插件拼的、不是模型复述的」唯一的标记。
+ *
+ * 用户的要求是「历史不可改写、不由模型自己复述」——所以这一段**只能**由插件从那条线程
+ * 自己的树上读原始材料拼出来（见 {@link installAskProxy} 的 `history` 那一路），
+ * 模型一个字都插不进去。锚点存在的意义是让人一眼看出这段是机器贴的。
+ */
+const HISTORY_ANCHOR = '【此前问答】'
+
+/** 历史块与**本轮问题**之间的分隔行。空历史时**一行都不出现**。 */
+const HISTORY_SEPARATOR = '【本轮】'
 
 /**
  * 面向模型的提问工具名。
@@ -268,6 +294,12 @@ const ROLE_LABELS: Readonly<Record<string, string>> = {
   impl: '实现',
   verify: '验证',
   lead: '中枢',
+  // 问答线程（`qa_thread` 工具派出的那一支）。加这一格**不是**为了好看：
+  // 它同时也是「这条孩子是不是问答线程」这条判据**唯一**的取值来源 ——
+  // `dispatchTo` 按生效键算出 `explain` 之后，既拿它当显示名，也拿它决定要不要
+  // 给这条线程拼历史回显（见 `installAskProxy`）。所以这个键必须与
+  // `profiles/*/cordis.patch.yml` 里 `presets.explain` 那个键**逐字相同**。
+  explain: '问答',
 }
 
 /**
@@ -1435,8 +1467,13 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
    * 同一个决策因此在面板上被记了两份、显示两遍）。中枢之所以压缩之后照样看得见下面问过的
    * 决策，靠的是决策段 `task:decisions` 读**合并视图**（`readMerged`），不是靠复制写入。
    */
-  /** 待装透传工具的直连子代理：childId → 它的提问根与名字。 */
-  const pendingAskRoots = new Map<string, { readonly root: Agent; readonly label: string }>()
+  /**
+   * 待装透传工具的直连子代理：childId → 它的提问根、名字，以及**要不要拼历史回显**。
+   *
+   * `history` 只对问答线程（生效键 {@link EXPLAIN_PRESET}）为 true ——
+   * 普通子代理的提问行为**逐字不变**（这一条是上次做错的教训：无差别接管所有子代理）。
+   */
+  const pendingAskRoots = new Map<string, { readonly root: Agent; readonly label: string; readonly history: boolean }>()
   /** 已经装过的子代理 → 它的提问根。孙代理沿这条链上溯。 */
   const childRoots = new WeakMap<Agent, Agent>()
 
@@ -1458,9 +1495,41 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
    * @param agent - 刚创建的子代理。
    * @param root - 它的提问根（人类应答者所在的那一支）。
    * @param label - 认人的名字，写进卡片标题与树节点。
+   * @param history - 要不要在**本次第一个问题**的正文前拼一段「此前问答」。
+   *   只有问答线程（生效键 {@link EXPLAIN_PRESET}）给 true；默认 false 时
+   *   这个函数的产出与加这一格之前**逐字相同**。
    */
-  const installAskProxy = (agent: Agent, root: Agent, label: string): void => {
+  const installAskProxy = (agent: Agent, root: Agent, label: string, history = false): void => {
     const childSid = String(agent.id)
+
+    /**
+     * 把这条线程**自己树上**已经问完答完的那些决策，拼成一段纯文本历史块。
+     *
+     * 材料来源是插件自己写的那两处（本函数下面的 `write` 与 `step`）：节点 id 是
+     * `ask-N`、title 是 `[label] 标题`、detail 是 `答：<答案>`。两个写动作都**只增不改**，
+     * 所以这一段是可信的原始材料，不是模型的复述 —— 这正是用户要的那一条。
+     *
+     * **绝不抛**：读树、解析失败一律吞掉并留日志，返回空串（调用方照原样提问）。
+     * 与下面那次写问题的 try/catch 同一档纪律 —— 一次读树失败不许把提问本身弄没。
+     * @returns 历史块（含尾部 {@link HISTORY_SEPARATOR}）；没有历史时是空串。
+     */
+    const historyBlock = (): string => {
+      try {
+        const nodes = tree().read(childSid)
+        // 只认「问完答完」的：`detail` 还没写上的那一轮（上一次提问超时、用户还没答）
+        // 不算历史 —— 把一条没有答案的问题写进历史，模型会以为用户答过了。
+        const answered = flattenNodes(nodes)
+          .filter(node => node.id.startsWith(DECISION_PREFIX) && node.detail !== undefined && node.detail !== '')
+        if (answered.length === 0) return ''
+        const rows = answered.map((node, index) =>
+          '第 ' + String(index + 1) + ' 轮 —— 问：' + unlabelledTitle(node.title)
+          + ' ｜ 答：' + stripAnswerPrefix(node.detail ?? ''))
+        return [HISTORY_ANCHOR, ...rows, HISTORY_SEPARATOR].join('\n')
+      } catch (error) {
+        ctx.logger?.warn?.('task: could not read back the earlier Q&A of sub-agent ' + childSid + ': ' + String(error))
+        return ''
+      }
+    }
     agent.ctx.tools.register(defineTool({
       name: ASK_TOOL_NAME,
       description: '问用户问题并等待回答。卡片落在队长会话界面，前缀是「[' + label + ']」，用户在那里作答；答案作为本工具的结果返回给你，同时这个问题会记为你自己任务树里的一个 ask-N 决策节点。凡是有事需要用户拍板，必须用本工具提问：绝对不要把问题写进结语或最终答复里等用户回答——那样用户看不到，等于你没问。拿到答案后按答案决定去留：只是填空或确认，就照原样继续做，不要重复问；要求换方向、改范围或推翻已定方案，就立刻停手，不再写任何文件，把已完成的部分、当前状态、证据和这条原始问答逐字写进结果，回报中枢等重派。',
@@ -1545,9 +1614,11 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
           throw new Error('ask_user_question: the `userQuestions` service is unavailable in this composition — the question was never shown')
         }
         const request = {
-          questions: asked.map(item => ({
+          questions: asked.map((item, index) => ({
             id: item.id,
-            question: item.question,
+            // **历史只贴第一个问题**：一次调用里带几个问题时，贴在每一个前面就是同一段话
+            // 在卡片上出现好几遍。`asked` 为空数组时这里一次都不取（空数组本来也不会走远）。
+            question: index === 0 && history ? withHistory(historyBlock(), item.question) : item.question,
             header: item.header === undefined ? '[' + label + ']' : '[' + label + '] ' + item.header,
             ...item.options === undefined ? {} : {
               options: item.options.map(option => ({
@@ -1617,7 +1688,7 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
       pendingAskRoots.delete(String(agent.id))
       childRoots.set(agent, ask.root)
       try {
-        installAskProxy(agent, ask.root, ask.label)
+        installAskProxy(agent, ask.root, ask.label, ask.history)
       } catch (error) {
         ctx.logger?.warn?.('task: sub-agent ' + String(agent.id) + ' started without its direct-to-user question tool: ' + String(error))
       }
@@ -1918,7 +1989,10 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
       // 这一处给 `system-prompt/assemble` 里那段提醒判身份用 —— 只有本插件派出去的孩子才会看到它。
       dispatchedChildren.add(id)
       // 提问根同样按 childId 落表（`agent/created` 里按同一个 id 查）。
-      if (askRoot !== undefined) pendingAskRoots.set(id, { root: askRoot, label: roleLabel(effectiveKey) })
+      // `history` 判的是**生效键**（不是 label）：只有问答线程才拼历史回显。
+      if (askRoot !== undefined) {
+        pendingAskRoots.set(id, { root: askRoot, label: roleLabel(effectiveKey), history: effectiveKey === EXPLAIN_PRESET })
+      }
     }
     const forgetChild = (id: string): void => {
       pendingAllow.delete(id)
@@ -2326,6 +2400,101 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
       await releaseRun(parent, sid, run)
     }
   }
+  /**
+   * 问答线程：把「用户要你解释」或「用户提了一个独立的新方向」单独开一条只干问答的线程。
+   *
+   * ## 为什么要有它
+   *
+   * 这两种话都不该在中枢那条线上展开：解释会让主干的上下文被一长串问答淹掉，
+   * 新方向更会把「正在做的事」与「还没定的事」搅在一起。所以它们走**同一件**东西 ——
+   * 一条独立子会话，与用户的全部往来都走现成的提问卡片（不另造聊天窗口），
+   * 中枢只收它的结论。
+   *
+   * ## 触发纪律（用户原话：**不是什么问题都用**，一般是用户要求解释或者独立新方向才用）
+   *
+   * 该用：用户明确要你解释某件事（「这是怎么工作的」「为什么要这么设计」）；
+   *       用户提出一个**独立的新方向**（区别于对当前活的补充说明）。
+   * 不该用：填空、确认、二选一这类一句话就能定的小事 —— 那些直接调
+   *       `ask_user_question`（或 `task` 的 `ask`），开一条线程只为问一句是浪费；
+   *       也不该拿它当「帮我查一下」的通用后端，它**只干问答、不改文件、不派活**。
+   *
+   * ## 交接方式
+   *
+   * 开的是一条**只干问答**的线程（身份 `explain`，工具面上拿掉了 edit/write/task）：
+   * 它把答案讲清楚，然后用提问卡片把回答交给用户，用户答完它接着答下一轮，
+   * 直到用户说「就这些」。**结论会自动回到主对话**（它结算时你会收到一条
+   * `subagent-settled` 通知），这条线程中间的每一轮问答不会挤进你的上下文。
+   *
+   * 本工具**立刻返回**，不等结果 —— 与 `task run` 同一条纪律：
+   * 要不要等、什么时候读结论，由你自己按当时情况判断（用 `task` 的 `result`）。
+   *
+   * ## 它与历史回显的关系
+   *
+   * 这条线程连着问好几轮时，插件会在**新卡片**的正文前自动贴一段「此前问答」
+   * （从那条线程自己树上读的原始材料，不是模型复述的），用户看得到前面几轮。
+   * 那是插件做的，你**不必**也不该在 `question` 里替它复述历史。
+   */
+  ctx.tools.register(defineTool({
+    name: 'qa_thread',
+    description: '开一条**只干问答**的线程，用来回答用户的解释请求、或跟用户聊一个独立的新方向。'
+      + '触发纪律：**不是**什么问题都用 —— 一般是「用户要求解释」或者「用户提出独立新方向」才用；'
+      + '填空、确认、二选一这类一句话能定的小事直接用 ask_user_question，不要为它开线程。'
+      + '开出来的线程只干问答：不改文件、不派活（edit/write/task 都被拿掉了）。'
+      + '它与用户的**全部**往来都走现成的提问卡片（就是你现在用的这套卡片，不另造聊天窗口）；'
+      + '它会把答案讲清楚、用卡片交给用户，用户答完接着答下一轮，直到用户说「就这些」。'
+      + '**结论会自动回到主对话**（它结算时你收到一条 `subagent-settled` 通知），中间的问答不进你的上下文。'
+      + '本工具立刻返回、不等结果；要读结论用 `task` 的 `result` 动作，按当时情况自己判断何时读。',
+    parameters: {
+      question: {
+        type: 'string',
+        required: true,
+        description: '用户的问题、或用户想讨论的那个东西。**尽量用用户的原话** —— 转述会丢掉语气与真正的诉求，而这条线程就是照着它去答的。',
+      },
+      background: {
+        type: 'string',
+        required: true,
+        description: '这条线程需要的背景：当前在做什么、已经定过什么、相关的文件在哪里。它看不到你的上下文，你写进去的才是它知道的。',
+      },
+      label: { type: 'string', description: '这条线程在面板上的短标签。省略即为「问答」。' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          task_id: { type: 'string', required: true, description: '开出来的那条问答线程的子会话 id（读它的结论时用它）。' },
+          status: { type: 'string', required: true, description: '当刻的状态；刚开出来时是 running（本工具不等结果）。' },
+          result: { type: 'string', description: '派发这一步自己的说明（一句话）。**不是**那条线程的结论 —— 结论走 `subagent-settled` 通知。' },
+          presetFallback: { type: 'string', description: '这一次派发**降级**了才有的留痕（`explain` 这条身份通道没走成）。没降级则整个键缺席。' },
+        },
+      },
+      render: (_args, value) => [{ type: 'text', text: renderFields(value, [
+        ['task_id', 'task_id'],
+        ['status', 'status'],
+        ['result', 'result'],
+        ['presetFallback', 'presetFallback'],
+      ]) }],
+    },
+    async execute(args, exec) {
+      const parent = requireAgent(exec)
+      const question = (args.question ?? '').trim()
+      const background = (args.background ?? '').trim()
+      if (question === '') throw new Error('qa_thread: `question` 是必填的 —— 没有要答的东西，这条线程开了也没用')
+      if (background === '') throw new Error('qa_thread: `background` 是必填的 —— 这条线程看不到你的上下文，不给背景它只能拿常识硬答')
+      const started = await dispatchTo(parent, {
+        prompt: qaThreadBrief(question, background),
+        preset: EXPLAIN_PRESET,
+        label: args.label ?? '问答',
+      }, exec.signal)
+      return {
+        task_id: started.task_id,
+        status: started.status,
+        result: '已开出问答线程；它与用户的问答走提问卡片，结论会在结算时作为 `subagent-settled` 通知回到本会话。',
+        ...started.presetFallback === undefined ? {} : { presetFallback: started.presetFallback },
+      }
+    },
+    presentCall: args => ({ card: 'generic', title: 'QA thread', kind: 'other', rawInput: args }),
+  }))
   ctx.tools.register(defineTool({
     name: 'task',
     description: '`task` 统一编排：掌管任务树与执行它的子代理。子代理异步结算：结算通知会在你下一轮以一条 `subagent-settled` 消息出现；`result` 只读已经到达的东西，从不等待。派活一律走 `run`：先声明 `nodes`（建树），起点立刻派出，后继由插件自动放行——**没有**「不建节点就派活」的直达通道。走这条路派出的子代理才会被装上「直接问用户」的提问工具。子代理缺前提或需要用户拍板时，必须直接问用户（用提问工具），不要自己硬猜。答案要求换方向、改范围或推翻已定方案时，子代理应停手回报，由中枢另派干净上下文的代理接手。派活时用中文角色名做 label（侦察/实现/验证），树与提问卡片按它显示。',
@@ -2433,7 +2602,31 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
           // 而它承载的本来正是「为什么没过」。缺了它，那句报错反而**盖掉**真因。
         },
       },
-      render: (_args, value) => [{ type: 'text', text: 'task ' + String(value.status) }],
+      // **调用方只看得见这里**：原先只吐 `'task ' + status` 一个词，于是用户选了什么、
+      // 树长什么样、线在哪，调用方一个都读不到（实测里中枢只能绕道直读数据库才拿到答案）。
+      // 现在把 `value` 里**确实存在**的字段都排出来，缺席的跳过 —— 键集与上面的
+      // `output.schema` 逐字对应，**一个新键都不加**（多一个未声明的键会让整份回执被判非法）。
+      render: (_args, value) => [{ type: 'text', text: renderFields(value, [
+        ['status', 'status'],
+        ['node', 'node'],
+        ['task_id', 'task_id'],
+        ['run', 'run'],
+        ['result', 'result'],
+        ['tree', 'tree'],
+        ['branch', 'branch'],
+        ['path', 'path'],
+        ['hash', 'hash'],
+        ['files', 'files'],
+        ['uncommitted', 'uncommitted'],
+        ['verification', 'verification'],
+        ['merged', 'merged'],
+        ['worktrees', 'worktrees'],
+        ['dispatched', 'dispatched'],
+        ['probe', 'probe'],
+        ['output', 'output'],
+        ['presetFallback', 'presetFallback'],
+        ['evidence', 'evidence'],
+      ]) }],
     },
     async execute(args, exec) {
       switch (args.action) {
@@ -2880,6 +3073,78 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
     },
     presentCall: args => ({ card: 'generic', title: 'Task', kind: 'other', rawInput: args }),
   }))
+}
+
+/**
+ * `qa_thread` 交给那条线程的简报。
+ *
+ * 三段的分工不许混：**用户原话**（它到底要什么）、**背景**（它需要知道什么）、
+ * **往来方式**（它该怎么跟用户说话）。第三段是**代码里的固定文本**，不是调用方手写的 ——
+ * 「一轮一轮用卡片接着问，直到用户说就这些」这件事每开一条线程都要重说一遍的话，
+ * 迟早会漏掉一条，而漏掉的那条会写完一大段就自己收工了。
+ *
+ * 历史回显**不写进简报**：它是插件在每次提问前现拼的（见 {@link installAskProxy}），
+ * 在这里交代一句「去看历史」等于把两处实现说成同一件事。
+ * @param question - 用户的问题/想讨论的东西（尽量是原话）。
+ * @param background - 这条线程需要的背景。
+ * @returns 简报全文。
+ */
+function qaThreadBrief(question: string, background: string): string {
+  return [
+    '【用户的问题】',
+    question,
+    '',
+    '【背景】',
+    background,
+    '',
+    '【你跟用户的往来方式】',
+    '这是一条**问答线程**：你要做的是把用户问的东西讲清楚，不是去改代码、也不是去派活。',
+    '跟用户说话**只能用提问卡片**（`ask_user_question`）—— 这是用户唯一看得见你的地方：'
+      + '卡片正文就是你要说的话，选项是给用户的下一步选择。',
+    '不要指望用户看得见你的普通输出，也不要写别的文件：把话写进卡片里。',
+    '用户答完，你就着新的追问**继续解释、再弹下一张卡**；需要好几轮就问好几轮，'
+      + '（前几轮的问与答会在新卡片上自动出现，你不必自己复述）。',
+    '直到用户选「就这些」，才停手 —— 那时把这次问答的结论写进你的最终结果（结语）。',
+  ].join('\n')
+}
+
+/**
+ * 把工具返回值里**确实存在**的那些字段排成多行纯文本。
+ *
+ * 为什么必须这样做（而不是像原先那样只吐一个状态词）：调用方**只看得见 render 的产出**，
+ * 一个 `'task running'` 等于什么都没给 —— 用户选了什么、树长什么样、线在哪，
+ * 调用方一个都读不到（实测里中枢只能绕道去直读数据库才拿到用户的选择）。
+ *
+ * 三条规矩，都不许破：
+ *   - **只输出存在的键**：缺席的、空串、空数组一律跳过，不占行；
+ *   - **只产出 {@link ContentBlock} 的稳妥成员** `{ type: 'text', text }`；
+ *   - **一个块**：多行文本合成一个 text 块（多块在部分客户端上会被拼成一行）。
+ *
+ * 这里**不做截断**：工具返回值本身已经过 schema 校验与无损序列化，长度由产出侧负责；
+ * 在这里砍一刀会让「看得见」变成「看得见一半」，而调用方无从知道被砍过。
+ * @param value - 工具返回值（已通过 schema）。
+ * @param fields - 字段顺序表：`[键名, 显示名]`，只列要露出来的那些。
+ * @returns 多行文本；一个字段都没有时返回一行说明性的空态。
+ */
+function renderFields(value: unknown, fields: readonly (readonly [string, string])[]): string {
+  const source = (value ?? {}) as Record<string, unknown>
+  const lines: string[] = []
+  for (const [key, title] of fields) {
+    const raw = source[key]
+    if (raw === undefined || raw === null) continue
+    // 数组：空数组跳过，否则一行一项（前缀对齐，读起来是一列）。
+    if (Array.isArray(raw)) {
+      if (raw.length === 0) continue
+      lines.push(title + ':')
+      for (const item of raw) lines.push('  - ' + String(item))
+      continue
+    }
+    // 数字与布尔照原样（`String(false)` 是 `'false'` 而不是空，正是要的）。
+    const text = typeof raw === 'string' ? raw : String(raw)
+    if (text === '') continue
+    lines.push(title + ': ' + text)
+  }
+  return lines.length === 0 ? '(no fields)' : lines.join('\n')
 }
 
 /**
@@ -3703,6 +3968,33 @@ function upstreamSection(
     parts.push(bodies.get(need) ?? '')
   }
   return { prompt: filled.prompt, text: UPSTREAM_ANCHOR + UPSTREAM_LEAD + '\n' + parts.join('\n') }
+}
+
+/**
+ * 把历史块拼到本次问题正文**前面**。
+ *
+ * 空历史时**一个字都不加**（返回原文，逐字不变）：这是「没有历史时不许出现空标题」
+ * 那条要求的落点 —— 不看一眼就拼，卡片上会出现一个只有标题的 {@link HISTORY_ANCHOR}。
+ * @param block - {@link installAskProxy} 里 `historyBlock()` 的产出；空串表示没有历史。
+ * @param question - 用户本来要看到的那个问题。
+ * @returns 拼好的正文。
+ */
+function withHistory(block: string, question: string): string {
+  return block === '' ? question : block + '\n\n' + question
+}
+
+/**
+ * 去掉决策节点标题上的 `[<角色>] ` 前缀。
+ *
+ * 那个前缀是 `installAskProxy` 写树时加的（`'[' + label + '] ' + title`），给人看的；
+ * 拼进历史块时它只是噪声 —— 一问一答那两行的读者已经知道这是谁在问。
+ * 只剥**最前面**那一对，标题里后面出现的方括号原样留着。
+ * @param title - 树节点的 title。
+ * @returns 去掉前缀的标题。
+ */
+function unlabelledTitle(title: string): string {
+  const matched = /^\[[^\]]*\]\s*/u.exec(title)
+  return matched === null ? title : title.slice(matched[0].length)
 }
 
 /**
