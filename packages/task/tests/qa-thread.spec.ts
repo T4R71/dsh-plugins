@@ -1,5 +1,5 @@
 /**
- * 本轮新增功能的三块单测：`qa_thread`、问答线程的历史自动回显、`task` 的回显。
+ * 本轮功能的三块单测：`qa_thread`、提问卡片正文的**逐字**纪律、`task` 的回显。
  *
  * 为什么单独一个文件而不是往既有的三份里塞：既有的 harness 都只**抓最后一个**
  * 注册进工具面的定义（`captured = definition`），而本包现在注册**两个**工具
@@ -9,8 +9,8 @@
  * 钉住四件事：
  * 1. `qa_thread` 真的存在、两个参数都必填、派发走的是 `preset: 'explain'`；
  * 2. 问答线程的简报里必须带**用户原话**、背景、以及「一轮一轮用卡片接着问」的指示；
- * 3. 历史回显**只**对问答线程启用（普通子代理逐字不变），且材料是插件从树上读的，
- *    没有历史时一个字都不加；
+ * 3. 卡片正文**逐字**是模型写的那一句 —— 插件不再往里拼任何历史（曾经拼过一段
+ *    「【此前问答】」；那条路已按用户决定撤掉，回看改走子会话里官方提问行的「回顾」）；
  * 4. `task` 的回显把存在的字段排出来、缺席的跳过，且只产出 text 块。
  *
  * ctx 与 Agent 都是本文件里的假件，不碰真机。
@@ -200,29 +200,28 @@ it('qa_thread 缺 question 或缺 background 一律抛错，一个孩子都不�
   assert.equal(h.starts.length, 0, '参数不全时不许派发')
 })
 
-it('问答线程：第二轮起卡片正文前面出现插件拼的【此前问答】，内容是第一轮的原问原答', async () => {
+it('问答线程：卡片正文逐字是模型那一句 —— 连问几轮，插件一个字都不往里拼', async () => {
   const h = harness({ answers: [{ id: 'q1', selected: ['A'] }] })
   await h.tool('qa_thread').execute({ question: '第一问', background: 'b' }, { agent: h.rootAgent, callId: 'c1' })
   const child = h.createChild('child-1')
   h.fire('agent/created', { agent: child })
 
-  // 第一轮：树上还没有任何问完答完的决策，所以**一个字都不加**。
   await h.asked(child, '第一问的正文')
-  assert.equal(h.askCalls[0].questions[0].question, '第一问的正文', '没有历史时正文逐字不变')
+  assert.equal(h.askCalls[0].questions[0].question, '第一问的正文', '正文逐字不变')
   assert.equal(h.nodesOf('child-1')[0].title, '[问答] 第一问的正文', '树节点标题带角色前缀')
   // 卡片前缀与树标题取自**同一个** label（`roleLabel(effectiveKey)`）：ROLE_LABELS
   // 里加了 `explain` 这一格，两处就一起生效，不需要另写一行代码。
   assert.equal(h.askCalls[0].questions[0].header, '[问答]', '卡片前缀跟着 ROLE_LABELS 走')
 
-  // 第二轮：第一轮已经问完答完，历史块必须出现在**本次第一个问题**的正文前。
+  // 第二轮：第一轮已经问完答完，历史上**确实**有材料可拼了 —— 而正文依旧一个字不加。
+  // 回看前几轮改走子会话里官方提问行的「回顾」（官方只读问答面板），不再挤进卡片正文。
   await h.asked(child, '第二问的正文')
-  const second = String(h.askCalls[1].questions[0].question)
-  assert.match(second, /^【此前问答】\n/, '历史块的锚点必须在最前')
-  assert.match(second, /第 1 轮 —— 问：第一问的正文 ｜ 答：A/, '一行一轮，问与答都取原样')
-  assert.match(second, /【本轮】\n\n第二问的正文$/, '块尾有分隔，然后才是本轮问题')
+  assert.equal(h.askCalls[1].questions[0].question, '第二问的正文', '第二轮正文也逐字不变')
+  assert.equal(h.nodesOf('child-1').length, 2, '两轮问答都照旧记进那条线程自己的树')
+  assert.equal(h.nodesOf('child-1')[0]?.detail, '答：A', '答案照旧写回同一节点的 detail')
 })
 
-it('问答线程：多轮累积，第三轮看得见前两轮（每轮一行）', async () => {
+it('问答线程：多轮累积也不攒正文 —— 每一轮的正文都只有那一轮自己那一句', async () => {
   const h = harness()
   await h.tool('qa_thread').execute({ question: 'Q', background: 'b' }, { agent: h.rootAgent, callId: 'c1' })
   const child = h.createChild('child-1')
@@ -230,13 +229,17 @@ it('问答线程：多轮累积，第三轮看得见前两轮（每轮一行）'
   await h.asked(child, '问一')
   await h.asked(child, '问二')
   await h.asked(child, '问三')
-  const third = String(h.askCalls[2].questions[0].question)
-  assert.match(third, /第 1 轮 —— 问：问一 ｜ 答：A/)
-  assert.match(third, /第 2 轮 —— 问：问二 ｜ 答：A/)
-  assert.equal(third.includes('第 3 轮'), false, '本轮自己还没答，不许当成历史写进去')
+  assert.deepStrictEqual(
+    h.askCalls.map(call => call.questions[0].question),
+    ['问一', '问二', '问三'],
+    '三轮三句，谁也不带前几轮',
+  )
+  for (const call of h.askCalls) {
+    assert.equal(String(call.questions[0].question).includes('【此前问答】'), false, '正文里不许再出现历史锚点')
+  }
 })
 
-it('历史回显只对问答线程启用：普通子代理的提问行为逐字不变', async () => {
+it('提问透传不分身份：问答线程与普通子代理的正文纪律是同一条', async () => {
   const h = harness()
   await h.tool('task').execute(
     { action: 'run', run: 'r1', nodes: [{ id: 'n1', prompt: 'go', preset: 'recon' }] },
@@ -250,16 +253,20 @@ it('历史回显只对问答线程启用：普通子代理的提问行为逐字�
   assert.equal(h.askCalls[1].questions[0].header, '[侦察]')
 })
 
-it('读树失败不许让提问失败：历史读不动时照原样提问并留一条日志', async () => {
+it('树读不动不许让提问失败：照原样提问、答案照常回来、并留一条写树失败的日志', async () => {
   const h = harness({ treeThrows: true })
   await h.tool('qa_thread').execute({ question: 'Q', background: 'b' }, { agent: h.rootAgent, callId: 'c1' })
   const child = h.createChild('child-1')
   h.fire('agent/created', { agent: child })
   const result = await h.asked(child, '照常问')
   assert.equal(h.askCalls.length, 1, '提问必须照样发出去')
-  assert.equal(h.askCalls[0].questions[0].question, '照常问', '读不到历史时正文逐字不变')
+  assert.equal(h.askCalls[0].questions[0].question, '照常问', '写不进树时正文依旧逐字不变')
   assert.equal(result.answers[0].selected[0], 'A', '答案照常回来')
-  assert.equal(h.warns.some(line => line.includes('could not read back the earlier Q&A')), true, '降级要留日志')
+  assert.equal(
+    h.warns.some(line => line.includes('could not record its question in its own tree')),
+    true,
+    '写树降级要留日志',
+  )
 })
 
 it('task 的回显：存在的字段排成多行、缺席的跳过，且只产出 text 块', () => {

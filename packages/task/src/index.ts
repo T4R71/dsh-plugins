@@ -201,13 +201,11 @@ const DEFAULT_PRESET = 'lead'
 /**
  * 问答线程的身份键（`presets.explain`，见 {@link ROLE_LABELS}）。
  *
- * 这个常量有**两处**用途，两处都必须是同一个字符串：
- *   1. `qa_thread` 工具派发时点名的 preset（`dispatchTo` 的 `spec.preset`）；
- *   2. `dispatchTo` 拿它判「这条孩子是不是问答线程」，只有是才给它拼历史回显
- *      （见 {@link installAskProxy} 的 `history` 那一格）。
+ * `qa_thread` 工具派发时点名的就是它（`dispatchTo` 的 `spec.preset`），
+ * 所以它必须与 profile 的 `cordis.patch.yml` 里 `presets.explain` 那个键**逐字相同**。
  *
- * 为什么判据用**生效键**而不是 `spec.label`：label 是调用方自由填的活名，
- * 拿它判身份会得到「叫「问答」的 recon 线程被拼了历史」这种错配 ——
+ * 判身份一向用**生效键**而不是 `spec.label`：label 是调用方自由填的活名，
+ * 拿它判会得到「叫「问答」的 recon 线程被当成问答线程」这种错配 ——
  * 与 {@link ROLE_LABELS} 那段注释里记的显示层错配是同一类问题。
  */
 const EXPLAIN_PRESET = 'explain'
@@ -231,18 +229,6 @@ const PERSONA_SECTION_NAME = 'deployment:persona-prefix'
  * 多一个字段直接拒），所以呈现语义**只能**由 detail 承载。
  */
 const ANSWER_PREFIX = '答：'
-
-/**
- * 问答线程历史块的锚点标题。**固定字符串**，是「这一段是插件拼的、不是模型复述的」唯一的标记。
- *
- * 用户的要求是「历史不可改写、不由模型自己复述」——所以这一段**只能**由插件从那条线程
- * 自己的树上读原始材料拼出来（见 {@link installAskProxy} 的 `history` 那一路），
- * 模型一个字都插不进去。锚点存在的意义是让人一眼看出这段是机器贴的。
- */
-const HISTORY_ANCHOR = '【此前问答】'
-
-/** 历史块与**本轮问题**之间的分隔行。空历史时**一行都不出现**。 */
-const HISTORY_SEPARATOR = '【本轮】'
 
 /**
  * 面向模型的提问工具名。
@@ -294,11 +280,8 @@ const ROLE_LABELS: Readonly<Record<string, string>> = {
   impl: '实现',
   verify: '验证',
   lead: '中枢',
-  // 问答线程（`qa_thread` 工具派出的那一支）。加这一格**不是**为了好看：
-  // 它同时也是「这条孩子是不是问答线程」这条判据**唯一**的取值来源 ——
-  // `dispatchTo` 按生效键算出 `explain` 之后，既拿它当显示名，也拿它决定要不要
-  // 给这条线程拼历史回显（见 `installAskProxy`）。所以这个键必须与
-  // `profiles/*/cordis.patch.yml` 里 `presets.explain` 那个键**逐字相同**。
+  // 问答线程（`qa_thread` 工具派出的那一支）。这个键必须与
+  // `cordis.patch.yml` 里 `presets.explain` 那个键**逐字相同**。
   explain: '问答',
 }
 
@@ -1468,12 +1451,12 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
    * 决策，靠的是决策段 `task:decisions` 读**合并视图**（`readMerged`），不是靠复制写入。
    */
   /**
-   * 待装透传工具的直连子代理：childId → 它的提问根、名字，以及**要不要拼历史回显**。
+   * 待装透传工具的直连子代理：childId → 它的提问根与名字。
    *
-   * `history` 只对问答线程（生效键 {@link EXPLAIN_PRESET}）为 true ——
-   * 普通子代理的提问行为**逐字不变**（这一条是上次做错的教训：无差别接管所有子代理）。
+   * 与白名单同一档纪律：只有本插件派出去的孩子才登记，普通子代理的提问行为**逐字不变**
+   * （这一条是上次做错的教训：无差别接管所有子代理）。
    */
-  const pendingAskRoots = new Map<string, { readonly root: Agent; readonly label: string; readonly history: boolean }>()
+  const pendingAskRoots = new Map<string, { readonly root: Agent; readonly label: string }>()
   /** 已经装过的子代理 → 它的提问根。孙代理沿这条链上溯。 */
   const childRoots = new WeakMap<Agent, Agent>()
 
@@ -1495,41 +1478,14 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
    * @param agent - 刚创建的子代理。
    * @param root - 它的提问根（人类应答者所在的那一支）。
    * @param label - 认人的名字，写进卡片标题与树节点。
-   * @param history - 要不要在**本次第一个问题**的正文前拼一段「此前问答」。
-   *   只有问答线程（生效键 {@link EXPLAIN_PRESET}）给 true；默认 false 时
-   *   这个函数的产出与加这一格之前**逐字相同**。
+   *
+   * 卡片正文**逐字**是模型自己写的那一句：插件不再往问题正文里拼任何东西。
+   * 前几轮的问与答要回看，走子会话里官方提问行的「回顾」——那条路渲染的就是
+   * 官方只读问答面板（选项置灰、可翻页），而这正是「历史不必挤在新卡片正文里」的落点。
    */
-  const installAskProxy = (agent: Agent, root: Agent, label: string, history = false): void => {
+  const installAskProxy = (agent: Agent, root: Agent, label: string): void => {
     const childSid = String(agent.id)
 
-    /**
-     * 把这条线程**自己树上**已经问完答完的那些决策，拼成一段纯文本历史块。
-     *
-     * 材料来源是插件自己写的那两处（本函数下面的 `write` 与 `step`）：节点 id 是
-     * `ask-N`、title 是 `[label] 标题`、detail 是 `答：<答案>`。两个写动作都**只增不改**，
-     * 所以这一段是可信的原始材料，不是模型的复述 —— 这正是用户要的那一条。
-     *
-     * **绝不抛**：读树、解析失败一律吞掉并留日志，返回空串（调用方照原样提问）。
-     * 与下面那次写问题的 try/catch 同一档纪律 —— 一次读树失败不许把提问本身弄没。
-     * @returns 历史块（含尾部 {@link HISTORY_SEPARATOR}）；没有历史时是空串。
-     */
-    const historyBlock = (): string => {
-      try {
-        const nodes = tree().read(childSid)
-        // 只认「问完答完」的：`detail` 还没写上的那一轮（上一次提问超时、用户还没答）
-        // 不算历史 —— 把一条没有答案的问题写进历史，模型会以为用户答过了。
-        const answered = flattenNodes(nodes)
-          .filter(node => node.id.startsWith(DECISION_PREFIX) && node.detail !== undefined && node.detail !== '')
-        if (answered.length === 0) return ''
-        const rows = answered.map((node, index) =>
-          '第 ' + String(index + 1) + ' 轮 —— 问：' + unlabelledTitle(node.title)
-          + ' ｜ 答：' + stripAnswerPrefix(node.detail ?? ''))
-        return [HISTORY_ANCHOR, ...rows, HISTORY_SEPARATOR].join('\n')
-      } catch (error) {
-        ctx.logger?.warn?.('task: could not read back the earlier Q&A of sub-agent ' + childSid + ': ' + String(error))
-        return ''
-      }
-    }
     agent.ctx.tools.register(defineTool({
       name: ASK_TOOL_NAME,
       description: '问用户问题并等待回答。卡片落在队长会话界面，前缀是「[' + label + ']」，用户在那里作答；答案作为本工具的结果返回给你，同时这个问题会记为你自己任务树里的一个 ask-N 决策节点。凡是有事需要用户拍板，必须用本工具提问：绝对不要把问题写进结语或最终答复里等用户回答——那样用户看不到，等于你没问。拿到答案后按答案决定去留：只是填空或确认，就照原样继续做，不要重复问；要求换方向、改范围或推翻已定方案，就立刻停手，不再写任何文件，把已完成的部分、当前状态、证据和这条原始问答逐字写进结果，回报中枢等重派。',
@@ -1614,11 +1570,9 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
           throw new Error('ask_user_question: the `userQuestions` service is unavailable in this composition — the question was never shown')
         }
         const request = {
-          questions: asked.map((item, index) => ({
+          questions: asked.map(item => ({
             id: item.id,
-            // **历史只贴第一个问题**：一次调用里带几个问题时，贴在每一个前面就是同一段话
-            // 在卡片上出现好几遍。`asked` 为空数组时这里一次都不取（空数组本来也不会走远）。
-            question: index === 0 && history ? withHistory(historyBlock(), item.question) : item.question,
+            question: item.question,
             header: item.header === undefined ? '[' + label + ']' : '[' + label + '] ' + item.header,
             ...item.options === undefined ? {} : {
               options: item.options.map(option => ({
@@ -1688,7 +1642,7 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
       pendingAskRoots.delete(String(agent.id))
       childRoots.set(agent, ask.root)
       try {
-        installAskProxy(agent, ask.root, ask.label, ask.history)
+        installAskProxy(agent, ask.root, ask.label)
       } catch (error) {
         ctx.logger?.warn?.('task: sub-agent ' + String(agent.id) + ' started without its direct-to-user question tool: ' + String(error))
       }
@@ -1989,9 +1943,9 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
       // 这一处给 `system-prompt/assemble` 里那段提醒判身份用 —— 只有本插件派出去的孩子才会看到它。
       dispatchedChildren.add(id)
       // 提问根同样按 childId 落表（`agent/created` 里按同一个 id 查）。
-      // `history` 判的是**生效键**（不是 label）：只有问答线程才拼历史回显。
+      // 标签走**生效键**（不是 label）：面板上要显示的是真正跑的那个身份。
       if (askRoot !== undefined) {
-        pendingAskRoots.set(id, { root: askRoot, label: roleLabel(effectiveKey), history: effectiveKey === EXPLAIN_PRESET })
+        pendingAskRoots.set(id, { root: askRoot, label: roleLabel(effectiveKey) })
       }
     }
     const forgetChild = (id: string): void => {
@@ -2430,9 +2384,9 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
    *
    * ## 它与历史回显的关系
    *
-   * 这条线程连着问好几轮时，插件会在**新卡片**的正文前自动贴一段「此前问答」
-   * （从那条线程自己树上读的原始材料，不是模型复述的），用户看得到前面几轮。
-   * 那是插件做的，你**不必**也不该在 `question` 里替它复述历史。
+   * 这条线程连着问好几轮时，卡片正文**只有模型自己写的那一句**：插件不往问题里拼任何历史。
+   * 要看前几轮，走子会话里官方提问行的「回顾」（官方只读问答面板，选项置灰、可翻页）。
+   * 所以你**不必**也不该在 `question` 里替用户复述历史 —— 那是官方那条路的事。
    */
   ctx.tools.register(defineTool({
     name: 'qa_thread',
@@ -3083,8 +3037,8 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
  * 「一轮一轮用卡片接着问，直到用户说就这些」这件事每开一条线程都要重说一遍的话，
  * 迟早会漏掉一条，而漏掉的那条会写完一大段就自己收工了。
  *
- * 历史回显**不写进简报**：它是插件在每次提问前现拼的（见 {@link installAskProxy}），
- * 在这里交代一句「去看历史」等于把两处实现说成同一件事。
+ * 历史回显**不写进简报**：插件不在卡片正文里拼历史（见 {@link installAskProxy}），
+ * 回看走子会话里官方提问行的「回顾」，在这里交代一句「去看历史」两处都不挨着。
  * @param question - 用户的问题/想讨论的东西（尽量是原话）。
  * @param background - 这条线程需要的背景。
  * @returns 简报全文。
@@ -3103,7 +3057,7 @@ function qaThreadBrief(question: string, background: string): string {
       + '卡片正文就是你要说的话，选项是给用户的下一步选择。',
     '不要指望用户看得见你的普通输出，也不要写别的文件：把话写进卡片里。',
     '用户答完，你就着新的追问**继续解释、再弹下一张卡**；需要好几轮就问好几轮，'
-      + '（前几轮的问与答会在新卡片上自动出现，你不必自己复述）。',
+      + '（每张卡正文只写你这一轮要说的话，不要在里面复述前几轮 —— 用户要看，回去翻问答记录）。',
     '直到用户选「就这些」，才停手 —— 那时把这次问答的结论写进你的最终结果（结语）。',
   ].join('\n')
 }
@@ -3968,33 +3922,6 @@ function upstreamSection(
     parts.push(bodies.get(need) ?? '')
   }
   return { prompt: filled.prompt, text: UPSTREAM_ANCHOR + UPSTREAM_LEAD + '\n' + parts.join('\n') }
-}
-
-/**
- * 把历史块拼到本次问题正文**前面**。
- *
- * 空历史时**一个字都不加**（返回原文，逐字不变）：这是「没有历史时不许出现空标题」
- * 那条要求的落点 —— 不看一眼就拼，卡片上会出现一个只有标题的 {@link HISTORY_ANCHOR}。
- * @param block - {@link installAskProxy} 里 `historyBlock()` 的产出；空串表示没有历史。
- * @param question - 用户本来要看到的那个问题。
- * @returns 拼好的正文。
- */
-function withHistory(block: string, question: string): string {
-  return block === '' ? question : block + '\n\n' + question
-}
-
-/**
- * 去掉决策节点标题上的 `[<角色>] ` 前缀。
- *
- * 那个前缀是 `installAskProxy` 写树时加的（`'[' + label + '] ' + title`），给人看的；
- * 拼进历史块时它只是噪声 —— 一问一答那两行的读者已经知道这是谁在问。
- * 只剥**最前面**那一对，标题里后面出现的方括号原样留着。
- * @param title - 树节点的 title。
- * @returns 去掉前缀的标题。
- */
-function unlabelledTitle(title: string): string {
-  const matched = /^\[[^\]]*\]\s*/u.exec(title)
-  return matched === null ? title : title.slice(matched[0].length)
 }
 
 /**
