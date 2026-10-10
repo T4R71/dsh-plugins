@@ -1,7 +1,7 @@
 {
   "name": "@t4r71/dsh-task",
   "description": "One first-class task tool: owns the task tree and the child agents working it (async dispatch, preset persona + tool filter, status and result collection)",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "publishConfig": {
     "access": "public"
   },
