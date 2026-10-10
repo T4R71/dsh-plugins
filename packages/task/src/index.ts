@@ -276,7 +276,6 @@ const DECISION_HEADING = '## 已裁定的事（用户已经拍过板）'
 const TREE_BRIEF_MAX_LINES = 40
 
 /**
-/**
  * 角色名（**实际生效的 preset 键**）→ 中文显示名。
  *
  * 只影响**给人看的两处**：树节点标题与提问卡片前缀（两者都取自 `installAskProxy` 的 label）。
@@ -3194,7 +3193,7 @@ function truncateTreeBrief(rendered: string): string {
   return [
     ...lines.slice(0, TREE_BRIEF_MAX_LINES),
     '（树太大，只列了前 ' + String(TREE_BRIEF_MAX_LINES) + ' 行，另有 '
-      + String(lines.length - TREE_BRIEF_MAX_LINES) + ' 行未列 —— 要看全的用 `task list`。）',
+      + String(lines.length - TREE_BRIEF_MAX_LINES) + ' 行未列。）',
   ].join('\n')
 }
 
