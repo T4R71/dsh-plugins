@@ -55,13 +55,34 @@ interface Captured {
 }
 
 /**
- * 一个只够跑通这三条链路的假上下文。
- * @param options - 用户给出的答案、tree 是否可读。
+ * 从简报里切出一段（段头到下一个段头之间）。
+ *
+ * 分段是这次改动的要害，所以断言必须**按段落做**：整篇里 `includes` 一次会把
+ * 「这一段有」与「另一段也有」混成同一个真值 —— 比如 `答：` 前缀只该在决策那一段被剥掉，
+ * 树那一段照原样印 detail，整篇搜就等于什么都没钉住。
+ * @param brief - 简报全文。
+ * @param heading - 段头（如 `【已裁定的事】`）。
+ * @returns 段正文（不含段头那行）；没有这一段时回 null。
+ */
+function section(brief: string, heading: string): string | null {
+  const start = brief.indexOf('\n' + heading + '\n')
+  if (start === -1) return null
+  const from = start + heading.length + 2
+  const rest = brief.slice(from)
+  const next = rest.search(/\n【[^】]+】\n/)
+  return (next === -1 ? rest : rest.slice(0, next)).replace(/\n+$/, '')
+}
+
+/**
+ * 一个只够跑通这几条链路的假上下文。
+ * @param options - 用户给出的答案、tree 是否可读、tree 服务是否在场。
  * @returns 按名字取工具、造孩子、触发事件的手段，以及可断言的树与提问记录。
  */
 function harness(options: {
   readonly answers?: readonly { readonly id: string; readonly selected: readonly string[] }[]
   readonly treeThrows?: boolean
+  /** 传 true 时 `ctx.get('taskTree')` 回 undefined —— 树服务**整个缺席**，不是读它时抛。 */
+  readonly treeAbsent?: boolean
 } = {}) {
   const store = new Map<string, Record<string, any>[]>()
   const nodesOf = (sid: string): Record<string, any>[] => {
@@ -71,11 +92,15 @@ function harness(options: {
     store.set(sid, fresh)
     return fresh
   }
+  const readTree = (sid: string): Record<string, any>[] => {
+    if (options.treeThrows === true) throw new Error('tree port is down')
+    return nodesOf(sid)
+  }
   const port = {
-    read: (sid: string) => {
-      if (options.treeThrows === true) throw new Error('tree port is down')
-      return nodesOf(sid)
-    },
+    read: readTree,
+    // 合并视图那一路也摆上：`buildDecisions` 与简报里的树段**优先**走它（`readMerged`
+    // 缺了才退回 `read`）。不给它的话，这里测到的就不是真机上跑的那条分支。
+    readMerged: (sid: string, _maxDepth?: number) => readTree(sid),
     write: async (sid: string, nodes: readonly Record<string, any>[], replace: boolean) => {
       const list = nodesOf(sid)
       if (replace) list.length = 0
@@ -99,7 +124,7 @@ function harness(options: {
     agents: { roots: () => [rootAgent] },
     tools: { register: (definition: Captured) => { registered.set(definition.name, definition); return () => {} } },
     get: (key: string) => {
-      if (key === 'taskTree') return port
+      if (key === 'taskTree') return options.treeAbsent === true ? undefined : port
       if (key === 'userQuestions') {
         return { ask: async (request: any) => { askCalls.push(request); return { answers: options.answers ?? [{ id: 'q1', selected: ['A'] }] } } }
       }
@@ -153,17 +178,20 @@ function harness(options: {
   }
 }
 
-it('qa_thread 注册了：两个参数都必填，且描述里写清了触发纪律', () => {
+it('qa_thread 注册了：只有 question 必填，且描述里写清了触发纪律', () => {
   const h = harness()
   const tool = h.tool('qa_thread')
   assert.ok(tool !== undefined, 'qa_thread 必须注册进工具面')
   const properties = tool.parameters.properties
   // 必填落在**顶层 `required` 数组**上，不是逐属性的 `required: true`（实测：
-  // `qa_thread` 编出来的是 `required: ["question","background"]`）。
+  // `qa_thread` 编出来的是 `required: ["question"]`）。
   // 这条与既有那份断言的角度不同：它读的是 `parameters.required` 这一个数组。
   const required = (tool.parameters as unknown as { required?: readonly string[] }).required ?? []
   assert.ok(required.includes('question'), 'question 必填')
-  assert.ok(required.includes('background'), 'background 必填')
+  // **契约变更**：`background` 从必填改成可选。这条断言是**反向**的，钉住的正是新契约 ——
+  // 事实（已裁定的事／任务树现状）由插件在派发那一刻自动抓，调用方只交「想法」，
+  // 而想法可以一个字都没有。它若仍必填，主对话就还得每次手写一段，这个活白干。
+  assert.equal(required.includes('background'), false, 'background 可选（事实由插件自己抓）')
   assert.equal(required.includes('label'), false, 'label 可选')
   assert.deepStrictEqual(Object.keys(properties).sort(), ['background', 'label', 'question'])
   const text = String(tool.description)
@@ -172,9 +200,10 @@ it('qa_thread 注册了：两个参数都必填，且描述里写清了触发纪
   assert.match(text, /不要为它开线程/, '描述要写清「什么时候不该用」')
   assert.match(text, /提问卡片/, '描述要说清它对用户的出口是提问卡片')
   assert.match(text, /结论会自动回到主对话/, '描述要说清结论怎么回来')
+  assert.match(text, /事实由插件自动抓/, '描述要说清事实不用调用方写')
 })
 
-it('qa_thread 派发：preset 是 explain、label 默认「问答」、简报里带用户原话与背景与卡片指示', async () => {
+it('qa_thread 派发：preset 是 explain、label 默认「问答」、简报里带用户原话与想法与卡片指示', async () => {
   const h = harness()
   const result = await h.tool('qa_thread').execute(
     { question: '这个插件为什么要做成一个 task 工具？', background: '当前在改 packages/task。' },
@@ -184,15 +213,94 @@ it('qa_thread 派发：preset 是 explain、label 默认「问答」、简报里
   assert.equal(h.starts[0].label, '问答', '身份名走 ROLE_LABELS（explain → 问答）')
   const brief = String(h.starts[0].request.prompt[0].text)
   assert.match(brief, /这个插件为什么要做成一个 task 工具？/, '用户原话必须原样进简报')
-  assert.match(brief, /当前在改 packages\/task。/, '背景必须进简报')
+  assert.match(brief, /【主对话交底的想法】/, '想法那一段要自报家门，好与事实分段分开')
+  assert.match(brief, /当前在改 packages\/task。/, '想法必须进简报')
   assert.match(brief, /问答线程/, '简报要交代这条线程是干什么的')
   assert.match(brief, /只能用提问卡片/, '简报要交代跟用户说话的唯一出口')
   assert.match(brief, /就这些/, '简报要交代停手条件')
+  assert.equal(brief.includes('【背景】'), false, '旧段名已换成「主对话交底的想法」，不留旧锚点')
   assert.equal(result.status, 'running')
   assert.equal(typeof result.task_id, 'string')
   // 回执的每个键都必须在 output.schema 里报备，否则调用方看到的是 `returned invalid output`。
   const declared = Object.keys(h.tool('qa_thread').output?.schema?.properties ?? {})
   for (const key of Object.keys(result)) assert.ok(declared.includes(key), '未声明的回执键：' + key)
+})
+
+it('qa_thread 不传 background 也能派发：简报里没有「想法」那一段，但自动事实段照旧', async () => {
+  const h = harness()
+  // 先往主对话那棵树上摆一条决策，好让自动事实那一段真的有话可说。
+  await h.tool('task').execute(
+    { action: 'plan', nodes: [{ id: 'ask-1', title: '[中枢] 用不用 pnpm？', detail: '答：不用 pnpm' }] },
+    { agent: h.rootAgent, callId: 'c0' },
+  )
+  const result = await h.tool('qa_thread').execute({ question: '为什么不用 pnpm？' }, { agent: h.rootAgent, callId: 'c1' })
+  assert.equal(h.starts.length, 1, '只给 question 必须照样派出去')
+  assert.equal(result.status, 'running')
+  const brief = String(h.starts[0].request.prompt[0].text)
+  assert.match(brief, /为什么不用 pnpm？/, '用户原话照旧进简报')
+  assert.equal(brief.includes('【主对话交底的想法】'), false, 'background 空 → 想法那一段整段省略')
+  assert.match(brief, /【已裁定的事】/, '没有 background 时自动事实段仍要出现')
+  assert.match(brief, /用不用 pnpm？/, '已裁定的事来自树')
+  assert.match(brief, /【去哪里找事实】/, '要交代事实从哪来')
+  assert.match(brief, /【任务树现状】/, '树的现状也要进简报')
+  const decisions = section(brief, '【已裁定的事】')
+  assert.ok(decisions !== null, '决策那一段要在')
+  assert.equal(decisions.includes('答：'), false, '答案要剥掉 `答：` 前缀，别把面板记号当内容')
+  assert.match(decisions, /用不用 pnpm？ → \*\*不用 pnpm\*\*/, '答案本身要在')
+})
+
+it('自动事实来自树：假树预置的决策节点连同它的答案一起进简报', async () => {
+  const h = harness()
+  h.nodesOf('sess-1').push(
+    { id: 'ask-1', title: '[中枢] 要不要给 explain 放开 task？', detail: '答：不给，task 进 deny', status: 'completed' },
+    { id: 'B1', title: '实现自动事实注入', detail: '还差测试', status: 'in_progress' },
+    { id: 'B2', title: '补构建', status: 'pending' },
+  )
+  await h.tool('qa_thread').execute({ question: 'q', background: 'b' }, { agent: h.rootAgent, callId: 'c1' })
+  const brief = String(h.starts[0].request.prompt[0].text)
+  const decisions = section(brief, '【已裁定的事】')
+  assert.ok(decisions !== null, '决策那一段要在')
+  assert.match(decisions, /要不要给 explain 放开 task？ → \*\*不给，task 进 deny\*\*/, '决策与答案要成对出现')
+  const treeText = section(brief, '【任务树现状】')
+  assert.ok(treeText !== null, '树那一段要在')
+  assert.match(treeText, /B1: 实现自动事实注入/, '树上的节点要露出来')
+  assert.match(treeText, /B2: 补构建/, '未干的节点也要露出来')
+  assert.match(treeText, /detail: 还差测试/, '非 completed 节点的 detail 要露出来')
+  assert.equal(brief.includes('## 已裁定的事（用户已经拍过板）'), false, 'Markdown 标题要剥掉，简报自带段头')
+})
+
+it('树服务缺席 / 读树抛异常：简报照常产出（只缺那两段），派发不被炸掉', async () => {
+  for (const options of [{ treeAbsent: true }, { treeThrows: true }] as const) {
+    const h = harness(options)
+    const result = await h.tool('qa_thread').execute({ question: 'Q', background: 'B' }, { agent: h.rootAgent, callId: 'c1' })
+    assert.equal(h.starts.length, 1, '树读不动也必须把线程派出去')
+    assert.equal(result.status, 'running')
+    const brief = String(h.starts[0].request.prompt[0].text)
+    assert.match(brief, /Q/, '用户原话照旧')
+    assert.match(brief, /B/, '想法照旧')
+    assert.match(brief, /【去哪里找事实】/, '固定那一段照旧')
+    assert.match(brief, /【你跟用户的往来方式】/, '往来方式照旧')
+    assert.equal(brief.includes('【已裁定的事】'), false, '抓不到就整段省略，不写「（无）」')
+    assert.equal(brief.includes('【任务树现状】'), false, '任务树那一段同样整段省略')
+    assert.equal(brief.includes('(empty tree)'), false, '空树不许把渲染器的占位串漏进简报')
+  }
+})
+
+it('树很大时截断，且如实标注被截掉了多少行', async () => {
+  const h = harness()
+  for (let i = 0; i < 60; i++) {
+    h.nodesOf('sess-1').push({ id: 'N' + String(i), title: '节点 ' + String(i), status: 'pending' })
+  }
+  await h.tool('qa_thread').execute({ question: 'q', background: 'b' }, { agent: h.rootAgent, callId: 'c1' })
+  const brief = String(h.starts[0].request.prompt[0].text)
+  const treeSection = brief.slice(brief.indexOf('【任务树现状】'), brief.indexOf('【去哪里找事实】'))
+  const lines = treeSection.trimEnd().split('\n')
+  // 40 行正文 + 1 行段头 + 1 行截断说明。
+  assert.equal(lines.length, 42, '正文行数必须真的被限住，而不是「顺便提一句」')
+  assert.match(treeSection, /N0: 节点 0/, '留下的是前 40 行')
+  assert.equal(treeSection.includes('N59:'), false, '被截掉的那一段不许还在')
+  assert.match(treeSection, /另有 20 行未列/, '截断了多少行要如实写出来')
+  assert.match(treeSection, /只列了前 40 行/, '说明里要写清上限')
 })
 
 it('qa_thread 的 label 可覆盖：给了就进派发请求；身份名照旧是「问答」', async () => {
@@ -207,17 +315,19 @@ it('qa_thread 的 label 可覆盖：给了就进派发请求；身份名照旧�
   assert.equal(h.starts[0].label, '问答', '身份显示名永远跟着生效键走，不被调用方的活名顶掉')
 })
 
-it('qa_thread 缺 question 或缺 background 一律抛错，一个孩子都不派', async () => {
+it('qa_thread 缺 question 一律抛错；缺 background 不抛（那才是新契约）', async () => {
   const h = harness()
   await assert.rejects(
     () => h.tool('qa_thread').execute({ background: 'b' }, { agent: h.rootAgent, callId: 'c1' }),
     /question/,
   )
-  await assert.rejects(
-    () => h.tool('qa_thread').execute({ question: 'q' }, { agent: h.rootAgent, callId: 'c1' }),
-    /background/,
-  )
-  assert.equal(h.starts.length, 0, '参数不全时不许派发')
+  // **契约变更**：原先这一行断言「只传 question 会被 `/background/` 拒掉」。现在事实由
+  // 插件自己抓，`background` 只剩「想法」这一件可省的事，所以只传 question **必须派出去**。
+  // 保留的仍是它原本要钉的那条**纪律**：参数不全时不许派发 —— 只是「不全」的定义
+  // 从「缺两参之一」收窄成「缺 question 这一参」（缺了它这条线程根本不知道要答什么）。
+  const ok = await h.tool('qa_thread').execute({ question: 'q' }, { agent: h.rootAgent, callId: 'c2' })
+  assert.equal(ok.status, 'running', '只给 question 应当成功派发')
+  assert.equal(h.starts.length, 1, '两条调用里只有合法的那一条派出了孩子')
 })
 
 it('问答线程：卡片正文逐字是模型那一句 —— 连问几轮，插件一个字都不往里拼', async () => {

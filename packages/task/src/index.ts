@@ -259,6 +259,22 @@ const MAX_DELEGATION_DEPTH = 3
 const DECISION_MERGE_DEPTH = MAX_DELEGATION_DEPTH
 
 /**
+ * 决策段的 Markdown 标题。
+ *
+ * 提成常量是因为它现在有**两个读点**：{@link buildDecisions} 用它起头（系统提示词那份），
+ * 问答线程的简报 {@link stripDecisionHeading} 拿它当锚点把标题剥掉（简报自带段头）。
+ * 两处靠字符串对齐等于把一条不变式藏在两个文件里的两个字面量上。
+ */
+const DECISION_HEADING = '## 已裁定的事（用户已经拍过板）'
+
+/**
+ * 简报里「任务树现状」那一段的**行数上限**。
+ *
+ * 为什么要有：树在长会话里没有上限（一条 run 就能挂几十个节点），整棵印进简报会把
+ * 「用户的问题」与「往来方式」挤出子线的视线。截断必须留痕，见 {@link truncateTreeBrief}。
+ */
+const TREE_BRIEF_MAX_LINES = 40
+
 /**
  * 角色名（**实际生效的 preset 键**）→ 中文显示名。
  *
@@ -1150,7 +1166,7 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
     const decisions = flattenNodes(nodes).filter(node => node.id.startsWith(DECISION_PREFIX) && node.detail !== undefined)
     if (decisions.length === 0) return ''
     return [
-      '## 已裁定的事（用户已经拍过板）',
+      DECISION_HEADING,
       '',
       '以下是本次会话里用户**已经明确回答过**的问题。不要再问一遍，也不要另起炉灶推翻它们。',
       '',
@@ -2355,6 +2371,55 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
     }
   }
   /**
+   * 简报里「任务树现状」那一段：**派发那一刻**从合并视图渲一份。
+   *
+   * 与 {@link buildDecisions} 同一条纪律：树服务缺席、读树抛异常、树是空的，
+   * 一律**静默返回空串**（这一段就整段省略），绝不把一次派发炸掉 ——
+   * 简报里少一段事实，比开不出一条线程好得多。
+   *
+   * 读的同样是**合并视图**（子代理自己的树挂在派发节点下面），所以这条线程看得见
+   * 「已经做过哪些、哪些还没干、哪些挂了」，而不只是主对话那一层。
+   * @param sid - 派发方（主对话）那条会话的 id。
+   * @returns 渲染好的树文本；没有可说的就空串。
+   */
+  const treeBrief = (sid: string): string => {
+    let nodes: readonly TaskNode[]
+    try {
+      const port = tree()
+      nodes = port.readMerged !== undefined ? port.readMerged(sid, DECISION_MERGE_DEPTH) : port.read(sid)
+    } catch { return '' }
+    const rendered = renderTree(nodes)
+    return rendered === EMPTY_TREE ? '' : truncateTreeBrief(rendered)
+  }
+
+  /**
+   * 这一段自动抓的**事实**：已裁定的事 + 任务树现状。
+   *
+   * ## 为什么只抓这两处、**不去读主会话的对话记录**
+   *
+   * 「事实」与「想法」是两样东西：
+   *   - **事实**（用户拍过什么板、树上有哪些活、代码里写的到底是什么）住在**稳定的地方**，
+   *     插件在派发那一刻自己去取，取不到就整段省掉 —— 调用方一个字都不用写；
+   *   - **想法**（你刚说了什么、哪条路被否决了、为什么现在问这个）**只有主对话知道**，
+   *     它本来就只存在于那条对话里，靠自动摘一段对话历史去猜既贵又不可靠，所以那段
+   *     仍然由调用方在 `background` 里交底。
+   *
+   * 因此这里**故意不碰**会话事件那条缝：把主会话的对话记录摘进子线，正是这条线程
+   * 要避开的东西（上下文漂回主对话）。事实是**推**给它的，它不必去**拉**。
+   * @param sid - 派发方（主对话）那条会话的 id；拿不到就一段都不抓。
+   * @returns 拼进简报的分段，按「已裁定的事」、「任务树现状」的顺序；一个都没有则空数组。
+   */
+  const qaFacts = (sid: string | undefined): readonly string[] => {
+    if (sid === undefined) return []
+    const parts: string[] = []
+    const decisions = buildDecisions(sid)
+    if (decisions !== '') parts.push('【已裁定的事】\n' + stripDecisionHeading(decisions))
+    const treeText = treeBrief(sid)
+    if (treeText !== '') parts.push('【任务树现状】\n' + treeText)
+    return parts
+  }
+
+  /**
    * 问答线程：把「用户要你解释」或「用户提了一个独立的新方向」单独开一条只干问答的线程。
    *
    * ## 为什么要有它
@@ -2371,6 +2436,21 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
    * 不该用：填空、确认、二选一这类一句话就能定的小事 —— 那些直接调
    *       `ask_user_question`（或 `task` 的 `ask`），开一条线程只为问一句是浪费；
    *       也不该拿它当「帮我查一下」的通用后端，它**只干问答、不改文件、不派活**。
+   *
+   * ## 事实自己查：调用方只交想法
+   *
+   * 这条线程看的**事实**不再靠调用方每次手写：插件在派发那一刻从两处稳定源头抓
+   * （已裁定的事 = {@link buildDecisions}，任务树现状 = {@link treeBrief}），
+   * 拼成 `【已裁定的事】` / `【任务树现状】` 两段注进简报，并且明说这两段只是快照 ——
+   * 它自己有读文件、跑命令的手，项目事实自己到仓库里查（见 {@link qaThreadBrief}）。
+   * `background` 因此**不再必填**，它要交的只剩**想法**。
+   *
+   * **这条缝不许扩到读主会话的对话历史**：那正是这条线程要避开的东西（上下文漂回主对话），
+   * 而「哪条路被否决了」这类想法本来就只存在于人那一边，自动摘一段对话既贵又不可靠。
+   * 事实走推、想法走交底，两边不混。
+   *
+   * 事实既然是**推**给它的，它就**不需要** `task` 工具去拉 —— `explain` 那条身份的
+   * deny 名单里 `task` 照旧不放出来（放出来等于给它派活的手，那是这条身份的红线）。
    *
    * ## 交接方式
    *
@@ -2397,6 +2477,8 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
       + '它与用户的**全部**往来都走现成的提问卡片（就是你现在用的这套卡片，不另造聊天窗口）；'
       + '它会把答案讲清楚、用卡片交给用户，用户答完接着答下一轮，直到用户说「就这些」。'
       + '**结论会自动回到主对话**（它结算时你收到一条 `subagent-settled` 通知），中间的问答不进你的上下文。'
+      + '它要的**事实由插件自动抓**（`【已裁定的事】`/`【任务树现状】`两段在派发那一刻注入），'
+      + '项目事实它自己到仓库里查；所以 `background` 只交**想法**（你刚说了什么、哪条路被否决了、为什么现在问这个），省略也可以。'
       + '本工具立刻返回、不等结果；要读结论用 `task` 的 `result` 动作，按当时情况自己判断何时读。',
     parameters: {
       question: {
@@ -2406,8 +2488,10 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
       },
       background: {
         type: 'string',
-        required: true,
-        description: '这条线程需要的背景：当前在做什么、已经定过什么、相关的文件在哪里。它看不到你的上下文，你写进去的才是它知道的。',
+        description: '可选：这条线程需要知道的**想法/意图** —— 只有你才知道的那些东西（你刚说了什么、哪条路被否决了、为什么现在问这个）。'
+          + '**事实不用你写**：用户已裁定的事与任务树现状由插件在派发这一刻自动抓取并写进简报（`【已裁定的事】`/`【任务树现状】`），'
+          + '而项目事实（代码怎么写的、配置在哪）它自己会到仓库里查。'
+          + '你**不必**也不该把「背景资料」复述一遍；省略它，简报里就只没有「想法」那一段。',
       },
       label: { type: 'string', description: '这条线程在面板上的短标签。省略即为「问答」。' },
     },
@@ -2434,9 +2518,11 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
       const question = (args.question ?? '').trim()
       const background = (args.background ?? '').trim()
       if (question === '') throw new Error('qa_thread: `question` 是必填的 —— 没有要答的东西，这条线程开了也没用')
-      if (background === '') throw new Error('qa_thread: `background` 是必填的 —— 这条线程看不到你的上下文，不给背景它只能拿常识硬答')
+      // `background` **不再必填**：事实由插件自己从稳定源头抓（见 {@link qaFacts}），
+      // 调用方要交的只剩「想法」，而想法可以一个字都没有（比如「用户问它是怎么工作的」
+      // 这种纯粹的解释请求）。空 → 那一段整段省略，见 {@link qaThreadBrief}。
       const started = await dispatchTo(parent, {
-        prompt: qaThreadBrief(question, background),
+        prompt: qaThreadBrief(question, background, qaFacts(parent.session?.id)),
         preset: EXPLAIN_PRESET,
         label: args.label ?? '问答',
       }, exec.signal)
@@ -3032,24 +3118,39 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
 /**
  * `qa_thread` 交给那条线程的简报。
  *
- * 三段的分工不许混：**用户原话**（它到底要什么）、**背景**（它需要知道什么）、
- * **往来方式**（它该怎么跟用户说话）。第三段是**代码里的固定文本**，不是调用方手写的 ——
- * 「一轮一轮用卡片接着问，直到用户说就这些」这件事每开一条线程都要重说一遍的话，
- * 迟早会漏掉一条，而漏掉的那条会写完一大段就自己收工了。
+ * 分段按**源头**分：哪一段是**事实**（谁抓的）、哪一段是**想法**（谁交的）必须一眼看得出 ——
+ * 这条线程要据此判断「哪句能信、哪句还得自己去核」。
  *
- * 历史回显**不写进简报**：插件不在卡片正文里拼历史（见 {@link installAskProxy}），
+ * 1. `【用户的问题】`：用户原话，调用方给什么写什么；
+ * 2. `【主对话交底的想法】`：调用方写的 `background`；**空时整段省略**；
+ * 3. `【已裁定的事】` / `【任务树现状】`：**插件自己抓的事实**（见 `qaFacts`），
+ *    拿不到就整段没有 —— 一段都不许用「（无）」之类的话凑；
+ * 4. `【去哪里找事实】`：固定文本，交代前面那两段只是**派发那一刻**的快照、
+ *    而且它自己就有读文件跑命令的手，项目事实自己到仓库里查；
+ * 5. `【你跟用户的往来方式】`：固定文本，交代它跟用户说话的唯一出口。
+ *
+ * 第 4、5 段是**代码里的固定文本**，不是调用方手写的 —— 「一轮一轮用卡片接着问」与
+ * 「事实自己去查」这两件事每开一条线程都要重说一遍的话，迟早会漏掉一条。
+ *
+ * 历史回显**不写进简报**：插件不在卡片正文里拼历史（见 `installAskProxy`），
  * 回看走子会话里官方提问行的「回顾」，在这里交代一句「去看历史」两处都不挨着。
  * @param question - 用户的问题/想讨论的东西（尽量是原话）。
- * @param background - 这条线程需要的背景。
+ * @param background - 调用方交底的想法；空串即没有这一段。
+ * @param facts - 插件自动抓的事实分段（`qaFacts` 的产出）；空数组即没有这两段。
  * @returns 简报全文。
  */
-function qaThreadBrief(question: string, background: string): string {
-  return [
-    '【用户的问题】',
-    question,
+function qaThreadBrief(question: string, background: string, facts: readonly string[] = []): string {
+  const parts: string[] = ['【用户的问题】', question]
+  if (background !== '') parts.push('', '【主对话交底的想法】', background)
+  for (const fact of facts) parts.push('', fact)
+  parts.push(
     '',
-    '【背景】',
-    background,
+    '【去哪里找事实】',
+    '上面那两段（已裁定的事／任务树现状）是**派发那一刻**的快照，不一定全，也可能已经过时。',
+    '**项目事实自己去查**：你手上有读文件、按路径找文件、按内容搜索、跑命令的工具 ——'
+      + '代码怎么写的、配置在哪、某个函数到底干什么，到仓库里自己看。**别指望别人告诉你**，'
+      + '也别凭常识猜：仓库就在那里，读它。',
+    '查不到或说不准时，就照实说查不到 —— 那比编一个像样的答案强。',
     '',
     '【你跟用户的往来方式】',
     '这是一条**问答线程**：你要做的是把用户问的东西讲清楚，不是去改代码、也不是去派活。',
@@ -3059,6 +3160,40 @@ function qaThreadBrief(question: string, background: string): string {
     '用户答完，你就着新的追问**继续解释、再弹下一张卡**；需要好几轮就问好几轮，'
       + '（每张卡正文只写你这一轮要说的话，不要在里面复述前几轮 —— 用户要看，回去翻问答记录）。',
     '直到用户选「就这些」，才停手 —— 那时把这次问答的结论写进你的最终结果（结语）。',
+  )
+  return parts.join('\n')
+}
+
+/**
+ * 把 `buildDecisions` 产出里的 Markdown 标题行剥掉。
+ *
+ * 那一份是给**系统提示词**用的，自带 `## …` 标题；拼进简报时段头已经是
+ * `【已裁定的事】`，标题再留着就成了同一句话说两遍。只剥**第一行**，且只当它
+ * 真是那个已知标题时才剥 —— 正文里万一也有 `##`，那一个字都不许动。
+ * @param rendered - `buildDecisions(sid)` 的产出。
+ * @returns 去掉标题行、并把紧随其后的空行一并吃掉之后的正文。
+ */
+function stripDecisionHeading(rendered: string): string {
+  if (!rendered.startsWith(DECISION_HEADING)) return rendered
+  return rendered.slice(DECISION_HEADING.length).replace(/^\n+/, '')
+}
+
+/**
+ * 给任务树现状那一段加上行数上限：**截了就要说**。
+ *
+ * 不许默默砍掉 —— 这条线程看到的是一份「看起来完整」的树，而它正拿这份树当事实用；
+ * 悄悄少掉一半会让它把「没列出来的活」当成「不存在」。所以被截时补一行说明，
+ * 把总数与未被列出的行数如实报出来。
+ * @param rendered - `renderTree` 的产出（多行）。
+ * @returns 原样，或截断后的文本加一行说明。
+ */
+function truncateTreeBrief(rendered: string): string {
+  const lines = rendered.split('\n')
+  if (lines.length <= TREE_BRIEF_MAX_LINES) return rendered
+  return [
+    ...lines.slice(0, TREE_BRIEF_MAX_LINES),
+    '（树太大，只列了前 ' + String(TREE_BRIEF_MAX_LINES) + ' 行，另有 '
+      + String(lines.length - TREE_BRIEF_MAX_LINES) + ' 行未列。）',
   ].join('\n')
 }
 
@@ -3322,6 +3457,15 @@ function childrenTruncationHint(total: number, shown: number): string {
 }
 
 /**
+ * `renderTree` 在**树上什么都没有**时回的那一句。
+ *
+ * 提成常量是因为它现在有第二个读点：{@link treeBrief} 拿它判断「这段到底有没有话说」——
+ * 空树的渲染结果不是空串，直接拼进简报会凭空多出一段写着「(empty tree)」的
+ * 「任务树现状」。两处靠字面量对齐等于把一条不变式藏进两个地方。
+ */
+const EMPTY_TREE = '(empty tree)'
+
+/**
  * 把一棵（可能嵌套的）树铺平成一列，顺序是先序：父在前、它的孩子紧随其后。
  *
  * 合并视图把被派发的子会话那棵树**挂**在派发节点的 `children` 上
@@ -3364,7 +3508,7 @@ function renderTree(nodes: readonly TaskNode[]): string {
     }
   }
   walk(nodes, 0)
-  return lines.length === 0 ? '(empty tree)' : lines.join('\n')
+  return lines.length === 0 ? EMPTY_TREE : lines.join('\n')
 }
 
 /**
