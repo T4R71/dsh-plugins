@@ -438,6 +438,103 @@ it('task 的回显：数组一行一项、空数组跳过、false 与 0 照原�
   assert.equal(text.includes('worktrees'), false, '空数组跳过')
 })
 
+/**
+ * 一段决策正文的**条**数（`- ` 起头的一行算一条）。
+ * @param section - 【已裁定的事】那一段的正文。
+ * @returns 条数。
+ */
+function bullets(section: string): string[] {
+  return section.split('\n').filter(line => line.startsWith('- '))
+}
+
+it('已裁定的事：单条标题被压成一行且带留痕，答案一字不动', async () => {
+  const h = harness()
+  // 标题 400 字符、中间夹两个换行 —— 真机上决策节点的 title 就是提问卡片正文，
+  // 主对话往里写的是一大段说理（实测 27 条里 9 条是多行、单条最长 695 字符）。
+  const longTitle = '先说一段很长的背景。'.repeat(20) + '\n第二段说理。\n第三段再说一句。'
+  const answer = '先别做：放一放。'
+  await h.tool('task').execute(
+    { action: 'plan', nodes: [{ id: 'ask-1', title: longTitle, detail: '答：' + answer }] },
+    { agent: h.rootAgent, callId: 'c0' },
+  )
+  await h.tool('qa_thread').execute({ question: 'q' }, { agent: h.rootAgent, callId: 'c1' })
+  const brief = String(h.starts[0].request.prompt[0].text)
+  const decisions = section(brief, '【已裁定的事】')
+  assert.ok(decisions !== null, '决策那一段要在')
+  const items = bullets(decisions)
+  assert.equal(items.length, 1, '一条决策仍然只占一条')
+  const line = items[0] as string
+  assert.equal(line.includes('\n'), false, '标题里的换行必须被折叠掉 —— 这条是「压成单行」')
+  assert.match(line, /…/, '被截的标题要留省略号')
+  assert.match(line, /标题已截到 160 字符（原文 \d+ 字符）/, '截了多少要如实写出来')
+  assert.match(line, /原文 3 行/, '原文是几行也要写出来')
+  assert.ok(line.includes('→ **' + answer + '**'), '答案必须完整保留，一个字不动')
+})
+
+it('已裁定的事：整段超上限就截，并如实写出总条数与未列条数', async () => {
+  const h = harness()
+  const total = 25
+  for (let i = 1; i <= total; i++) {
+    await h.tool('task').execute(
+      { action: 'plan', nodes: [{ id: 'ask-' + String(i), title: '第' + String(i) + '件事怎么定？', detail: '答：定' + String(i) }] },
+      { agent: h.rootAgent, callId: 'c' + String(i) },
+    )
+  }
+  await h.tool('qa_thread').execute({ question: 'q' }, { agent: h.rootAgent, callId: 'c9' })
+  const decisions = section(String(h.starts[0].request.prompt[0].text), '【已裁定的事】')
+  assert.ok(decisions !== null, '决策那一段要在')
+  const items = bullets(decisions)
+  // 20 条正文 + 1 行截断说明（说明行本身不以 `- ` 起头，故单独断言）。
+  assert.equal(items.length, 20, '正文条数必须真的被限住，而不是「顺便提一句」')
+  assert.match(decisions, /第1件事怎么定？ → \*\*定1\*\*/, '留下的是前 20 条，首条要在')
+  assert.equal(decisions.includes('第21件事'), false, '被截掉的那一段不许还在')
+  assert.match(decisions, /决策共 25 条，只列了前 20 条，另有 5 条未列/, '截断了多少条要如实写出来')
+})
+
+it('已裁定的事：短决策逐字原样，看不出任何加工痕迹', async () => {
+  const h = harness()
+  await h.tool('task').execute(
+    { action: 'plan', nodes: [{ id: 'ask-1', title: '[中枢] 用不用 pnpm？', detail: '答：不用 pnpm' }] },
+    { agent: h.rootAgent, callId: 'c0' },
+  )
+  await h.tool('qa_thread').execute({ question: 'q' }, { agent: h.rootAgent, callId: 'c1' })
+  const decisions = section(String(h.starts[0].request.prompt[0].text), '【已裁定的事】')
+  assert.ok(decisions !== null, '决策那一段要在')
+  const items = bullets(decisions)
+  assert.deepStrictEqual(items, ['- [中枢] 用不用 pnpm？ → **不用 pnpm**'], '没超限的条目必须逐字原样')
+  assert.equal(decisions.includes('…'), false, '没被截就不许出现省略号')
+  assert.equal(decisions.includes('已截到'), false, '没被截就不许出现留痕')
+  assert.equal(decisions.includes('未列'), false, '没超条数就不许出现截断说明')
+})
+
+it('已裁定的事：问题是超长的、答案也长 —— 红线是答案一个字都不许少', async () => {
+  const h = harness()
+  const longTitle = '这是主对话写的一大段说理，'.repeat(30)
+  // 答案同样长（133 字符是实测最长答案的量级），专门用来钉「只截标题不截答案」。
+  const answer = '我仍然有一些补充想法：'
+    + '第一，这个机制真正的目的是让我在指定方案时能问一些问题了解情况，'
+    + '或者我根本就不懂、你得给我解答，那这样会导致主对话参杂无关内容，上下文腐化变快、成本也高；'
+    + '第二，主对话思考的时候不适合打断，我要的是实时响应的对话；'
+    + '第三，我可能需要多线程讨论，几条线之间谁也不碰谁，谁也不等谁。'
+  await h.tool('task').execute(
+    { action: 'plan', nodes: [{ id: 'ask-1', title: longTitle, detail: '答：' + answer }] },
+    { agent: h.rootAgent, callId: 'c0' },
+  )
+  await h.tool('qa_thread').execute({ question: 'q' }, { agent: h.rootAgent, callId: 'c1' })
+  const brief = String(h.starts[0].request.prompt[0].text)
+  const decisions = section(brief, '【已裁定的事】')
+  assert.ok(decisions !== null, '决策那一段要在')
+  const items = bullets(decisions)
+  assert.equal(items.length, 1, '答案再长也不许被拆成第二条')
+  const line = items[0] as string
+  // 红线：答案逐字完整 —— 用不依赖标题被压多短的写法钉死。
+  assert.ok(line.includes('→ **' + answer + '**'), '答案必须逐字完整（这是这一段的唯一用途）')
+  assert.ok(answer.length > 100, '这条测试的意义就在答案够长，别把它写短了')
+  // 标题那一头确实被压了：留在答案前面的那段不含整条原问题。
+  assert.equal(line.includes(longTitle), false, '超长标题不该整段留在简报里')
+  assert.match(line, /…/, '标题那头要留省略号')
+})
+
 it('task 的回显：一个字段都没有时也有话说（不是空块）', () => {
   const h = harness()
   const blocks = h.tool('task').output!.render({}, {})

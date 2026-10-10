@@ -276,6 +276,55 @@ const DECISION_HEADING = '## 已裁定的事（用户已经拍过板）'
 const TREE_BRIEF_MAX_LINES = 40
 
 /**
+ * 简报里「已裁定的事」那一段里**单条标题**的字符上限。
+ *
+ * ## 为什么必须有这一刀
+ *
+ * 这一段的输入是 `buildDecisions` 的产出，而它**没有任何上限** —— 实测一条 27 条决策的
+ * 简报里，这一段独占 4078 字符 / 90 行（整篇 7369 字符），比已经截过的「任务树现状」还大。
+ * 拆开看两头：真正短的是**答案**（实测均值 39 字符），长的是**标题** —— 决策节点的 title
+ * 就是提问卡片的正文，主对话往里写的是一大段说理（实测单条最长 695 字符、27 条里 9 条是多行）。
+ * 把标题整段搬过去，等于把主对话的独白复述一遍，而这条问答线程存在的全部理由就是
+ * 别让主对话的上下文流进来。
+ *
+ * ## 定值依据（拿实测那 27 条 4078 字符的决策集，逐个组合实跑出来的）
+ *
+ * | 条数上限 | 标题上限 | 段字符 | 段行数 | 其中被截的条 |
+ * | --- | --- | --- | --- | --- |
+ * | 不设 | 不设 | 4078 | 90 | — |
+ * | 40 | 300 | 3580 | 29 | 2 |
+ * | 20 | 200 | 2102 | 23 | 0 |
+ * | 20 | 160 | 2102 | 23 | 0 |
+ * | 20 | 120 | 2111 | 23 | 1 |
+ *
+ * 取 **160**。表里那两行读出来的结论是：这个量级的段里，**字数由条数上限决定**
+ * （40→20 一次降 41%），标题上限本身只负责削掉「几百字符的主对话独白」这类离群值 ——
+ * 实测这一组里没有超过 160 的标题，可它一旦出现（合成集：27 条、标题均 300 字符），
+ * 160 这一刀就再降 53%。120 反而更差：多截了 1 条却多花 9 个字符。
+ *
+ * 160 也是实测标题均值 101 的 1.6 倍：认得清「这是哪一件事」，又不至于把独白搬回来。
+ * 再往上加（200 起）省不下任何东西，再往下压（120）要付出「认不出是哪件事」的代价
+ * 却只多省几个字符。
+ *
+ * **答案一个字都不截**：这一段唯一的用途是「别再重问已经拍过板的事」，
+ * 答案被截掉，这条线程就会把问过的事再问一遍 —— 那比长坏得多。
+ */
+const DECISION_TITLE_MAX_CHARS = 160
+
+/**
+ * 简报里「已裁定的事」那一段的**条数上限**。
+ *
+ * 与 {@link TREE_BRIEF_MAX_LINES} 同一条纪律：超了就截，**截了就要如实说**
+ * （见 {@link compactDecisionBrief}），不许默默砍掉 —— 这条线程拿这一段当「哪些事
+ * 已经拍过板」的**全部事实**用，悄悄少一半会让它把「没列出来的决策」当成「还没定」，
+ * 转头再问一遍。
+ *
+ * 是**条数**不是行数：每条决策都被 {@link compactDecisionBullet} 压成了恰好一行，
+ * 两个说法在这里等价。取 20 的理由见 {@link DECISION_TITLE_MAX_CHARS} 上那张表。
+ */
+const DECISION_BRIEF_MAX_ITEMS = 20
+
+/**
  * 角色名（**实际生效的 preset 键**）→ 中文显示名。
  *
  * 只影响**给人看的两处**：树节点标题与提问卡片前缀（两者都取自 `installAskProxy` 的 label）。
@@ -2406,6 +2455,12 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
    *
    * 因此这里**故意不碰**会话事件那条缝：把主会话的对话记录摘进子线，正是这条线程
    * 要避开的东西（上下文漂回主对话）。事实是**推**给它的，它不必去**拉**。
+   * 与 {@link truncateTreeBrief} 同一处纪律：树服务缺席、读树抛异常，一律静默返回空数组
+   * （那一段整段省略），绝不把一次派发炸掉。决策那一段的**上限**另见
+   * {@link compactDecisionBrief}：只压这一侧的产出，`buildDecisions` 本身一个字不动。
+   *
+   * 因此这里**故意不碰**会话事件那条缝：把主会话的对话记录摘进子线，正是这条线程
+   * 要避开的东西（上下文漂回主对话）。事实是**推**给它的，它不必去**拉**。
    * @param sid - 派发方（主对话）那条会话的 id；拿不到就一段都不抓。
    * @returns 拼进简报的分段，按「已裁定的事」、「任务树现状」的顺序；一个都没有则空数组。
    */
@@ -2413,7 +2468,7 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
     if (sid === undefined) return []
     const parts: string[] = []
     const decisions = buildDecisions(sid)
-    if (decisions !== '') parts.push('【已裁定的事】\n' + stripDecisionHeading(decisions))
+    if (decisions !== '') parts.push('【已裁定的事】\n' + compactDecisionBrief(stripDecisionHeading(decisions)))
     const treeText = treeBrief(sid)
     if (treeText !== '') parts.push('【任务树现状】\n' + treeText)
     return parts
@@ -3124,7 +3179,9 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
  * 1. `【用户的问题】`：用户原话，调用方给什么写什么；
  * 2. `【主对话交底的想法】`：调用方写的 `background`；**空时整段省略**；
  * 3. `【已裁定的事】` / `【任务树现状】`：**插件自己抓的事实**（见 `qaFacts`），
- *    拿不到就整段没有 —— 一段都不许用「（无）」之类的话凑；
+ *    拿不到就整段没有 —— 一段都不许用「（无）」之类的话凑。
+ *    两段都**有上限、且截了就说**：「已裁定的事」单条压成一行、答案一字不截、
+ *    整段超 20 条就标注未列条数（`compactDecisionBrief`）；「任务树现状」按 40 行截并标注。
  * 4. `【去哪里找事实】`：固定文本，交代前面那两段只是**派发那一刻**的快照、
  *    而且它自己就有读文件跑命令的手，项目事实自己到仓库里查；
  * 5. `【你跟用户的往来方式】`：固定文本，交代它跟用户说话的唯一出口。
@@ -3176,6 +3233,90 @@ function qaThreadBrief(question: string, background: string, facts: readonly str
 function stripDecisionHeading(rendered: string): string {
   if (!rendered.startsWith(DECISION_HEADING)) return rendered
   return rendered.slice(DECISION_HEADING.length).replace(/^\n+/, '')
+}
+
+/** 决策条目的分隔符：`buildDecisions` 用它把标题与答案拼起来（`- 标题 → **答案**`）。 */
+const DECISION_ARROW = ' → **'
+
+/**
+ * 把一个决策条目压成**恰好一行**：标题折叠换行 + 截断，**答案一个字不动**。
+ *
+ * ## 为什么只压标题
+ *
+ * 这一段的用途是「别再重问已经拍过板的事」，扛这个用途的**只有答案**（实测均值 39 字符，
+ * 用户答的都是「先别做：放一放。」这类短句）；长的那一头是标题 —— 决策节点的 title
+ * 就是提问卡片正文，主对话往里写的是一大段说理（实测 27 条里 9 条带换行、单条最长 695 字符）。
+ * 所以：标题压，答案留。答案被截掉，这条线程就会把问过的事再问一遍。
+ *
+ * ## 留痕
+ *
+ * 不许默默砍：真压过/截过的条目在标题后补一句 `（已截到 N 字符，原文 M 行）`，
+ * 截断处另有省略号 `…`。**没被动过的条目逐字原样返回** —— 短决策不该看出加工痕迹，
+ * 否则「哪条被动过」就成了噪音。
+ * @param block - 一个决策条目（可能跨多行）。
+ * @returns 单行条目；认不出 `- 标题 → **答案**` 这个形状时原样返回（只是把尾巴的换行去掉）。
+ */
+function compactDecisionBullet(block: string): string {
+  // 分块是从原文里切出来的，还带着 `- ` 前缀；这里统一按**正文**加工，出口再补回去。
+  const raw = block.trimEnd()
+  const body = raw.startsWith('- ') ? raw.slice(2) : raw
+  // 认形状：只有 `…答案**` 结尾的才拆得开。拆不开就一个字别动 —— 这段是事实段，
+  // 猜错了比不加工更坏（把答案当标题截掉正是这条改动的红线）。
+  if (!body.endsWith('**')) return raw
+  const inner = body.slice(0, -2)
+  const at = inner.lastIndexOf(DECISION_ARROW)
+  if (at === -1) return raw
+  const rawTitle = inner.slice(0, at)
+  const answer = inner.slice(at + DECISION_ARROW.length)
+  const lineCount = rawTitle.split('\n').length
+  const folded = rawTitle.replace(/\s+/g, ' ').trim()
+  const chars = Array.from(folded)
+  const truncated = chars.length > DECISION_TITLE_MAX_CHARS
+  const title = truncated ? chars.slice(0, DECISION_TITLE_MAX_CHARS - 1).join('') + '…' : folded
+  const marks: string[] = []
+  if (truncated) marks.push('标题已截到 ' + String(DECISION_TITLE_MAX_CHARS) + ' 字符（原文 ' + String(chars.length) + ' 字符）')
+  if (lineCount > 1) marks.push('原文 ' + String(lineCount) + ' 行')
+  const note = marks.length === 0 ? '' : '（' + marks.join('，') + '）'
+  return '- ' + title + note + DECISION_ARROW + answer + '**'
+}
+
+/**
+ * 给「已裁定的事」那一段加上限：单条压成一行，整段超条数就截，**截了就要说**。
+ *
+ * 与 {@link truncateTreeBrief} 同一条纪律、同一种交代方式：被截时补一行说明，
+ * 把总条数与未列条数如实报出来。不许默默砍掉 —— 这条线程拿这一段当「哪些事已经
+ * 拍过板」的全部事实用，少掉一半会让它把没列出来的决策当成还没定，转头再问一遍，
+ * 那正是这一段要防的事。
+ *
+ * 只动 `buildDecisions` 的**产出**，不动它本身：那一份是给系统提示词、主对话自己看的，
+ * 行为不能跟着问答线程一起变。
+ * @param body - `stripDecisionHeading(buildDecisions(sid))` 的产出。
+ * @returns 压过的正文；没有条目时原样返回。
+ */
+function compactDecisionBrief(body: string): string {
+  const lines = body.split('\n')
+  const head: string[] = []
+  let firstBullet = -1
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i] ?? ''
+    if (line.startsWith('- ')) { firstBullet = i; break }
+    head.push(line)
+  }
+  if (firstBullet === -1) return body
+  // 分块：`- ` 起头是新条目，其余行归上一条（标题里带换行时就是这个形状）。
+  const blocks: string[] = []
+  for (const line of lines.slice(firstBullet)) {
+    if (line.startsWith('- ')) blocks.push(line)
+    else if (blocks.length > 0) blocks[blocks.length - 1] += '\n' + line
+  }
+  if (blocks.length === 0) return body
+  const kept: string[] = blocks.slice(0, DECISION_BRIEF_MAX_ITEMS).map(compactDecisionBullet)
+  if (blocks.length > DECISION_BRIEF_MAX_ITEMS) {
+    kept.push('（决策共 ' + String(blocks.length) + ' 条，只列了前 '
+      + String(DECISION_BRIEF_MAX_ITEMS) + ' 条，另有 '
+      + String(blocks.length - DECISION_BRIEF_MAX_ITEMS) + ' 条未列。）')
+  }
+  return [...head, ...kept].join('\n')
 }
 
 /**
