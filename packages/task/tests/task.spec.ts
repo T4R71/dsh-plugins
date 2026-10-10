@@ -112,6 +112,22 @@ function freshLedgerFile(): string {
 }
 
 /**
+ * 同上，但一次给出**两个**账本路径（run 与 worktree）。写法与 `qa-thread.spec.ts`
+ * 的 `freshLedgerFiles()` 同源。
+ *
+ * 为什么本文件里那些**不走 harness** 的裸 `apply(ctx, {...})` 也必须用它：
+ * 那些用例的假 ctx 没有 `baseUrl`，`runsFile` 省略（或写成空串）时会一路落到
+ * `ledgerPathFor` 回退链的最后一档 —— `DSH_PROFILE_DIR`，也就是**用户正在用的真机
+ * profile 账本** `task-runs.json`。每一次 `run` 都往那个真文件里叠一条记录，
+ * 与别的 spec 并发跑时多个进程还会抢写同一个文件。
+ * @returns 一个尚未写过的私有目录里的两个账本路径。
+ */
+function freshLedgerFiles(): { runsFile: string; worktreesFile: string } {
+  const dir = mkdtempSync(join(tmpdir(), 'task-runs-spec-'))
+  return { runsFile: join(dir, 'task-runs.json'), worktreesFile: join(dir, 'task-worktrees.json') }
+}
+
+/**
  * 读账本文件里某条会话的 run 列表。**直接读那个文件**，断言的是真的落了盘。
  * @param file - 账本文件路径。
  * @param sid - 会话 id。
@@ -554,7 +570,7 @@ it('run 把节点 preset 的 persona 与 toolFilter 平铺进 request，并包�
   systemPrompt: { section: () => () => {} },
   on: () => () => {},
   }
-  apply(ctx as never, { provider: 'default', presets: { reader: { persona: 'P', allow: ['read'] } } })
+  apply(ctx as never, { provider: 'default', ...freshLedgerFiles(), presets: { reader: { persona: 'P', allow: ['read'] } } })
   const result = await run(captured as Captured, {
     action: 'run',
     run: 'r1',
@@ -619,6 +635,7 @@ it('run 把节点 preset 的内核 preset 名放进 request——孩子显式声
   // 两者故意不同名，这样「透传的是查表结果而不是模型点的那个名字」才被真的钉住。
   apply(ctx as never, {
     provider: 'default',
+    ...freshLedgerFiles(),
     presets: { recon: { persona: 'R', preset: 'recon-face', deny: ['task'], agentOptions: { reasoningEffort: 'low' } } },
   })
   const result = await run(captured as Captured, {
@@ -658,7 +675,7 @@ it('名册在册但名字不在册 → 退回减法，且把「不在册」这�
     systemPrompt: { section: () => () => {} },
     on: () => () => {},
   }
-  apply(ctx as never, { provider: 'default', presets: { recon: { persona: 'R' } } })
+  apply(ctx as never, { provider: 'default', ...freshLedgerFiles(), presets: { recon: { persona: 'R' } } })
   const result = await run(captured as Captured, {
     action: 'run',
     run: 'r1',
@@ -695,7 +712,7 @@ it('名册读不动（list 抛）时照样派得出去，只是留痕写明名�
     systemPrompt: { section: () => () => {} },
     on: () => () => {},
   }
-  apply(ctx as never, { provider: 'default', presets: { recon: { persona: 'R' } } })
+  apply(ctx as never, { provider: 'default', ...freshLedgerFiles(), presets: { recon: { persona: 'R' } } })
   const result = await run(captured as Captured, {
     action: 'run',
     run: 'r1',
@@ -774,7 +791,7 @@ it('表里没写 preset 这一格时按角色键自己问名册 —— 声明选
     systemPrompt: { section: () => () => {} },
     on: () => () => {},
   }
-  apply(ctx as never, { provider: 'default', presets: { recon: { persona: 'R', deny: ['task'] } } })
+  apply(ctx as never, { provider: 'default', ...freshLedgerFiles(), presets: { recon: { persona: 'R', deny: ['task'] } } })
   const result = await run(captured as Captured, {
     action: 'run',
     run: 'r1',
@@ -817,6 +834,7 @@ it('run 把节点 preset 的 agentOptions 放进 request——角色自己钉住
   }
   apply(ctx as never, {
     provider: 'default',
+    ...freshLedgerFiles(),
     presets: { recon: { persona: 'R', agentOptions: { reasoningEffort: 'low', maxTokens: 4096 } } },
   })
   // 迁移的判断：agentOptions 的落点就是派发请求本身（只有直连一条通道，`startContinuable`
@@ -844,7 +862,7 @@ it('run 的节点 preset 没声明 agentOptions 时 request 里没有这个键�
     systemPrompt: { section: () => () => {} },
     on: () => () => {},
   }
-  apply(ctx as never, { provider: 'default', presets: { recon: { persona: 'R' } } })
+  apply(ctx as never, { provider: 'default', ...freshLedgerFiles(), presets: { recon: { persona: 'R' } } })
   await run(captured as Captured, { action: 'run', run: 'r1', nodes: [{ id: 'n1', prompt: 'go', preset: 'recon' }] }, caller)
   const spec = seen[0] as { request: Record<string, unknown> }
   // 全等之外还要单独钉 hasOwn：物化出来的 `{}` 会让「省略」与「显式给空」长得一样。
@@ -876,7 +894,7 @@ it('名册缺席时 request 里没有 preset 这个键——rosterless 部署靠
     systemPrompt: { section: () => () => {} },
     on: () => () => {},
   }
-  apply(ctx as never, { provider: 'default', presets: { recon: { persona: 'R' } } })
+  apply(ctx as never, { provider: 'default', ...freshLedgerFiles(), presets: { recon: { persona: 'R' } } })
   await run(captured as Captured, { action: 'run', run: 'r1', nodes: [{ id: 'n1', prompt: 'go', preset: 'recon' }] }, caller)
   const spec = seen[0] as { request: Record<string, unknown> }
   assert.strictEqual(Object.hasOwn(spec.request, 'preset'), false,
@@ -915,7 +933,7 @@ it('归一：run 声明 nodes 时先写树再派活，一次调用完成建节�
   systemPrompt: { section: () => () => {} },
   on: () => () => {},
   }
-  apply(ctx as never, { provider: 'default', presets: { reader: { persona: 'P' } } })
+  apply(ctx as never, { provider: 'default', ...freshLedgerFiles(), presets: { reader: { persona: 'P' } } })
   const result = await run(captured as Captured, {
     action: 'run',
     run: 'r1',
@@ -972,7 +990,7 @@ it('派发把节点推成 in_progress——参数描述承诺的迁移必须真�
   systemPrompt: { section: () => () => {} },
   on: () => () => {},
   }
-  apply(ctx as never, { provider: 'default', presets: {} })
+  apply(ctx as never, { provider: 'default', ...freshLedgerFiles(), presets: {} })
   await run(captured as Captured, { action: 'run', run: 'r1', nodes: [{ id: 'existing-1', prompt: 'go' }] }, caller)
   assert.deepStrictEqual(order, ['write', 'start', 'bind:existing-1:child-5', 'step:existing-1:in_progress'])
   // 直连通道（`ctx.subagents.startContinuable` 那条）同样追加了节点指令。
@@ -1007,7 +1025,7 @@ it('run 不给 nodes 时当场抛，一个字节都不写树——「不建节�
   systemPrompt: { section: () => () => {} },
   on: () => () => {},
   }
-  apply(ctx as never, { provider: 'default', presets: {} })
+  apply(ctx as never, { provider: 'default', ...freshLedgerFiles(), presets: {} })
   await assert.rejects(
     () => run(captured as Captured, { action: 'run', run: 'r1' }, caller),
     /requires a non-empty `nodes` list/,
@@ -1044,7 +1062,7 @@ it('run 写树时`replace` 恒为 false——整树替换不是这条路要的�
   systemPrompt: { section: () => () => {} },
   on: () => () => {},
   }
-  apply(ctx as never, { provider: 'default', presets: {} })
+  apply(ctx as never, { provider: 'default', ...freshLedgerFiles(), presets: {} })
   await run(captured as Captured, {
     action: 'run', run: 'r1',
     nodes: [{ id: 'only', title: 'only node', prompt: 'go' }],
@@ -1542,7 +1560,7 @@ it('run 把节点预设的 drop 编进 persona，随身份一起走', async () =
     systemPrompt: { section: () => () => {} },
   on: () => () => {},
   }
-  apply(ctx as never, { provider: 'default', presets: { scout: { persona: 'P', drop: ['plan:policy'] } } })
+  apply(ctx as never, { provider: 'default', ...freshLedgerFiles(), presets: { scout: { persona: 'P', drop: ['plan:policy'] } } })
   await run(captured as Captured, { action: 'run', run: 'r1', nodes: [{ id: 'n1', prompt: 'go', preset: 'scout' }] }, makeCaller())
   const persona = (seen[0] as { request: { persona: string } }).request.persona
   assert.deepStrictEqual(decodeDropDirective(persona), { drop: ['plan:policy'], text: 'P' })
@@ -1603,7 +1621,7 @@ it('无 preset 的派发节点走 lead 身份，绝不继承父的 persona —�
     systemPrompt: { section: () => () => {}, getSectionOrder: () => 0 },
     on: () => () => {},
   }
-  apply(ctx as never, { provider: 'default', defaultRules: 'RULES', runsFile: '', presets: { lead: { persona: '你是中枢。' }, recon: { persona: '你是侦察。' } } })
+  apply(ctx as never, { provider: 'default', defaultRules: 'RULES', ...freshLedgerFiles(), presets: { lead: { persona: '你是中枢。' }, recon: { persona: '你是侦察。' } } })
   // 节点的 preset 已迁移成预设名数组，未知名字现在在注册期就抛。
   await run(captured as Captured, { action: 'run', run: 'r1', nodes: [{ id: 'n1', prompt: 'go' }] }, caller)
   const spec = seen[0] as { request: Record<string, unknown> }
@@ -1626,7 +1644,7 @@ it('节点显式给了身份名就按身份走，与默认那支互不干扰', a
     systemPrompt: { section: () => () => {}, getSectionOrder: () => 0 },
     on: () => () => {},
   }
-  apply(ctx as never, { provider: 'default', presets: { lead: { persona: '你是中枢。' }, recon: { persona: '你是侦察。', deny: ['edit', 'write'] } } })
+  apply(ctx as never, { provider: 'default', ...freshLedgerFiles(), presets: { lead: { persona: '你是中枢。' }, recon: { persona: '你是侦察。', deny: ['edit', 'write'] } } })
   await run(captured as Captured, { action: 'run', run: 'r1', nodes: [{ id: 'n1', prompt: 'go', preset: 'recon' }] }, caller)
   const spec = seen[0] as { request: Record<string, unknown> }
   // persona 前缀会挂一层丢弃指令：deny 掉的工具，其说明段不该留在这一支的提示词里。
@@ -1955,7 +1973,7 @@ it('派发简报：明令禁止写状态行，并说清判定来自宿主那句�
     systemPrompt: { section: () => () => {} },
     on: () => () => {},
   }
-  apply(ctx as never, { provider: 'default', presets: {} })
+  apply(ctx as never, { provider: 'default', ...freshLedgerFiles(), presets: {} })
   await run(captured as Captured, { action: 'run', run: 'r1', nodes: [{ id: 'impl', prompt: 'go' }] }, caller)
   assert.ok(brief.includes('【节点状态】'), '锚点不许动')
   assert.ok(brief.includes('impl'), '必须点名被绑定的节点')
