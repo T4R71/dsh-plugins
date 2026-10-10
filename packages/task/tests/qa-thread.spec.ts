@@ -16,8 +16,28 @@
  * ctx 与 Agent 都是本文件里的假件，不碰真机。
  */
 import assert from 'node:assert/strict'
+import { mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { it } from 'node:test'
 import { apply, type ResolvedConfig } from '../src/index.ts'
+
+/**
+ * 每个 harness 用**自己的账本文件**：在系统临时目录下开一个私有目录，两个路径都经
+ * `apply` 的配置交给它（`runsFile` 与 `worktreesFile`）。
+ *
+ * 为什么必须给：`runsFile: ''` 会走 `ledgerPathFor` 的回退链
+ * （配置 → `DSH_TASK_RUNS_FILE` → `ctx.baseUrl` → `DSH_PROFILE_DIR`/`DSH_HOME` → cwd），
+ * 而本文件的 ctx 是假件、没有 `baseUrl` —— 于是测试直接写进**用户正在用的真机 profile
+ * 账本** `DSH_PROFILE_DIR/task-runs.json`。单跑只是往那个真文件里叠垃圾记录；与其它
+ * spec 并发跑时多个进程抢写同一个文件，`session-store` 的原子替换当场抛 `could not be written`。
+ * 写法与 `task.spec.ts:110` 的 `freshLedgerFile()` 同源。
+ * @returns 一个尚未写过的私有目录里的两个账本路径。
+ */
+function freshLedgerFiles(): { runsFile: string; worktreesFile: string } {
+  const dir = mkdtempSync(join(tmpdir(), 'qa-thread-spec-'))
+  return { runsFile: join(dir, 'task-runs.json'), worktreesFile: join(dir, 'task-worktrees.json') }
+}
 
 /** 抓取注册进工具面的定义。 */
 interface Captured {
@@ -100,7 +120,7 @@ function harness(options: {
   apply(ctx as never, {
     provider: 'default',
     defaultRules: 'RULES',
-    runsFile: '',
+    ...freshLedgerFiles(),
     // 三个身份都要在表里：`explain` 是这一轮新增的，缺了会在 `resolvePreset` 那一步
     // 撞 UnknownPresetError（那正是它该撞的）。
     presets: { recon: { persona: 'R' }, lead: { persona: 'L' }, explain: { persona: 'E', deny: ['edit', 'write', 'task'], maxDepth: 1 } },
