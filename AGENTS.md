@@ -71,6 +71,16 @@ git ls-files | grep -E '(^|/)(node_modules|lib|dist)/|\.tgz$|^pnpm-lock\.yaml$' 
 
 每个包在自己的目录里定义 `build` / `test` / `typecheck`；用 `pnpm --filter <包名> <script>` 调用。
 
+**改了 `src/` 必须 build，否则不生效。** profile 里的包是 `link:` 安装，运行期读的是包目录下的 `lib/index.js`（经 `package.json` 的 `exports`），**不是 `src/`**。而 `typecheck` 里的 `tsc -b` 只写 `lib/types/`（`tsdown` 的 entry），**不产出 `lib/index.js`** —— 那个只有 `build` 里的 `tsdown` 会写。所以「typecheck 过了、测试全绿、提交完成」全都不等于**运行中的实例会用上新代码**。
+
+2026-10-14 实测踩过一次：三处改动、212/212 全绿、提交 `c5bbf4f` 完成，用户重启后旧行为原样 —— 因为 `lib/index.js` 的 mtime 还停在改动之前。判据只有一条：
+
+```sh
+ls -la packages/<pkg>/lib/index.js packages/<pkg>/src/*.ts   # lib 必须更晚
+```
+
+多个包一起改就逐个 build（`pnpm --filter <包名> build`），**不要**用仓库级 `-r`（见下）。
+
 **不要用仓库级 `-r` 全量构建**去跑 `docs/COMPATIBILITY.md` 里标了「未迁移」的包——它们面向 `0.1.6-alpha.2`，在本仓当前的目标版本下不具备可构建性。
 
 ## 运行隔离
