@@ -11,6 +11,7 @@ import { it } from 'node:test'
 import {
   chooseIdentityChannel,
   EmptyPresetFilterError,
+  intersectToolFilterWithFace,
   resolvePreset,
   UnknownPresetError,
   type AgentPresetRosterPort,
@@ -310,4 +311,49 @@ it('没有任何身份名时返回 undefined——没有身份，也就没有降
   // 本来就没有身份要交，留痕会变成一次假警报。
   assert.strictEqual(await chooseIdentityChannel({ list: async () => [] }, undefined), undefined)
   assert.strictEqual(await chooseIdentityChannel(undefined, undefined), undefined)
+})
+
+// ── 围栏 × 父面 求交集 ────────────────────────────────────────────────────────
+// 隐患：`tools.restrict()` 对未知名字**整体抛**（`dsh-tools/lib/index.js:2906-2908`），
+// 而宿主在 `applyChildComposition` 里拿降级通道交出去的 toolFilter 直接调它
+// （`dsh-subagent/lib/index.js:522`）。这几条钉住求交集的判据与两条不对称。
+
+it('围栏 × 父面：父面上有的名字原样留下，没有的剔掉并如实登记', () => {
+  const face = new Set(['read', 'grep'])
+  const result = intersectToolFilterWithFace({ allow: ['read', 'pwsh'], deny: ['grep', 'ops_bash'] }, name => face.has(name))
+  assert.deepStrictEqual(result.filter, { allow: ['read'], deny: ['grep'] })
+  // 按声明顺序：先 allow 那半、后 deny 那半。
+  assert.deepStrictEqual(result.dropped, ['pwsh', 'ops_bash'])
+})
+
+it('围栏 × 父面：问不出来（没有那个接口）时一个名字都不剔——判据缺席不等于名字不在', () => {
+  assert.deepStrictEqual(
+    intersectToolFilterWithFace({ deny: ['ops_bash'] }, undefined),
+    { filter: { deny: ['ops_bash'] }, dropped: [] },
+  )
+  // 连围栏都没有：既不交也不剔。
+  assert.deepStrictEqual(intersectToolFilterWithFace(undefined, () => true), { dropped: [] })
+})
+
+it('围栏 × 父面：deny 剔空则不交（它什么都不删），allow 剔空照交（fail-closed 那一侧）', () => {
+  // deny 空了还交出去，只会白白向 provider 要一次 `toolFilter` 能力
+  // （`dsh-subagent/lib/index.js:3188`）。
+  assert.deepStrictEqual(intersectToolFilterWithFace({ deny: ['ops_bash'] }, () => false), { dropped: ['ops_bash'] })
+  // allow 空了是「一个都不留」：放宽成「继承父的全部工具」会让一次笔误变成一次权限提升。
+  assert.deepStrictEqual(
+    intersectToolFilterWithFace({ allow: ['ops_bash'] }, () => false),
+    { filter: { allow: [] }, dropped: ['ops_bash'] },
+  )
+  // 两半都声明、只有 deny 被剔空：剩下的那一半照旧交。
+  assert.deepStrictEqual(
+    intersectToolFilterWithFace({ allow: ['read'], deny: ['ops_bash'] }, name => name === 'read'),
+    { filter: { allow: ['read'] }, dropped: ['ops_bash'] },
+  )
+})
+
+it('围栏 × 父面：run_code 是 restrict 专门拒收的保留名，在父面上也照样剔', () => {
+  // 它不是「未知名字」那一类，而是同一个函数里的另一条当场抛（`dsh-tools/lib/index.js:2905`）：
+  // 名字写对了也照样让整次派发失败，所以连同未知名字一起拦在派发之前。
+  const result = intersectToolFilterWithFace({ deny: ['run_code'] }, () => true)
+  assert.deepStrictEqual(result, { dropped: ['run_code'] })
 })

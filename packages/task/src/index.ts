@@ -111,7 +111,7 @@ import { SessionId } from '@deepseek-ai/dsh-session'
 // 解法是在读取判别式的那一处把联合**放宽成 `string`**（见快照失效那条监听器）：
 // 判别式在运行时本来就是字符串，读它不需要知道联合的全部成员。
 import type { Dict } from '@deepseek-ai/cosmokit'
-import { allowToolSectionFilter, chooseIdentityChannel, decodeDropDirective, encodeDropDirective, resolvePreset, toolSectionsForFilter } from './presets.ts'
+import { allowToolSectionFilter, chooseIdentityChannel, decodeDropDirective, encodeDropDirective, intersectToolFilterWithFace, resolvePreset, toolSectionsForFilter } from './presets.ts'
 import type { AgentPresetRosterPort, IdentityChannel, PresetAgentOptions, PresetSpec } from './presets.ts'
 
 export { PRESETS_FIELD, resolvePreset, UnknownPresetError, EmptyPresetFilterError } from './presets.ts'
@@ -2111,6 +2111,38 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
   }
 
   /**
+   * 一个工具名在**这个父代理的面上**看不看得见 —— 降级通道求交集的唯一判据。
+   *
+   * 为什么只能逐条问，而不是拿一份清单：`tools.view()` 是 private
+   * （`dsh-tools/lib/types/index.d.ts:680`），本包能用到的调用点里也没有「列出已注册工具名」
+   * 的接口（同一段论证见 {@link installAllowShadow} 与 `toolSectionsForFilter` 的注释）。
+   * 公开的 `get(name, scope)` 够用，而且**判据等价**：父面看得见的名字，孩子的
+   * `restrictableNames` 里一定也有 —— 孩子 join 的就是父的挂载，父自己那一层在孩子的链上
+   * 是**祖先层**，而 `restrict` 的已知集合正是「全局层 + 祖先层的注册名」（pre-restriction）。
+   * 反过来，父面上没有的名字孩子也继承不到（`restrict` 是纯减法），剔掉它不放宽任何东西。
+   *
+   * 问不出来就返回 `undefined` ⇒ 一个名字都不剔（见 {@link intersectToolFilterWithFace}）：
+   * 没有判据时宁可照旧，也绝不猜着删。
+   * @param parent - 这次派发的父代理（`exec.agent`）。
+   * @returns 判据；这个部署里问不出来时为 undefined。
+   */
+  const parentFaceProbe = (parent: Agent): ((name: string) => boolean) | undefined => {
+    const registry = ctx.tools as unknown as { get?: (name: string, scope?: unknown) => unknown } | undefined
+    if (registry === undefined || typeof registry.get !== 'function') return undefined
+    const read = registry.get.bind(registry)
+    return (name: string) => {
+      try {
+        return read(name, parent) !== undefined
+      } catch (error) {
+        // 判据自己抛（例如 PTC 模式下缺呈现运行时）⇒ 当成「问不出来」，**保留**这个名字：
+        // 判据缺席与「名字不在父面上」是两件事，混在一起就成了静默剔名。
+        ctx.logger?.warn?.('task: could not read the parent tool face for "' + name + '"; the declared tool filter is left as-is: ' + String(error))
+        return true
+      }
+    }
+  }
+
+  /**
    * 一次派发：**工具路径与自动放行路径共用这一份**。
    *
    * 它就是从 `case 'dispatch'` 里原样抽出来的那段（提问根登记、节点简报），
@@ -2189,6 +2221,33 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
     // `preset` 键**不进 `request`** —— 宿主不消费它。`SubagentStartRequest` 的九字段定义
     // 与三条独立实测见 `M:\T4 dev\docs\AGENT-PRESET-LIMITS.md`。
     const wantedPreset = channel?.kind === 'preset' ? channel.id : undefined
+    // ── 降级通道的围栏先与**父面**求交集（2026-10-14）──────────────────────────
+    // 隐患原文在 `M:\T4 dev\docs\AGENT-PRESET-LIMITS.md` §「一个仍未修的隐患」：
+    // `deny: [ops_bash]` 在降级通道里进 `toolFilter`，而宿主拿它**直接调**
+    // `childCtx.tools.restrict(composition.toolFilter)`（`dsh-subagent/lib/index.js:522`）。
+    // `tools.restrict()` 对未知名字是**整体抛**的（`dsh-tools/lib/index.js:2906-2908`）——
+    // 于是卸载 `dsh-ops`（父面上不再有 `ops_bash`）之后，recon 的一次降级派发当场失败
+    // （实测报 `tools.restrict() names unknown global tool "ops_bash"`，节点留在 pending）。
+    // 声明一条**用不上的**工具，反倒赔上整条降级通道：这是纯亏，必须在这里拦掉。
+    //
+    // 剔名**不是**吞掉 deny：那半张表在 `registerChild` 里**无条件**落进 `pendingDeny`，
+    // 由 `agent/created` 交给 {@link installDenyGuard} 在执行时兑现 —— 那正是预设通道的兑现方式，
+    // 也是 `dsh-ops` 那种 scoped registration（`restrict` 管不住）唯一拦得住的地方。
+    // persona 那层的 `tool:<名>` 丢弃指令照旧按**原声明**拼（见上面的 `drops`），
+    // 所以「这一支不使用某个工具」在提示词那一维上也一个字没少。
+    // 剔掉的每一个名字都进日志与降级留痕（见下），绝不静默。
+    const face = wantedPreset === undefined
+      ? intersectToolFilterWithFace(preset.toolFilter, parentFaceProbe(parent))
+      : undefined
+    // 剔名留痕：与降级原因**同格**（`presetFallback`）—— 两者说的是同一件事的不同侧面
+    // （「这一支装的面与声明的不完全一样」），分成两格只会让人漏看一格。
+    // 宿主日志同样留一行：返回值只有模型看得见，运维那一侧要有自己的痕。
+    const faceTrace = face !== undefined && face.dropped.length > 0
+      ? 'the tool filter named tools the parent face does not have; dropped from the delegated filter'
+        + ' (tools.restrict() rejects unknown names outright; the execution-time deny guard still refuses them): '
+        + face.dropped.join(', ')
+      : undefined
+    if (faceTrace !== undefined) ctx.logger?.warn?.('task: ' + faceTrace)
     // `maxDepth` 与 `agentOptions` 两条通道都照传：内核一次算三样
     // （`continuation.ts:121-126`），且预设自己声明的档位优先级最高（`child-agent.ts:151-169`）。
     const maxDepth = ctx.subagents.resolveMaxDepth(preset.maxDepth)
@@ -2212,7 +2271,10 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
       // 走 B 路时两者都不装，让角色那一支自己的东西生效。
       ...wantedPreset === undefined ? {
         ...persona !== undefined ? { persona } : {},
-        ...preset.toolFilter !== undefined ? { toolFilter: preset.toolFilter } : {},
+        // 交出去的是**求过交集**的那一份（见上面 `face`）：父面上没有的名字不再让宿主的
+        // `tools.restrict()` 整体抛。声明里的名字一个都没少 —— 只是那些父面本来就没有的
+        // 名字不再交给一个会为此抛错的接口。
+        ...face?.filter !== undefined ? { toolFilter: face.filter } : {},
       } : {},
       ...maxDepth !== undefined ? { maxDepth } : {},
       // 角色固定的档位走这里。宿主那侧是**逐字段覆盖**父的
@@ -2289,10 +2351,14 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
       registerChild(String(started.childId))
     }
     const settled = await settleDispatch({ agent: parent }, spec.bind, started.childId)
-    // 降级留痕**只在真的降级时**多出这一格（见 {@link DispatchedNode}）：`fallbackTrace`
-    // 是 `undefined` 就原样返回，绝不写成 `{ presetFallback: undefined }` —— 返回值过的是
+    // 降级留痕**只在真的降级时**多出这一格（见 {@link DispatchedNode}）：没有任何一条留痕
+    // 就原样返回，绝不写成 `{ presetFallback: undefined }` —— 返回值过的是
     // 无损 JSON 序列化器，那个形状会当场炸。
-    return fallbackTrace === undefined ? settled : { ...settled, presetFallback: fallbackTrace }
+    // 两条留痕按同一套连接符拼（与 `run` 那条路逐字一致）。
+    const traces: string[] = []
+    if (fallbackTrace !== undefined) traces.push(fallbackTrace)
+    if (faceTrace !== undefined) traces.push(faceTrace)
+    return traces.length === 0 ? settled : { ...settled, presetFallback: traces.join(' ｜ ') }
   }
   /**
    * 本插件**派出过**的子会话（childId = 它自己的 session id）。

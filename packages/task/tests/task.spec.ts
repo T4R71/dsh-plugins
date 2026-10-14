@@ -204,11 +204,24 @@ function harness(options: { tree?: boolean; children?: readonly (string | { read
    * 假宿主认不认调用方预留的 `spec.childId`。默认不认（孩子拿宿主自己发的 `child-N`）；
    * 开了就是当刻那一代宿主 —— `lib/index.js:1677` 的 `spec.childId ?? brandString(randomUUID())`。
    */
-  hostChildId?: boolean } = {}): {
+  hostChildId?: boolean;
+  /**
+   * **父面**（`exec.agent`）当刻实际可见的工具名。给了它，这一件假件才长出两块真机上的东西：
+   * `ctx.tools.get(name, scope)`（真机是公开的 `ToolRegistry.get`，`dsh-tools/lib/types/index.d.ts:690`），
+   * 以及宿主在 `applyChildComposition` 里那一行 `childCtx.tools.restrict(composition.toolFilter)`
+   * （`dsh-subagent/lib/index.js:522`）的模型 —— 判据逐字照抄 `dsh-tools/lib/index.js:2906-2908`：
+   * **一个未知名字就整体抛**。
+   *
+   * 不给就是「没有可问的清单、也没有那个会抛的 restrict」的世界：既有用例一个字节都不变
+   * （它们钉的是围栏被原样交出去，不该被这一项改写成另一回事）。
+   */
+  faceTools?: readonly string[] } = {}): {
   tool: Captured
   calls: string[]
   listed: string[]
   messages: FakeMessage[]
+  /** `ctx.logger.warn` 收到过的每一行（假件现在带 logger，留痕这类断言靠它）。 */
+  logs: string[]
   treeNodes: Record<string, unknown>[]
   nodesOf: (sid: string) => Record<string, unknown>[]
   treeCalls: string[]
@@ -264,6 +277,9 @@ function harness(options: { tree?: boolean; children?: readonly (string | { read
   const listeners: { event: string; handler: (...args: never[]) => unknown }[] = []
   // 「自动放行不通知中枢」的计数点：假 ctx 上任何一条会惊动中转的通路都在这里记一笔。
   const notified: string[] = []
+  // `ctx.logger.warn` 收到过的每一行。假 ctx 现在**带** logger（真机也带），
+  // 所以「丢掉的名字必须留下可读的一行」这件事测得出来。
+  const logs: string[] = []
   // 每次 startContinuable 的入参：自动派发的简报要从这里看。
   const starts: unknown[] = []
   // 每次 `agentPresets.select()` 的调用。换面**只能**在这一刻发生（见 src/index.ts 的
@@ -280,7 +296,17 @@ function harness(options: { tree?: boolean; children?: readonly (string | { read
   // `options.runsFile` 换一个共享路径，就是「宿主重启之后账本仍在」的最小模型。
   const runsFile = options.runsFile ?? freshLedgerFile()
   const ctx = {
-    tools: { register: (definition: Captured) => { captured = definition; return () => {} } },
+    tools: {
+      register: (definition: Captured) => { captured = definition; return () => {} },
+      // 真机那边这是公开的 `ToolRegistry.get(name, scope)`：问「这个名字在这个作用域上
+      // 看得见吗」。`view()` 是 private，所以「父面有哪些工具」只能这样**逐条问**——
+      // 这一件假件的形状就是照那条限制给的（给了 `faceTools` 才长这个接口）。
+      ...options.faceTools === undefined ? {} : {
+        get: (name: string, _scope?: unknown) =>
+          options.faceTools?.includes(name) === true ? { name } : undefined,
+      },
+    },
+    logger: { warn: (message: string) => { logs.push(String(message)) } },
     get: (key: string) => {
       calls.push(`get:${key}`)
       if (key === 'taskTree' && options.tree === true) {
@@ -351,7 +377,10 @@ function harness(options: { tree?: boolean; children?: readonly (string | { read
     inject: () => { notified.push('inject'); return undefined },
     subagents: {
       resolveMaxDepth: () => undefined,
-      startContinuable: async (spec: { readonly childId?: string }) => {
+      startContinuable: async (spec: {
+        readonly childId?: string
+        readonly request?: { readonly toolFilter?: { readonly allow?: readonly string[]; readonly deny?: readonly string[] } }
+      }) => {
         // 宿主有两代，差别就在 `spec.childId` 这一格认不认：
         //   默认（`hostChildId` 没开）演的是**不认**的那一代 —— 孩子拿到的永远是宿主自己
         //   发的那个 id，`child-N` 就是它；那一代里调用方在派发前不可能知道 id，
@@ -364,6 +393,24 @@ function harness(options: { tree?: boolean; children?: readonly (string | { read
         // 派发**之前**的那条缝：测试在这里制造「孩子起来了、账本却写不进去」的窗口。
         options.beforeStart?.()
         starts.push(spec)
+        // 宿主的 `applyChildComposition`（`dsh-subagent/lib/index.js:522`）那一行：
+        //     if (composition.toolFilter !== void 0) childCtx.tools.restrict(composition.toolFilter)
+        // 判据逐字照抄 `dsh-tools/lib/index.js:2906-2908` —— 有一个未知名字就**整体抛**。
+        // 「已知」在这一件假件里取父面（`faceTools`）。真机那边这个集合是「全局层 + 祖先层
+        // 的注册名」，是这里给的一个**超集**，所以这条模型比真机**更严**：它拦下的名字，
+        // 真机的 restrict 未必拦；反过来它放过的，真机一定放过（名字都在父面上了）。
+        // `faceTools` 没给时这一格整个不装 —— 老用例的假件里根本没有 restrict 这个概念。
+        if (options.faceTools !== undefined && spec.request?.toolFilter !== undefined) {
+          const known = new Set(options.faceTools)
+          const unknown = [...spec.request.toolFilter.allow ?? [], ...spec.request.toolFilter.deny ?? []]
+            .filter(name => !known.has(name))
+          if (unknown.length > 0) {
+            throw new Error('tools.restrict() names unknown global tool'
+              + (unknown.length > 1 ? 's' : '') + ' '
+              + unknown.map(name => '"' + name + '"').join(', ')
+              + '; known global tools: ' + [...known].sort().join(', '))
+          }
+        }
         // 宿主在**返回之前**就把孩子材料化、并按它的身份装配一次系统提示词 —— 真机上
         // 那一次正好落在 `startContinuable` 还没返回的时候。`actual` 是孩子**实际**
         // 会用的 id：认这一格的那一代就是调用方预留的那一个。
@@ -433,7 +480,7 @@ function harness(options: { tree?: boolean; children?: readonly (string | { read
   }
   apply(ctx as never, config)
   assert.ok(captured !== undefined, 'apply must register exactly one tool')
-  return { tool: captured, calls, listed, messages, treeNodes, nodesOf, treeCalls, sections, listeners, notified, starts, selects, sent, runsFile, worktreesFile }
+  return { tool: captured, calls, listed, messages, treeNodes, nodesOf, treeCalls, sections, listeners, notified, starts, selects, sent, runsFile, worktreesFile, logs }
 }
 
 /**
@@ -1699,6 +1746,95 @@ it('节点显式给了身份名就按身份走，与默认那支互不干扰', a
     { drop: ['tool:edit', 'tool:write'], text: '你是侦察。' },
   )
   assert.deepStrictEqual(spec.request.toolFilter, { deny: ['edit', 'write'] })
+})
+
+/**
+ * 降级通道的 toolFilter 必须先与**父面**求交集。
+ *
+ * 失效模式（`M:\T4 dev\docs\AGENT-PRESET-LIMITS.md` §「一个仍未修的隐患」）：
+ * `deny: [ops_bash]` 在降级通道里进 `toolFilter`，宿主拿它**直接调**
+ * `childCtx.tools.restrict(composition.toolFilter)`（`dsh-subagent/lib/index.js:522`），
+ * 而 `tools.restrict()` 对未知名字是**整体抛**的（`dsh-tools/lib/index.js:2906-2908`）。
+ * 于是**卸载 `dsh-ops`**（父面上不再有 `ops_bash`）之后，recon 的一次降级派发会当场抛 ——
+ * 声明一条用不上的工具，反而把整条降级通道炸掉。
+ *
+ * 这一条用例把它钉住：父面上只有 `task` / `ops_grep` / `ask_user_question`，recon 声明
+ * `deny: [ops_bash]`。假宿主照真机那一行调 restrict，判据逐字照抄 —— 不修就是抛。
+ */
+it('降级派发：deny 的工具不在父面上时不抛，剔名留痕，执行时守卫照旧拒', async () => {
+  const h = harness({
+    tree: true,
+    // 父面当刻实际可见的工具名（= 卸载 dsh-ops 之后的世界，没有 ops_bash）。
+    faceTools: ['task', 'ops_grep', 'ask_user_question'],
+    presets: { recon: { persona: 'R', deny: ['ops_bash'] } },
+  })
+  const parent = { id: 'lead-1', session: { id: SESSION, header: { delegationDepth: 0 } } }
+  const result = await run(
+    h.tool,
+    { action: 'run', run: 'r1', nodes: [{ id: 'A', prompt: 'a', preset: 'recon' }] },
+    { agent: parent, signal: AbortSignal.timeout(200) },
+  )
+  // ① 派发不许抛：这一条就是那个失效模式本身（修之前这里是 `tools.restrict() names unknown
+  //    global tool "ops_bash"`）。
+  assert.deepStrictEqual(result.dispatched, ['A'],
+    '一条用不上的 deny 不该让整次派发失败；宿主日志：' + JSON.stringify(h.logs))
+  // ② 留痕：父面上没有的名字必须**说出来**，两个地方都要看得见 ——
+  //    返回值那格（人/模型看得见）+ 宿主日志一行（运维看得见）。
+  const trace = String(result.presetFallback)
+  assert.match(trace, /no agent-preset roster/, '这一档照旧是 rosterless 降级')
+  assert.match(trace, /ops_bash/, '被剔掉的名字必须写进降级留痕：' + trace)
+  assert.ok(h.logs.some(line => line.includes('ops_bash')), '被剔掉的名字必须留一行日志：' + JSON.stringify(h.logs))
+  // ③ 交出去的围栏里不再有那个名字 —— 否则宿主的 restrict 会整体抛。
+  //    纯 deny 且被剔空之后，这一格整个不交：它已经什么都不删，却会白白向 provider
+  //    要一次 `toolFilter` 能力（`dsh-subagent/lib/index.js:3188`）。
+  const spec = h.starts[0] as { request: Record<string, unknown> }
+  assert.strictEqual(Object.hasOwn(spec.request, 'toolFilter'), false,
+    '剔空了的 deny 不该再交出去，实际：' + JSON.stringify(spec.request.toolFilter))
+  // ④ **deny 没有被吞掉**：守卫照旧在执行时拒。这是 scoped registration（restrict 管不住，
+  //    见 src/index.ts 顶部那段论证）唯一拦得住的地方，也是预设通道的兑现方式。
+  const child = fakeChildAgent('child-1')
+  await fireEvent(h.listeners, 'agent/created', { agent: child.agent })
+  const guards = h.listeners.filter(item => item.event === 'tools/pre-execute')
+  assert.ok(guards.length > 0, 'apply 必须装上那个执行前守卫')
+  let decision: unknown
+  for (const guard of guards) {
+    decision = await (guard.handler as unknown as (exec: unknown, next: () => Promise<unknown>) => Promise<unknown>)(
+      { agent: child.agent, name: 'ops_bash' },
+      async () => ({ kind: 'allow' }),
+    )
+  }
+  assert.deepStrictEqual(decision, {
+    kind: 'deny',
+    reason: '角色声明不使用 ops_bash：这一支的设计是不执行外部命令（见该角色预设里的 deny）。',
+  })
+})
+
+/**
+ * 上一条的对照组：工具**在**父面上时围栏原样交出去。
+ *
+ * 没有它，「求交集」会被误读成「降级通道一律把 deny 删掉」—— 那正是**静默吞掉 deny**，
+ * 是本包最不能做的一种修法。
+ */
+it('降级派发：工具在父面上时 toolFilter 原样交出去，一个名字都不剔', async () => {
+  const h = harness({
+    tree: true,
+    faceTools: ['task', 'ops_grep', 'ops_bash'],
+    presets: { recon: { persona: 'R', deny: ['ops_bash'] } },
+  })
+  const parent = { id: 'lead-1', session: { id: SESSION, header: { delegationDepth: 0 } } }
+  const result = await run(
+    h.tool,
+    { action: 'run', run: 'r1', nodes: [{ id: 'A', prompt: 'a', preset: 'recon' }] },
+    { agent: parent, signal: AbortSignal.timeout(200) },
+  )
+  assert.deepStrictEqual(result.dispatched, ['A'])
+  const spec = h.starts[0] as { request: Record<string, unknown> }
+  assert.deepStrictEqual(spec.request.toolFilter, { deny: ['ops_bash'] },
+    '在父面上的名字必须原样交出去 —— 求交集不是把 deny 一律删掉')
+  // 没有剔名 ⇒ 留痕里只有降级原因那一句，一个字的剔名说明都不该多。
+  assert.strictEqual(result.presetFallback,
+    'preset "recon" was declared but no agent-preset roster is loaded; falling back to persona + toolFilter')
+  assert.deepStrictEqual(h.logs, [], '没有剔名就没有日志')
 })
 
 it('全局规则段注册在根作用域，order 夹在 harness 身份(-1000) 与 persona(0) 之间', () => {

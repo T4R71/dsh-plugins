@@ -277,6 +277,97 @@ export function toolSectionsForFilter(
     .map(name => `${TOOL_SECTION_PREFIX}${name}`)
 }
 
+/**
+ * `tools.restrict()` **明确拒收**的那一个保留名字：PTC 模式的呈现通道。
+ *
+ * 这不是「未知名字」那一类，而是同一处的**另一条当场抛** ——
+ * `if ([...allow ?? [], ...deny ?? []].includes("run_code")) throw new Error(...)`
+ * （`dsh-tools/lib/index.js:2905`）。两条都在同一个函数里，所以求交集时一并剔掉：
+ * 名字写错会让整次派发失败，而 `run_code` 是写对了也照样让整次派发失败的那一个。
+ * 只在本模块内用（{@link intersectToolFilterWithFace}），不进本包的公开面。
+ */
+const RESERVED_PTC_TRANSPORT = 'run_code'
+
+/**
+ * 一次「围栏 × 父面」求交的结果。
+ */
+export interface FaceFilterIntersection {
+  /**
+   * 求交之后**还能交出去**的那一格围栏。
+   *
+   * 缺席表示这一格整个不交：原声明只剩 `deny`，而它剔完一个名字都不剩 —— 那时的围栏
+   * 什么都不删，交出去却要白白向 provider 要一次 `toolFilter` 能力
+   * （`dsh-subagent/lib/index.js:3188` 那张 capabilities 表）。
+   */
+  readonly filter?: { readonly allow?: readonly string[]; readonly deny?: readonly string[] }
+  /** 因为不在父面上（或本就是保留名）而被剔掉的名字；按声明顺序、去重。 */
+  readonly dropped: readonly string[]
+}
+
+/**
+ * 把 `allow` / `deny` 与**父面当刻实际可见的工具名**求交集。
+ *
+ * ## 为什么要它
+ *
+ * 降级通道把 `toolFilter` 平铺进 `SubagentStartRequest`，而宿主拿它**直接调**
+ * `childCtx.tools.restrict(composition.toolFilter)`（`dsh-subagent/lib/index.js:522`）。
+ * `tools.restrict()` 对未知名字是**整体抛**的（`dsh-tools/lib/index.js:2906-2908`：
+ * `const unknown = [...allow, ...deny].filter(name => !known.has(name)); if (unknown.length > 0) throw`）——
+ * 不是「白写一条」，是**整次派发失败**。于是角色声明 `deny: [ops_bash]`、而父面上没有
+ * `ops_bash`（`dsh-ops` 没装）时，一次降级派发当场炸掉：声明一条**用不上的**工具，
+ * 反倒赔上整条降级通道（隐患原文见 `M:\T4 dev\docs\AGENT-PRESET-LIMITS.md` §「一个仍未修的隐患」）。
+ *
+ * ## 两条判据
+ *
+ * - **父面上没有的名字，剔掉不放宽任何东西**：孩子 join 的就是父的挂载、`restrict` 又是纯减法，
+ *   父面看不见的工具孩子本来就继承不到 —— 剔它只是不再让宿主为一个不存在的名字抛错。
+ *   父面看得见的名字原样留着，围栏的效力一个字不变。
+ * - **问不出来时不剔**：`onParentFace` 缺席（这个部署的 `ctx.tools` 没有那个公开接口）
+ *   就原样交出去**照旧让宿主去撞**，绝不在没有判据的时候猜着删 —— 那才是静默吞掉声明。
+ *
+ * ## 两半的不对称是故意的
+ *
+ * 剔空的 `deny` 不交（它什么都不删，只白占一格能力）；剔空的 `allow` **照交** ——
+ * `allow: []` 是「一个都不留」的紧口径，是 fail-closed 的那一侧。反过来放宽成
+ * 「继承父的全部工具」会让一次笔误变成一次权限提升，正是本包最不能做的那种退化
+ * （同一条判断见 {@link UnknownPresetError} 的注释）。
+ *
+ * **它一个字节都没有吞掉 deny**：`deny` 那半张表照旧落进执行时守卫
+ * （`src/index.ts` 的 `installDenyGuard`），被剔掉的名字也照旧进日志与降级留痕。
+ * @param filter - 查表查出来的工具围栏。
+ * @param onParentFace - 逐条问「这个名字在父面上看得见吗」；`undefined` = 这个部署问不出来。
+ * @returns 求交后的围栏（可能是「不交」）与被剔掉的名字。
+ */
+export function intersectToolFilterWithFace(
+  filter: ResolvedPreset['toolFilter'],
+  onParentFace: ((name: string) => boolean) | undefined,
+): FaceFilterIntersection {
+  if (filter === undefined) return { dropped: [] }
+  if (onParentFace === undefined) return { filter, dropped: [] }
+  const kept: { allow?: string[]; deny?: string[] } = {}
+  const dropped: string[] = []
+  /**
+   * 筛一半。
+   * @param names - 这一半的名字；没声明就整半不碰。
+   * @param key - `allow` 还是 `deny`（两半剔空之后的去留不同）。
+   */
+  const sift = (names: readonly string[] | undefined, key: 'allow' | 'deny'): void => {
+    if (names === undefined) return
+    const survivors: string[] = []
+    for (const name of names) {
+      if (name !== RESERVED_PTC_TRANSPORT && onParentFace(name)) {
+        survivors.push(name)
+        continue
+      }
+      if (!dropped.includes(name)) dropped.push(name)
+    }
+    if (key === 'allow' || survivors.length > 0) kept[key] = survivors
+  }
+  sift(filter.allow, 'allow')
+  sift(filter.deny, 'deny')
+  return Object.keys(kept).length === 0 ? { dropped } : { filter: kept, dropped }
+}
+
 /** 装配时能看到的那些字段。只需要工具名，其余一概不碰。 */
 export interface AssemblyToolListing {
   /** 本次装配时该代理可见的工具（`SystemPrompt.assemble` 返回的 `tools`）。 */
