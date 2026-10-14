@@ -477,7 +477,8 @@ function harnessSourceNote(): string {
 function withNodeBrief(prompt: string, bind: string | undefined, concise = false): string {
   if (bind === undefined) return prompt
   const brief = NODE_BRIEF_ANCHOR
-    + `你绑定的节点是 \`${bind}\`（in_progress 已由插件写入，不必再设）。`
+    + `你绑定的节点是 \`${bind}\`（**这一个**节点的 in_progress 已由插件写入，不必再设）。`
+    + '**你自己 plan 出来的阶段节点由你自己推进**：开工时置 `in_progress`，做完置 `completed`。'
     + '**不要在结语里写 `状态：完成` / `状态：失败` 这类状态行，也不要写任何状态标记** ——'
     + '插件不读它：你那个节点的状态由插件按**宿主的结算模板**判'
     + '（正常结束 / 被强停 / 上下文用尽 / 拒绝执行 / 出错），认不出时保持原状、绝不猜。'
@@ -2974,7 +2975,7 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
       },
       replace: { type: 'boolean', description: 'plan/run：整树替换而非合并。默认 false；不在本列表里的节点会被丢弃。' },
       node: { type: 'string', description: 'step：要推进的节点 id。' },
-      status: { type: 'string', enum: ['pending', 'in_progress', 'completed', 'failed'], description: 'step：新状态。子代理结算时由插件自己算——判据是**宿主投进父会话那句固定的结束模板**（`settlementSummary(childId, stopReason)`，见 `readStopReason`）：认得「正常结束」→ completed，但那只说明它**最后一轮正常结束了，未判定对错**；认得「被强停／上下文用尽／拒绝执行／出错／异常结束」→ failed 并记真实原因；**认不出 → 一个状态都不置**，节点保持原状、账本也不推进。子代理在结语里写状态行**不作数**（派发简报明令禁止它写），插件不看它的散文。' },
+      status: { type: 'string', enum: ['pending', 'in_progress', 'completed', 'failed'], description: 'step：新状态。子代理结算时由插件自己算——判据是**宿主投进父会话那句固定的结束模板**（`settlementSummary(childId, stopReason)`，见 `readStopReason`）：认得「正常结束」→ completed，但那只说明它**最后一轮正常结束了，未判定对错**；认得「被强停／上下文用尽／拒绝执行／出错／异常结束」→ failed 并记真实原因；**认不出 → 一个状态都不置**，节点保持原状、账本也不推进。子代理在结语里写状态行**不作数**（派发简报明令禁止它写），插件不看它的散文。**你自己 plan 出来的节点不受此限** —— 那一条由你自己推进：开工时置 `in_progress`，做完置 `completed`。' },
       detail: { type: 'string', description: 'step：替换节点的 detail。' },
       prompt: { type: 'string', description: 'run 的每个节点一项（该节点自己要干的活，原样交给子代理）/ send：子代理收到的简报。' },
       preset: { type: 'string', description: 'run（顶层默认给全条流水线，节点项给该节点，节点项优先）：身份名，决定子代理的 persona 与工具过滤。省略则拿 lead 身份——绝不继承你的 persona；未知名字直接报错，不回落。这个名字同时是**内核预设名**（`presets.<角色>.preset` 那格可覆盖它）：名字在预设名册里就把身份整个交给预设树装配，问不到就退回 persona + 工具过滤并在返回值里留痕。' },
@@ -4091,7 +4092,7 @@ const AUTO_DISPATCH_FAILED_PREFIX = '派发失败：'
  * 语气是命令式的，但**没有任何配套拦截**：不做规划不会被拦、不会被判失败，也不会有配置项
  * 或闸门。措辞强制、执行不拦 —— 这两件事互不矛盾，正是这一版要的形态。
  */
-const PROCESS_NUDGE = '【过程记录（必须）】多步的活：**开工第一步必须**用 `task plan` 在**你自己的任务树**里写下阶段计划（分几段、每段做什么由你自己定）；**每完成一段必须**用 `task step` 推进到 completed，并在 detail 里写下这一段的结论。阶段之间**可以并行**，不要求先后顺序。'
+const PROCESS_NUDGE = '【过程记录（必须）】多步的活：**开工第一步必须**用 `task plan` 在**你自己的任务树**里写下阶段计划（分几段、每段做什么由你自己定）；**每开工一段先把它置 `in_progress`，每完成一段必须**用 `task step` 推进到 completed，并在 detail 里写下这一段的结论。阶段之间**可以并行**，不要求先后顺序。'
 
 /**
  * 常驻的**隔离纪律**那一句：与 {@link PROCESS_NUDGE} 同段、同一个装配点。
