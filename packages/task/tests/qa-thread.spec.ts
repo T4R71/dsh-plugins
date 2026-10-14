@@ -338,7 +338,7 @@ it('问答线程：卡片正文逐字是模型那一句 —— 连问几轮，�
 
   await h.asked(child, '第一问的正文')
   assert.equal(h.askCalls[0].questions[0].question, '第一问的正文', '正文逐字不变')
-  assert.equal(h.nodesOf('child-1')[0].title, '[问答] 第一问的正文', '树节点标题带角色前缀')
+  assert.equal(h.nodesOf('child-1')[0]!.title, '[问答] 第一问的正文', '树节点标题带角色前缀')
   // 卡片前缀与树标题取自**同一个** label（`roleLabel(effectiveKey)`）：ROLE_LABELS
   // 里加了 `explain` 这一格，两处就一起生效，不需要另写一行代码。
   assert.equal(h.askCalls[0].questions[0].header, '[问答]', '卡片前缀跟着 ROLE_LABELS 走')
@@ -409,8 +409,8 @@ it('task 的回显：存在的字段排成多行、缺席的跳过，且只产�
     evidence: 'settlement notice read from this session history',
   })
   assert.equal(blocks.length, 1, '合成一个块，不散成好几个')
-  assert.equal(blocks[0].type, 'text', '只允许 text 成员')
-  const text = String(blocks[0].text)
+  assert.equal(blocks[0]!.type, 'text', '只允许 text 成员')
+  const text = String(blocks[0]!.text)
   assert.match(text, /^status: completed$/m)
   assert.match(text, /^task_id: child-7$/m)
   assert.match(text, /^result: 它说完了$/m)
@@ -429,7 +429,7 @@ it('task 的回显：数组一行一项、空数组跳过、false 与 0 照原�
     worktrees: [],
     merged: false,
     files: 0,
-  })[0].text)
+  })[0]!.text)
   assert.match(text, /^dispatched:$/m)
   assert.match(text, /^  - A$/m)
   assert.match(text, /^  - B$/m)
@@ -539,7 +539,7 @@ it('task 的回显：一个字段都没有时也有话说（不是空块）', ()
   const h = harness()
   const blocks = h.tool('task').output!.render({}, {})
   assert.equal(blocks.length, 1)
-  assert.equal(String(blocks[0].text), '(no fields)')
+  assert.equal(String(blocks[0]!.text), '(no fields)')
 })
 
 it('task 回显覆盖的键都在 output.schema 里声明过——多一个未声明的键会让整份回执被判非法', () => {
@@ -551,7 +551,7 @@ it('task 回显覆盖的键都在 output.schema 里声明过——多一个未�
     branch: 'b', path: 'p', hash: 'h', files: 1, uncommitted: 2, verification: 'v',
     merged: true, worktrees: ['w'], dispatched: ['d'], probe: 'P', output: 'O',
     presetFallback: 'F', evidence: 'E',
-  })[0].text)
+  })[0]!.text)
   for (const key of declared) {
     if (key === 'result') continue
     assert.ok(rendered.includes(key + ':'), 'schema 里声明的键「' + key + '」应该出现在回显里')

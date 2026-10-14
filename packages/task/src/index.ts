@@ -21,17 +21,30 @@
  *
  * ## 派发怎么走：一律直连子代理
  *
- * 逐次派发**支持预设名**（0.2.0-rc.2 起 `SubagentStartRequest` 有 `preset?: string` 槽），
- * 所以预设名有两层含义、别混：本包自建的那张表（见 `./presets.ts`）管「角色名 → 一组槽」，
- * 其中 `PresetSpec.preset` 那一格才是**交给内核的 preset 名**（孩子显式要装哪一支面）。
+ * 角色名与本包那张表（见 `./presets.ts`）管「角色名 → 一组槽」；
+ * `PresetSpec.preset` 那一格是**角色在 agentPresets 名册里的 id**。
+ *
+ * **2026-10-14 更正**：原注释在此处写「`SubagentStartRequest` 有 `preset?: string` 槽」——
+ * **那是错的**，已由三条独立实测推翻（详见 `M:\T4 dev\docs\AGENT-PRESET-LIMITS.md`）：
+ *   ① 该接口实际只有九个字段（`label` / `prompt` / `parent` / `signal` / `agentOptions` /
+ *      `outputSchema` / `maxDepth` / `toolFilter` / `persona`），**根本没有 `preset`**；
+ *      宿主的 capabilities 校验里也没有它，传了就是静默丢弃。
+ *   ② `applyChildComposition` 硬编码 `composeFrom(childCtx, parent.ctx)`：孩子**无条件**
+ *      join 父的挂载（registry 侧 JSDoc：「Join a child to the exact revision retained by its parent」）。
+ *   ③ 孩子 session header 的 `agentPreset` 实测是父的 `ptc-custom`。
  *
  * **两条通道，派发那刻问名册定**（{@link chooseIdentityChannel}）：
- * - 名册在册 ⇒ 只交 `preset`，孩子整支面由预设树装配 —— **同一个请求里不能再有 `persona`**：
- *   内核 `child-agent.ts:360-366` 会在 child 的 scope 层注册 `deployment:persona-prefix`，
- *   而预设树里的 `@deepseek-ai/dsh-persona` 注册的正是同一个名字（`persona/src/index.ts:63-68`），
- *   同层重名直接抛 `prompt section "deployment:persona-prefix" is already registered in this scope`。
- * - 名册缺席、名字不在册、或那一行 `broken` ⇒ 退回 `persona` + `toolFilter` 的减法，
- *   并在返回值里留一行 `presetFallback`（rosterless 是合法部署，但它不是静默少交身份的理由）。
+ * - **在册（B 路）** ⇒ 换面交给 registry 的 `select(agent, id)`，兑现点是 `agent/created`
+ *   监听器（那一刻孩子零轮，实测 `openTurnStartSeq === null && lastTurn === 0`）。
+ *   这条路上**不装** `persona` / `toolFilter` —— 两者都会盖住角色那一支自己的东西：
+ *   内核在 child 的 scope 层注册 `deployment:persona-prefix`（`child-agent.ts:360-366`），
+ *   而预设树里的 `@deepseek-ai/dsh-persona` 用的正是同一个段名
+ *   （`persona/src/index.ts:63-68`），同层重名直接抛
+ *   `prompt section "deployment:persona-prefix" is already registered in this scope`。
+ *   孩子因此拿到**角色目录自己的整支 plugin 行**（不是从父的面里减出来的）。
+ * - **不在册（A 路，降级）** ⇒ 退回 `persona` + `toolFilter` 的减法，在父的面里删。
+ *   这是降级不是等价方案（`tools.restrict()` 只删不加），并在返回值里留一行 `presetFallback`
+ *   （rosterless 是合法部署，但它不是静默少交身份的理由）。
  *
  * `maxDepth` 与 `agentOptions` **两条通道都照传**：内核一次算三样
  * （`continuation.ts:121-126`），preset 层的档位反而优先级最高（`child-agent.ts:151-169`）。
@@ -85,6 +98,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { defineTool } from '@deepseek-ai/dsh-tools'
+import type { PreToolDecision, ToolExecution } from '@deepseek-ai/dsh-tools'
 // 服务面的类型来自这个模块的 `declare module '@deepseek-ai/cordis'` 增补：
 // 没有这条 import，`ctx.subagents` 在 Context 上不存在（模块增补不会被自动加载）。
 import type { ContinuableStart, SubagentInterruptAuthority, SubagentStartRequest } from '@deepseek-ai/dsh-subagent'
@@ -148,6 +162,7 @@ import {
 import { fenceChildSession, type ChildAgentRegistry } from './child-sandbox.ts'
 import { randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
+import { dirname, join } from 'node:path'
 
 /**
  * 决策节点的 id 前缀。`ask` 写下的每一个问题都带这个前缀，
@@ -400,6 +415,35 @@ const ENVELOPE_SECTIONS_LINE = '结语请以固定小节的**一级标题**开�
   + '`## 判不了`（没做或没跑成的，写清缺哪份前提）。'
   + '父代理只会看到每个小节的**前几行**，全文会落到磁盘上并附 sha256 ——'
   + '所以把最重要的放前面，不必为了省字数牺牲内容。'
+
+/**
+ * 打包安装里那条「DSH 检出在哪」的提示对**外部**文件工具不可达，派发时自动补一句纠正。
+ *
+ * 那句话由 `dsh-web-app` 的 `addHarnessSourceSection` 加进**全局**系统提示（段名
+ * `harness:source`），路径取
+ * `SOURCE_ROOT = fileURLToPath(new URL("../../../..", import.meta.url))` ——
+ * 从 `dsh-web-app/lib/index.js` 往上四层，结果是 `<安装根>/resources/app.asar/dsh`。
+ *
+ * **dev 模式下那是真目录、提示成立；打包成 asar 之后它是归档内部的虚拟路径。**
+ * 而 `app.asar` 是个**文件**不是目录（实测 121,348,951 B，`PSIsContainer=False`），
+ * 于是外部工具（`rg` / `glob` / `node fs`）走到那里一律 `os error 3`。
+ *
+ * 代价是实测过的：两个子代理都照着那句去「核对检出」，白花预算。
+ * 官方没有只关这一段的开关 —— `dsh-web-app` 的 `surfaceContext` 会**连
+ * `app:web-surface` 一起关**，而后者（Web GUI 方位感、HMR 边界、不要另起服务器）
+ * 是实打实有用的。所以这里只补一句，不动官方。
+ *
+ * **自动判定，不是写死**：只有真检测到 `app.asar` 才加。源码部署下这段一个字都不出现。
+ * @returns 要前置到简报的纠正；不需要时返回空串。
+ */
+function harnessSourceNote(): string {
+  const asar = join(dirname(process.execPath), 'resources', 'app.asar')
+  if (!existsSync(asar)) return ''
+  return '**先读这一条**：系统提示里那句「The DeepSeek Harness implementation checkout is at …」'
+    + '给的路径在 `app.asar` **归档内部**（那是个文件，不是目录），普通文件工具到不了那里 ——'
+    + ' `rg` / `glob` / `node fs` 一律报 `os error 3`。**别去核对它，也别为它花预算**：'
+    + '确实需要 DSH 内部实现时，直接说明读不到即可。'
+}
 
 /**
  * 派发简报后面追加的节点指令：把「你自己那个节点」的存在与收尾责任交给子代理。
@@ -1524,6 +1568,50 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
   const pendingAskRoots = new Map<string, { readonly root: Agent; readonly label: string }>()
   /** 已经装过的子代理 → 它的提问根。孙代理沿这条链上溯。 */
   const childRoots = new WeakMap<Agent, Agent>()
+  /**
+   * 待换面的直连子代理：childId → 它在册的角色预设 id。
+   *
+   * 只在角色**真在名册里**时登记（`channel.kind === 'preset'`）。兑现点是下面那个
+   * `agent/created` 监听器 —— 那一刻孩子零轮，`select()` 的准入条件满足。
+   */
+  const pendingPreset = new Map<string, string>()
+  // ── 角色声明的「执行时拒绝」────────────────────────────────────────────────
+  // 为什么不用 `tools.restrict`：它只过滤**全局**工具，注释原文是
+  //     "Restrict global tools for the calling agent scope. ... scoped registrations remain visible."
+  // 而 `dsh-ops` 的 `ops_bash` 由 `entry.ctx.tools.register(...)` 注册在**那个 agent 自己**
+  // 的 scope 里（`dsh-ops/lib/session-shells.js`），属于 scoped registration。于是
+  // `restrict({ deny: ["ops_bash"] })` 拦不住它，还会因 `restrictableNames` 里没有这个名字
+  // 而当场抛 unknown global tool。
+  //
+  // 所以改成执行时拒绝：工具名仍在孩子的面上，但调用被单调挡下并给出可读理由，
+  // 角色「读、搜、回报，不改变任何东西」的设计意图因此仍然成立。
+  const pendingDeny = new Map<string, readonly string[]>()
+  const agentDeny = new WeakMap<Agent, ReadonlySet<string>>()
+
+  /**
+   * 装上「按角色拒绝」的执行前守卫。
+   *
+   * `tools/pre-execute` 给理由，`ctx.tools.guard` 做单调兜底；任一条命中即拒绝。
+   * 拒绝理由写明是哪一支角色的哪种设计，便于孩子自己改道而不是反复重试。
+   * @param host - 本插件的 ctx。
+   */
+  const installDenyGuard = (host: Context): void => {
+    const reasonFor = (agent: Agent | undefined, toolName: string): string | undefined => {
+      if (agent === undefined || toolName === '') return undefined
+      const denied = agentDeny.get(agent)
+      if (denied === undefined || !denied.has(toolName)) return undefined
+      return '角色声明不使用 ' + toolName + '：这一支的设计是不执行外部命令（见该角色预设里的 deny）。'
+    }
+    host.on('tools/pre-execute', async (exec: ToolExecution, next: () => Promise<PreToolDecision>) => {
+      const refusal = reasonFor(exec?.agent, String(exec?.name ?? ''))
+      if (refusal === undefined) return next()
+      return { kind: 'deny', reason: refusal } satisfies PreToolDecision
+    })
+    if (typeof host.tools?.guard === 'function') {
+      host.effect(() => host.tools.guard((exec: ToolExecution) =>
+        reasonFor(exec?.agent, String(exec?.name ?? ''))), 'task: role tool denial')
+    }
+  }
 
   /**
    * 一个代理的**提问根**：人类应答者所在的那一支。
@@ -1693,6 +1781,8 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
     }))
   }
 
+  installDenyGuard(ctx)
+
   ctx.on('agent/created', ({ agent }) => {
     // 只认白名单与提问根这两件事（键都是会话 id）。
     //
@@ -1712,6 +1802,47 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
         ctx.logger?.warn?.('task: sub-agent ' + String(agent.id) + ' started without its direct-to-user question tool: ' + String(error))
       }
     }
+    // ── 角色预设换面（B 路）────────────────────────────────────────────────────
+    // 宿主在 `applyChildComposition` 里硬编码 `composeFrom(childCtx, parent.ctx)`：
+    // 孩子**无条件** join 父的挂载，而 `SubagentStartRequest` 上根本没有 preset 字段。
+    // 唯一换面入口是 registry 的 `select()`（`@Remote("select")` —— GUI 切预设调的就是它）。
+    //
+    // 为什么这条缝够用：select 的准入条件是
+    //     boundary.openTurnStartSeq === null && boundary.lastTurn === 0
+    // 实测在这一刻读到的正是 `{ openTurnStartSeq: null, lastTurn: 0 }`（孩子零轮），
+    // 而主会话同一时刻是 `lastTurn: 56` —— 差距是结构性的，不是运气。
+    //
+    // select 会 `await mount()`（挂角色那一支的 plugin 行），所以它是异步的；
+    // 这里**不等**它：等会阻塞事件分发，而失败又不该影响派发。失败只留一条日志，
+    // 孩子退回父的面（与降级同形态）。
+    // 拒绝表先落：守卫读的是 agentDeny，与 select 成败无关 —— 即使换面失败退回
+    // 父的面，这个孩子仍然不该执行那些命令。
+    const denied = pendingDeny.get(String(agent.id))
+    if (denied !== undefined) {
+      pendingDeny.delete(String(agent.id))
+      if (denied.length > 0) agentDeny.set(agent, new Set(denied))
+    }
+    const wanted = pendingPreset.get(String(agent.id))
+    if (wanted !== undefined) {
+      pendingPreset.delete(String(agent.id))
+      const presets = ctx.get('agentPresets') as
+        | { select?: (agent: Agent, id: string) => Promise<unknown> }
+        | undefined
+      if (presets?.select === undefined) {
+        ctx.logger?.warn?.(
+          'task: child ' + String(agent.id) + ' stayed on its parent preset; entity exposes no select(): ' + wanted,
+        )
+      } else {
+        void presets.select(agent, wanted).catch((error: unknown) => {
+          ctx.logger?.warn?.(
+            'task: child ' + String(agent.id) + ' stayed on its parent preset; select("'
+            + wanted + '") failed: ' + String(error),
+          )
+        })
+      }
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
     const direct = pendingAllow.get(String(agent.id))
     if (direct !== undefined) {
       pendingAllow.delete(String(agent.id))
@@ -1957,39 +2088,57 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
     const persona = drops.length > 0
       ? encodeDropDirective(drops, preset.persona ?? '')
       : preset.persona
-    // **两条通道互斥**：在册就只交 `preset`（孩子整支面由预设树装配），否则才平铺
-    // persona + toolFilter。两者同时出现不是「更保险」，是**当场抛错**（见上面那段）。
+    // ── 两条通道定稿（2026-10-14）─────────────────────────────────────────────
     //
-    // 取的是 `preset.preset`（表里那格查出来的内核名），不是 `spec.preset`
-    // （调用方点的**角色名**）：两者可能不同名，把角色名直接交给内核会让查表失败。
-    const presetSlot = channel?.kind === 'preset' ? { preset: channel.id } : undefined
+    // **走 B 路**（角色在名册里）：换面交给 registry 的 `select(agent, id)`，兑现点是上面那个
+    // `agent/created` 监听器 —— 那一刻孩子零轮，`openTurnStartSeq === null && lastTurn === 0`
+    // 实测成立。孩子拿到的是**角色自己的整支 plugin 行**。
+    //
+    // 这条路上**不装** persona / toolFilter：`applyChildComposition` 注册的段名是
+    // `deployment:persona-prefix`，与角色预设自己的那一段**同名**，装了就会盖住角色目录的
+    // 真源。工具面同理 —— 那一支的 plugin 行才是决定者。
+    //
+    // **走 A 路**（角色不在名册，即 channel 是 fallback 或 undefined）：退回平铺
+    // persona + toolFilter，在**父的面里做减法**。这是降级，不是等价方案：
+    // `tools.restrict()` 只删不加，孩子永远拿不到父没有的工具。
+    //
+    // `preset` 键**不进 `request`** —— 宿主不消费它。`SubagentStartRequest` 的九字段定义
+    // 与三条独立实测见 `M:\T4 dev\docs\AGENT-PRESET-LIMITS.md`。
+    const wantedPreset = channel?.kind === 'preset' ? channel.id : undefined
     // `maxDepth` 与 `agentOptions` 两条通道都照传：内核一次算三样
     // （`continuation.ts:121-126`），且预设自己声明的档位优先级最高（`child-agent.ts:151-169`）。
     const maxDepth = ctx.subagents.resolveMaxDepth(preset.maxDepth)
     const request: Omit<SubagentStartRequest, 'label' | 'signal' | 'outputSchema'> = {
       ...spec.label !== undefined ? { label: spec.label } : {},
-      // 隔离前言在最前、节点指令在最后：孩子先看到「你在哪个检出、别碰哪个目录」，
-      // 再看自己的活，最后才是回传状态那一行 —— 顺序与它要遵照的优先级一致。
+      // 顺序即优先级：环境纠正 → 隔离前言 → 孩子自己的活 → 节点指令（回传状态那一行在最后）。
+      //
+      // `harnessSourceNote()` 排在最前是**故意的**：它是关于「系统提示里那句话不可信」的
+      // 纠正，孩子必须先读到它，才不会照着那句去核对一条到不了的路径（实测代价见函数注释）。
+      // 它自判环境，源码部署下返回空串、整段消失。
       prompt: [{ type: 'text', text: withNodeBrief(
-        spec.worktree === undefined ? spec.prompt : linePreamble(spec.worktree) + '\n\n' + spec.prompt,
+        [
+          harnessSourceNote(),
+          spec.worktree === undefined ? spec.prompt : linePreamble(spec.worktree) + '\n\n' + spec.prompt,
+        ].filter(part => part.length > 0).join('\n\n'),
         spec.bind,
         spec.concise === true,
       ) }],
       parent,
-      ...(presetSlot ?? {}),
-      ...presetSlot !== undefined ? {} : {
+      // `preset` 键**不进 request**（宿主不读它）。只有降级通道才平铺 persona + toolFilter；
+      // 走 B 路时两者都不装，让角色那一支自己的东西生效。
+      ...wantedPreset === undefined ? {
         ...persona !== undefined ? { persona } : {},
         ...preset.toolFilter !== undefined ? { toolFilter: preset.toolFilter } : {},
-      },
+      } : {},
       ...maxDepth !== undefined ? { maxDepth } : {},
       // 角色固定的档位走这里。宿主那侧是**逐字段覆盖**父的
       // `provider/model/reasoningEffort/maxTokens`，所以只写 `reasoningEffort` 时
       // 路由（provider/model）原样继承父的 —— 最安全的用法，本包不替调用方加默认。
       ...preset.agentOptions !== undefined ? { agentOptions: narrowAgentOptions(preset.agentOptions) } : {},
     }
-    // 白名单遮蔽只在直连通道装：走预设时工具面由那一支自己的 plugin 行决定，
-    // 这里再装一层 `allow` 影子等于拿本包的表去覆盖预设树的选择。
-    const allowTools = presetSlot === undefined ? preset.toolFilter?.allow : undefined
+    // 白名单遮蔽只在**降级**通道装。走 B 路时工具面由角色那一支自己的 plugin 行决定，
+    // 这里再装一层 `allow` 影子等于拿本包的表去覆盖角色目录的选择。
+    const allowTools = wantedPreset === undefined ? preset.toolFilter?.allow : undefined
     // **id 先于孩子存在**：宿主允许调用方自己定这一个
     // （`dsh-subagent/lib/index.js:1677` 的 `spec.childId ?? brandString(randomUUID())`），
     // 而这一步是本插件唯一能把三处登记**放到孩子第一次装配之前**的办法。
@@ -2001,12 +2150,19 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
     // 孩子看到的第一次与此后每一次装配都是逐字相同的那一份。
     const childId = SessionId(randomUUID())
     const askRoot = rootAgentOf(parent)
-    // 三处登记都按 childId 认领，所以只能**成组**地写、成组地撤：撤一半留一半正是
+    // 四处登记都按 childId 认领，所以只能**成组**地写、成组地撤：撤一半留一半正是
     // 「静默失效」的样子（白名单等一个不存在的孩子、集合里留一条死 id）。
     const registerChild = (id: string): void => {
       if (allowTools !== undefined && allowTools.length > 0) pendingAllow.set(id, [...allowTools])
       // 这一处给 `system-prompt/assemble` 里那段提醒判身份用 —— 只有本插件派出去的孩子才会看到它。
       dispatchedChildren.add(id)
+      // 角色预设：`agent/created` 里按同一个 childId 兑现换面。
+      if (wantedPreset !== undefined) pendingPreset.set(id, wantedPreset)
+      // 同一格 `deny` 声明两条通道共用：降级通道里它进 toolFilter（在父的面上做减法），
+      // 预设通道里 toolFilter 不交，改由上面那个守卫在执行时兑现。
+      // 一处声明、两条通道都算数，角色文件不用为通道差异写两遍。
+      const deniedTools = preset.toolFilter?.deny
+      if (deniedTools !== undefined && deniedTools.length > 0) pendingDeny.set(id, [...deniedTools])
       // 提问根同样按 childId 落表（`agent/created` 里按同一个 id 查）。
       // 标签走**生效键**（不是 label）：面板上要显示的是真正跑的那个身份。
       if (askRoot !== undefined) {
@@ -2017,6 +2173,8 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
       pendingAllow.delete(id)
       dispatchedChildren.delete(id)
       pendingAskRoots.delete(id)
+      pendingPreset.delete(id)
+      pendingDeny.delete(id)
     }
     // 登记与派发之间**不许有 `await`**：宿主一进 `startContinuable` 就可能材料化孩子并按
     // 它的身份装配一次，而那就是孩子看到的第一次。

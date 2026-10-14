@@ -216,6 +216,8 @@ function harness(options: { tree?: boolean; children?: readonly (string | { read
   listeners: { event: string; handler: (...args: never[]) => unknown }[]
   notified: string[]
   starts: unknown[]
+  /** 每次 `agentPresets.select()` 的调用（换面的唯一入口）。 */
+  selects: { readonly agentId: string; readonly id: string }[]
   sent: { agent: unknown; target: unknown; content: unknown; options: unknown }[]
   runsFile: string
   worktreesFile: string
@@ -264,6 +266,9 @@ function harness(options: { tree?: boolean; children?: readonly (string | { read
   const notified: string[] = []
   // 每次 startContinuable 的入参：自动派发的简报要从这里看。
   const starts: unknown[] = []
+  // 每次 `agentPresets.select()` 的调用。换面**只能**在这一刻发生（见 src/index.ts 的
+  // `agent/created` 监听器）：0.2.0-rc.2 的 `SubagentStartRequest` 里没有 preset 字段。
+  const selects: { agentId: string; id: string }[] = []
   // 每次 sendMessage 的入参：`resume` 必须走**这条路**（唤醒原来那个孩子），绝不能走创建通道。
   const sent: { agent: unknown; target: unknown; content: unknown; options: unknown }[] = []
   // 每次派发一个新的子会话 id：自动放行按 childId 对号入座，
@@ -328,6 +333,9 @@ function harness(options: { tree?: boolean; children?: readonly (string | { read
           list: async () => options.agentPresets?.map(entry => typeof entry === 'string'
             ? { id: entry }
             : entry),
+          // `select(agent, id)` 是**换面的唯一入口**，兑现点是孩子零轮时那一次
+          // `agent/created`。记下每一次调用，供断言读。
+          select: async (agent: { id: string }, id: string) => { selects.push({ agentId: String(agent.id), id }) },
         }
       }
       return undefined
@@ -425,7 +433,7 @@ function harness(options: { tree?: boolean; children?: readonly (string | { read
   }
   apply(ctx as never, config)
   assert.ok(captured !== undefined, 'apply must register exactly one tool')
-  return { tool: captured, calls, listed, messages, treeNodes, nodesOf, treeCalls, sections, listeners, notified, starts, sent, runsFile, worktreesFile }
+  return { tool: captured, calls, listed, messages, treeNodes, nodesOf, treeCalls, sections, listeners, notified, starts, selects, sent, runsFile, worktreesFile }
 }
 
 /**
@@ -609,8 +617,15 @@ it('run 把节点 preset 的 persona 与 toolFilter 平铺进 request，并包�
  * `@deepseek-ai/dsh-persona` 注册的是同一个段名，两个都给就是当场抛）、
  * 以及返回值里**没有**降级留痕。
  */
-it('run 把节点 preset 的内核 preset 名放进 request——孩子显式声明要装哪一支面', async () => {
+it('run 在 agent/created 那一刻按查表结果换面——孩子显式声明要装哪一支面', async () => {
+  // **契约变更（2026-10-14）**：这条原先断言 `spec.request.preset`，而宿主的
+  // `SubagentStartRequest` 九字段里**根本没有 preset**（`src/index.ts` 顶部注释与
+  // `docs/AGENT-PRESET-LIMITS.md` 的实测）——送进去也没人读。换面的唯一入口改成
+  // registry 的 `select(agent, id)`，兑现点是孩子零轮时那一次 `agent/created`。
+  // 所以这条改钉**那个动作**：请求里不许再出现 preset，select 必须按查表结果被调用。
   const seen: unknown[] = []
+  const selects: { agentId: string; id: string }[] = []
+  const listeners: { event: string; handler: (...args: never[]) => unknown }[] = []
   let captured: Captured | undefined
   const ctx = {
     tools: { register: (d: Captured) => { captured = d; return () => {} } },
@@ -619,7 +634,11 @@ it('run 把节点 preset 的内核 preset 名放进 request——孩子显式声
         return { read: () => [], write: async () => {}, step: async () => {}, bind: async () => {} }
       }
       if (key === 'agentPresets') {
-        return { list: async () => [{ id: 'recon-face' }, { id: 'lead' }] }
+        return {
+          list: async () => [{ id: 'recon-face' }, { id: 'lead' }],
+          // 换面的唯一入口：记录每次 select 的 (agentId, id)。
+          select: async (agent: { id: string }, id: string) => { selects.push({ agentId: String(agent.id), id }) },
+        }
       }
       return undefined
     },
@@ -629,7 +648,10 @@ it('run 把节点 preset 的内核 preset 名放进 request——孩子显式声
     },
     userQuestions: { ask: async () => ({ answers: [] }) },
     systemPrompt: { section: () => () => {} },
-    on: () => () => {},
+    on: (event: string, handler: (...args: never[]) => unknown) => {
+      listeners.push({ event, handler })
+      return () => {}
+    },
   }
   // 表里的**角色名**是 `recon`，交给内核的是**另一支** preset 名 `recon-face`：
   // 两者故意不同名，这样「透传的是查表结果而不是模型点的那个名字」才被真的钉住。
@@ -644,8 +666,13 @@ it('run 把节点 preset 的内核 preset 名放进 request——孩子显式声
     nodes: [{ id: 'n1', prompt: 'go', preset: 'recon' }],
   }, caller)
   const spec = seen[0] as { request: Record<string, unknown> }
-  assert.strictEqual(spec.request.preset, 'recon-face',
-    '交给内核的必须是查表得到的 preset 名，不是模型点的角色名')
+  // ① 请求里**不许**再有 preset：宿主的九字段里没有它，交出去只是一段没人读的数据。
+  assert.strictEqual(Object.hasOwn(spec.request, 'preset'), false,
+    'preset 不进 request：宿主不读这个键，换面走 select')
+  // ② 换面真的发生了，点名的是**查表结果**（角色名 recon → 预设名 recon-face）。
+  await fireEvent(listeners, 'agent/created', { agent: fakeChildAgent('child-9').agent })
+  assert.deepStrictEqual(selects, [{ agentId: 'child-9', id: 'recon-face' }],
+    '交给名册的必须是查表得到的 preset 名，不是模型点的角色名')
   // **互斥**：预设换掉的是整支面，persona/toolFilter 再交一份不是"更保险"，是当场抛。
   assert.strictEqual(Object.hasOwn(spec.request, 'persona'), false,
     '走预设时不许再交 persona —— 同名段在同一个 scope 层会撞上宿主的注册')
@@ -722,7 +749,7 @@ it('名册读不动（list 抛）时照样派得出去，只是留痕写明名�
   assert.strictEqual((seen[0] as { request: Record<string, unknown> }).request.persona, 'R')
 })
 
-it('harness 里装了名册时走预设通道：请求里只有 preset，返回值里没有留痕', async () => {
+it('harness 里装了名册时走预设通道：请求里没有 preset，换面由 select 兑现，返回值里没有留痕', async () => {
   // 与上面几条内联假 ctx 的用例互补：这一条走的是**完整 harness**（真树 + 真账本 + 真派发），
   // 钉的是「换成真链路之后通道判定没有漂」。
   const h = harness({ tree: true, agentPresets: ['lead', 'recon'], presets: { recon: { persona: 'R', allow: ['read'] } } })
@@ -733,9 +760,14 @@ it('harness 里装了名册时走预设通道：请求里只有 preset，返回�
   }, caller)
   assert.deepStrictEqual(result, { status: 'running', run: 'r1', dispatched: ['A'] })
   const spec = h.starts[0] as { request: Record<string, unknown> }
-  assert.strictEqual(spec.request.preset, 'recon')
+  // 名册在册 ⇒ 身份走预设通道，请求里不出现 preset（宿主不读它）。
+  assert.strictEqual(Object.hasOwn(spec.request, 'preset'), false, 'preset 不进请求')
   assert.strictEqual(Object.hasOwn(spec.request, 'persona'), false)
   assert.strictEqual(Object.hasOwn(spec.request, 'toolFilter'), false)
+  // 换面由 `agent/created` 那一刻的 select 兑现：孩子拿的是宿主发的 `child-1`。
+  await fireEvent(h.listeners, 'agent/created', { agent: fakeChildAgent('child-1').agent })
+  assert.deepStrictEqual(h.selects, [{ agentId: 'child-1', id: 'recon' }],
+    '在册 ⇒ 交给名册的就是角色在册里的那个 id')
 })
 
 it('降级留痕按原因去重、保声明顺序——同一个原因不许在返回值里说几遍', async () => {
@@ -773,6 +805,8 @@ it('表里没写 preset 这一格时按角色键自己问名册 —— 声明选
   // 这一条钉的是 `PresetSpec.preset` 那一格的**省略语义**：`presets: { recon: { persona: 'R' } }`
   // 里没写 preset，但角色名本身就是预设名，所以名册里有一支叫 `recon` 的面时照样走预设通道。
   const seen: unknown[] = []
+  const selects: { agentId: string; id: string }[] = []
+  const listeners: { event: string; handler: (...args: never[]) => unknown }[] = []
   let captured: Captured | undefined
   const ctx = {
     tools: { register: (d: Captured) => { captured = d; return () => {} } },
@@ -780,7 +814,12 @@ it('表里没写 preset 这一格时按角色键自己问名册 —— 声明选
       if (key === 'taskTree') {
         return { read: () => [], write: async () => {}, step: async () => {}, bind: async () => {} }
       }
-      if (key === 'agentPresets') return { list: async () => [{ id: 'recon' }, { id: 'lead' }] }
+      if (key === 'agentPresets') {
+        return {
+          list: async () => [{ id: 'recon' }, { id: 'lead' }],
+          select: async (agent: { id: string }, id: string) => { selects.push({ agentId: String(agent.id), id }) },
+        }
+      }
       return undefined
     },
     subagents: {
@@ -789,7 +828,10 @@ it('表里没写 preset 这一格时按角色键自己问名册 —— 声明选
     },
     userQuestions: { ask: async () => ({ answers: [] }) },
     systemPrompt: { section: () => () => {} },
-    on: () => () => {},
+    on: (event: string, handler: (...args: never[]) => unknown) => {
+      listeners.push({ event, handler })
+      return () => {}
+    },
   }
   apply(ctx as never, { provider: 'default', ...freshLedgerFiles(), presets: { recon: { persona: 'R', deny: ['task'] } } })
   const result = await run(captured as Captured, {
@@ -798,7 +840,11 @@ it('表里没写 preset 这一格时按角色键自己问名册 —— 声明选
     nodes: [{ id: 'n1', prompt: 'go', preset: 'recon' }],
   }, caller)
   const spec = seen[0] as { request: Record<string, unknown> }
-  assert.strictEqual(spec.request.preset, 'recon', '省略那一格 ⇒ 角色键自己就是预设名')
+  // 省略那一格 ⇒ 角色键自己就是预设名：请求里同样不出现 preset，换面走 select。
+  assert.strictEqual(Object.hasOwn(spec.request, 'preset'), false, 'preset 不进请求')
+  await fireEvent(listeners, 'agent/created', { agent: fakeChildAgent('child-9').agent })
+  assert.deepStrictEqual(selects, [{ agentId: 'child-9', id: 'recon' }],
+    '省略那一格 ⇒ 角色键自己就是预设名')
   assert.strictEqual(Object.hasOwn(spec.request, 'toolFilter'), false,
     '在册 ⇒ 围栏也交给预设树，本包不再叠一层')
   assert.strictEqual(Object.hasOwn(result, 'presetFallback'), false)
