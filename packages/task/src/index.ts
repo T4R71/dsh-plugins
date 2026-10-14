@@ -761,6 +761,32 @@ interface UserQuestionsSurface {
   }): Promise<{ answers: readonly UserQuestionAnswerItem[] }>
 }
 
+/**
+ * 外部预设表的最小面：**只读地问一次「当刻那张表长什么样」**。
+ *
+ * 与 {@link UserQuestionsSurface}（同文件）、{@link AgentPresetRosterPort}（`./presets.ts`）
+ * 同一种写法：本包**不 import** `dsh-preset-studio`。那是一个独立的包、走自己那条版本线，
+ * 把它的类型写进本包的 public 面会让声明文件生成报 TS2883（同一个理由见 `PresetAgentOptions`
+ * 的 JSDoc）；更要紧的是没装它的部署（本包自己的单测就是这种）根本没有这个服务 ——
+ * 编译期硬依赖会让本包在那些部署里装不上。
+ *
+ * 提供者是根作用域上的一次 `ctx.provide('presetFiles', port)`。本包**机会式**消费它：
+ * 拿得到就用它的表，拿不到（服务缺席、或者它自己抛）就退回 `config.presets` 那份，
+ * 见 {@link apply} 里的 `presetTable` —— 那一格**绝不给派发新增一个抛错点**。
+ */
+interface PresetFilesPort {
+  /**
+   * 当刻生效的那张表：身份名 → 规格。形状与本行配置的 `presets` 那一格**逐字相同**
+   * （`./presets.ts` 的 `PresetSpec`），因为两者喂的是同一个 `resolvePreset`。
+   *
+   * **必须是同步的**：调用方在派发那一刻现问一次、不 await 它。若实现返回一个 Promise，
+   * 它在调用方眼里就是「一张空的表」（`Object.keys` 为 0），于是退回 `config.presets` ——
+   * 静默走回配置那一份，而不是把一个 thenable 当表用。
+   * @returns 表；**空对象表示「没有可用的表」**，调用方据此退回配置。
+   */
+  table(): Readonly<Record<string, PresetSpec>>
+}
+
 /** 名册服务的最小面与通道判定都在 `./presets.ts` 里，这里只是把它挂到 Context 上。 */
 declare module '@deepseek-ai/cordis' {
   interface Context {
@@ -783,6 +809,15 @@ declare module '@deepseek-ai/cordis' {
      * 派发失败，等于让本插件在那些部署里根本不能用。
      */
     agentPresets?: AgentPresetRosterPort
+    /**
+     * 可选的**外部预设表**：预设不写在 `cordis.patch.yml` 上、改由一个专门管文件的插件
+     * （`dsh-preset-studio`）读/写并对外提供时，走的就是这个名字。
+     *
+     * 与 `userQuestions` 同一档的软依赖 —— 本插件**只机会式消费**它：
+     * `ctx.get('presetFiles')`.**table()** 拿得到一张非空表就用它，否则用 `config.presets`。
+     * 拿不到不是错误：没装那个插件、或者它还没装载完，都是合法部署，本包照旧按配置跑。
+     */
+    presetFiles?: PresetFilesPort
   }
 }
 
@@ -2029,6 +2064,53 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
   }
 
   /**
+   * **派发那一刻**要用的那张预设表：先问外部来源（`dsh-preset-studio` 一类插件提供的
+   * `ctx.get('presetFiles')`），拿不到才退回本行配置的 `config.presets`。
+   *
+   * 三件事必须写清楚，它们各自踩过坑：
+   *
+   * 1. **为什么读在派发时，而不是 `apply` 一开始读一次存下来**：`task` 在构造期就把
+   *    `config` 收进了那个默认参数，profile 里 `cordis.patch.yml` 的改动**不会热重载**
+   *    到它身上（本包一路就是这么读 `config.presets` 的）。把表读在派发那一刻，
+   *    管文件的插件改完文件之后，**下一次派发**就看得见新表 —— 这是这项改造的全部意义；
+   *    在 `apply` 里同步求值一次再存起来，等于又钉死一份快照。
+   *
+   * 2. **为什么拿不到就退回配置**：这条路上没有调用方在看（自动放行那条链连模型都不在旁边），
+   *    而「这个部署没装那个插件」「它还没装载完」「它的表此刻是空的」全是**合法状态**。
+   *    在这里抛，等于给每一次派发新增一个抛错点 —— 与 `index.ts` 里那两条监听器
+   *    「自己吞掉一切异常」是同一条纪律（每一次事件分发失败都不许把整轮对话炸掉）。
+   *    所以 `ctx.get` 抛、`table()` 抛、返回的不是表，一律当作「拿不到」：退回配置，
+   *    派发该成的照成。
+   *
+   * 3. **为什么走服务、不自己去读文件**：那一套格式（目录、文件名、解析、写回）
+   *    只能有**一份实现**，而它属于那个管文件的插件。本包自己再读一遍文件，就会多出
+   *    第二份解析器 —— 两份一起漂移，最后谁都不知道「生效的到底是哪张表」。
+   *    接口刻意收到最小面（{@link PresetFilesPort} 只有 `table()`），本包**不 import**
+   *    那个包，理由与 {@link AgentPresetRosterPort} 逐字相同。
+   *
+   * 「非空」这个判据不是洁癖：空表与「没有表」对 `resolvePreset` 是同一件事
+   * （查不到名字就走 `UnknownPresetError` / `{}`），而把空表当表用会让一次「插件还没
+   * 装载完」的时序问题静默变成本包配置的失效。宁可退回配置，也不要一张空表。
+   * @returns 当刻生效的预设表；外部来源拿不到时是本行的 `config.presets`。
+   */
+  const presetTable = (): Readonly<Record<string, PresetSpec>> => {
+    try {
+      const port = ctx.get('presetFiles') as PresetFilesPort | undefined
+      // 必须是**同步**的表：返回 Promise 的话 `Object.keys` 拿不到任何键，
+      // 下面那格非空判据会把它当空表、退回配置 —— 正是我们要的（不 await、不猜）。
+      const table = port?.table()
+      if (table !== undefined && table !== null && typeof table === 'object' && !Array.isArray(table) && Object.keys(table).length > 0) {
+        return table as Readonly<Record<string, PresetSpec>>
+      }
+    } catch (error) {
+      // 只记一行日志，**绝不改变去向**：服务在、却读不出来是异常现场，值得在宿主日志里
+      // 留个痕；但派发照旧走配置那一份，见上面第 2 条。
+      ctx.logger?.warn?.('task: reading the external preset table failed; falling back to the configured presets: ' + String(error))
+    }
+    return config.presets
+  }
+
+  /**
    * 一次派发：**工具路径与自动放行路径共用这一份**。
    *
    * 它就是从 `case 'dispatch'` 里原样抽出来的那段（提问根登记、节点简报），
@@ -2061,7 +2143,9 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
     signal: AbortSignal,
   ): Promise<{ task_id: string; node?: string; status: string; result?: string; presetFallback?: string }> => {
     assertCanDelegate(parent)
-    const preset = resolvePreset(config.presets, spec.preset, DEFAULT_PRESET)
+    // 表**现问一次**（理由与两条退回路径整段见 {@link presetTable}）：外部来源拿得到就用它，
+    // 拿不到才用 `config.presets`。这是本文件里唯一读配置那格预设表的地方。
+    const preset = resolvePreset(presetTable(), spec.preset, DEFAULT_PRESET)
     // **实际生效的 preset 键**：显示层（树标题 / 提问卡片前缀 / label 之外的）一律以它为准，
     // 不以调用方自由填的 `spec.label` 为准 —— 两者不一致时，label 只是个活名，身份是这一支。
     // 与 `resolvePreset` 同一处取值，所以「显示的身份」与「真正跑的身份」不可能再分叉。
