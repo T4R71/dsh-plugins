@@ -51,7 +51,30 @@
     # （`packages/task/src/index.ts:256`），所以这里按实测值写，不按猜测写。
     #
     # `presets` 只给 `deny`，不给 `allow`：`allow` 是白名单，写错一个名字就等于
-    # 悄悄收走子代理的工具；`deny` 写错一个名字只是白写一条，失败方向是安全的。
+    # 悄悄收走子代理的工具。
+    #
+    # ⚠️ 2026-10-14 实测证伪了「deny 写错一个名字只是白写一条」这条判断：
+    # `tools.restrict()`（@deepseek-ai/dsh-tools）对**未知名字直接抛错**，整个派发失败：
+    #   tools.restrict() names unknown global tools "todo_write", "subagent",
+    #   "subagent_fork", "workflow"; known global tools: ...
+    # 判据在 dsh-tools/lib/index.js：
+    #   const known = this.view(scope).restrictableNames;
+    #   const unknown = [...allow, ...deny].filter((n) => !known.has(n));
+    #   if (unknown.length > 0) throw new Error('tools.restrict() names unknown global tool...')
+    # 而 `restrictableNames` 只收**全局工具表里注册过的名字**（本机实测见下），
+    # 所以 deny 必须逐字取自真实工具面，一个都不能凭印象写。
+    #
+    # 本机（desktop profile + ptc-custom）实测可用的全局工具名（35 个，去 run_code）：
+    #   ask_user_question, create_goal, edit, exit_plan_mode, get_goal, glob, grep,
+    #   interrupt_agent, job_kill, job_list, job_output, list_agents,
+    #   load_workspace_dependencies, present, pwsh, qa_thread, read, read_image,
+    #   schedule_create, schedule_delete, schedule_list, schedule_update,
+    #   send_message, skill, spawn_teammate, task, team_task_create, team_task_get,
+    #   team_task_list, team_task_update, update_goal, wait_agent, web_fetch,
+    #   web_search, write
+    # 下面**不存在的**四个名字曾导致派发 100% 失败，已移除：
+    #   todo_write（本组合里被 disabled: true 关掉）、subagent、
+    #   subagent_fork、workflow（都不在本 preset 的工具面里）。
     #
     # 下面出现的每一个名字都取自**真机实测的工具面**，不是从文档抄的：
     #   M:\T4\out\stage2\collapse\out-C-collapsed\tools-surface.json 的 `toolNames`
@@ -65,24 +88,78 @@
       config:
         provider: spawn
         presets:
-          # 侦察：只读、只回报，不动任何东西。
-          # 三个写入面（edit / write / pwsh）与可写入的 todo_write 全摘，派发面全摘。
+          # ── 身份两通道：preset（面）+ persona（兜底） ────────────────────────
+          #
+          # 为什么两条通道各给一个：
+          #   preset  —— 唯一能让孩子【拥有父从来没有过的工具和技能组】的通道。
+          #              指向 .agent-presets\role-*\agent.cordis.yml，身份提示词、
+          #              技能组、工具面都写在那三个目录里。
+          #   persona —— 兜底。名册在册时 task【只交 preset、不交 persona】（两条身份段
+          #              同名同层会让宿主当场抛）；名册缺席/名字不在册/条目 broken 时
+          #              自动退回 persona + toolFilter，此时这条兜底生效。
+          #              实测证据：M:\DSH-RESCUE\tools\verify_channel.mjs 六条路径全跑过。
+          #
+          # ⛔ 不要再给 `deny`。2026-10-14 两次派发实测把它证伪了。
+          # 第一次报：tools.restrict() names unknown global tools "todo_write",
+          #   "subagent", "subagent_fork", "workflow"
+          # 换成取自主会话面的名字后，第二次仍失败："spawn_teammate", "send_message",
+          #   "interrupt_agent", "team_task_create", "team_task_update" 同样被判未知。
+          #
+          # 原因：tools.restrict() 的 restrictableNames 是**按目标 agent 的 scope 现算的**
+          # （dsh-tools/lib/index.js 的 view(scope)），而 role-* 预设自带的工具面只有 5 行
+          # （persona / skill-filesystem / tool-skill / tool-fs / tool-fs-search），
+          # 产出 read / glob / grep / skill —— 主会话面上的名字在其中一个都不存在。
+          # 且**一个未知名字就整体抛错**，整个派发失败，不是「白写一条」。
+          #
+          # 也别写成空数组 `deny: []`：两栏都给空会抛 EmptyPresetFilterError
+          # （presets.js 的 resolvePreset）。**两栏都省略**才是「继承父」。
+          #
+          # preset 通道下本就不需要 deny：role-* 自带的面已是最小面。deny 只在降级路径
+          # （名册缺席、退回 persona + toolFilter 平铺）才起作用，而那条路要求名字取自
+          # **父的面** —— 与 preset 通道互相冲突，一份配置无法同时满足两个面。
+          #
+          # 角色行为要改，改 C:\Users\TRI\.dsh\.agent-presets\role-*\ 里的
+          # persona\prefix.md 与 agent.cordis.yml，不用碰本文件。
+          #
+          # 排障信号：派发后若返回值里出现
+          #   preset "role-recon" is not in the agent-preset roster (available: ...)
+          # 就说明角色没被认到，已静默降级（不抛错）。
+          # 2026-10-14 起 `preset` 是真的生效的 —— 但**不是**通过 SubagentStartRequest
+          # 送进去的（那九字段里没有 preset，送了也没人读）。流程是：
+          #   ① task 派发前把 childId → 'role-recon' 登记进 pendingPreset
+          #   ② 孩子在 agent/created 那一刻（实测 lastTurn === 0、openTurnStartSeq === null）
+          #      被 `agentPresets.select(agent, 'role-recon')` 换成**角色自己的整支 plugin 行**
+          # 所以孩子拿到的面来自 role-recon\ 目录，**不是**从父的面里减出来的。
+          #
+          # 下面的 persona 是**兜底**，只在换面失败时才会被用上（那时 task 退回平铺通道，
+          # 孩子在父的面里做减法）。角色正常生效时它**不会被读**，真源是
+          # role-recon\persona\prefix.md。
+          # `deny` 与角色目录的分工：角色目录管「提示词 / 工具面 / 技能」三件，
+          # 而 `deny` 是**任务派发策略**（与 maxDepth 同类），所以留在本表。
+          #
+          # 为什么 recon 要 deny ops_bash：dsh-ops 是按 **agent** 挂工具的
+          # （`dsh-ops` 的 `ctx.on('agent/created', attach)`），它绕过了
+          # 「recon 目录里没有 shell 组」这个设计 —— 实测 recon 子代理拿到了 ops_bash。
+          # 而 `tools.restrict` 只过滤**全局**工具（原注释："Restrict global tools ...
+          # scoped registrations remain visible"），对 scope-local 的 ops_bash 无效。
+          # 所以 task 改成在**执行时**拒绝：工具名还在孩子面上，但调用被单调挡下，
+          # 并给出可读理由（"角色声明不使用 ops_bash ..."）。
+          #
+          # 同一格声明两条通道共用：降级通道（A 路）里它进 toolFilter 做减法；
+          # 预设通道（B 路）里 toolFilter 不交，由 task 的执行前守卫兑现。
           recon:
+            preset: role-recon
             persona: 'You are a reconnaissance agent. Read, search and report. Change nothing.'
-            deny: ['edit', 'write', 'pwsh', 'todo_write', 'subagent', 'subagent_fork', 'task', 'workflow']
+            deny: [ops_bash]
             maxDepth: 1
-          # 实施：干活的那一支，所以写入面与 pwsh 留着，只摘派发面（不许再往下套娃）。
           impl:
+            preset: role-impl
             persona: 'You are an implementation agent. Make the change and prove it with a command.'
-            deny: ['subagent', 'subagent_fork', 'task']
             maxDepth: 2
-          # 校验：读、找、跑命令都可以（要能自己复现结论），但不能改任何东西、
-          # 也不能再往下派。所以 pwsh 留着，三个写入面与 todo_write 摘掉。
           verify:
+            preset: role-verify
             persona: 'You are a verification agent. Reproduce the claim yourself and report evidence, not agreement.'
-            deny: ['edit', 'write', 'todo_write', 'subagent', 'subagent_fork', 'task', 'workflow']
             maxDepth: 1
-
     # 浏览器半边：右侧边栏的大纲面板。数据源是 `plan-tree-sessions` 那份配置文档的
     # 共享镜像（`ctx.configForms.describe()`）。
     # 需要挂在有浏览器表面的 profile 上；纯宿主 profile 停用这一行即可。
