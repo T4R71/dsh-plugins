@@ -4,8 +4,8 @@
  * 为什么不用 js-yaml：本仓库是 pnpm 工作区，js-yaml@4.3.2 确实躺在
  * node_modules/.pnpm 里，但它没有被任何包链接过（任何 packages 下的子包都没有
  * 链接到它）。把它写进 dependencies 就必须跑一次 pnpm install —— 那会改写
- * M:\dsh-plugins 的 pnpm-lock.yaml 与 node_modules，而这是一个**只读**仓库。
- * 为三个格式固定的文件付这个代价不划算，所以这里自带实现，零依赖。
+ * M:\dsh-plugins 的 pnpm-lock.yaml 与 node_modules。为三个格式固定的文件付这个
+ * 代价不划算，所以这里自带实现，零依赖。
  *
  * 支持的范围（正好覆盖这三个文件用到的语法）：
  *   - 块序列       `- id: x`
@@ -15,9 +15,13 @@
  *   - 引号标量     '...' 与 "..."（含 \\' 与 \\" 转义）
  *   - 行内流式     [] 与 {} 的空写法，以及 ["a", "b"] 这类简单标量列表
  *   - 注释         `#`（不在引号内的才当注释）
- *   - 自定义标签   `!!js process.platform === 'win32'` → 字符串
- *                  （cordis.yml 允许 !!js，官方预设也用它；这里按字符串容忍，
- *                  与 js-yaml 注册 `new Type('!!js', { kind: 'scalar' })` 同效）
+ *   - 自定义标签   `!!js <表达式>` → **在本进程内真求值**，拿到的是表达式的值
+ *                  （布尔/数字/字符串），不是表达式文本；求值出错才退回原表达式
+ *                  字符串。为什么必须真求值：字符串是**真值**，收成字符串会让每
+ *                  一行 `disabled: !!js ...` 被静默当成 `disabled: true` —— 实测
+ *                  role-impl 的整个 shell 组因此零贡献且不报任何错。
+ *                  见 parseScalar 的 jsTag 分支与 tests/yaml.spec.ts，两边都不许
+ *                  改回去（真求值换回字符串，那份 spec 立刻 5 条红）。
  *   - 其他标量     null / true / false / 数字 / 裸字符串
  *
  * 不支持（本包用不到，遇到就按字面量当字符串，不抛）：锚点、别名、多文档、
