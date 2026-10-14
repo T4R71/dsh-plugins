@@ -1,0 +1,21 @@
+# 组合包层：只插本包自己那一行，不碰 profile 的其余部分。
+#
+# 为什么必须有这个文件：0.2.0 的插件管理器把「是不是组合包」判在 package.json 的
+# `dsh.bundle.patch` 上（dsh-plugin-manager 的 bundleManifest：patch 缺失就返回
+# undefined）。没有它，这个包会被标成「异常 · not-bundle」，也不能被列进 profile 的
+# dsh.profile.bundles。
+#
+# 这一行的落点就是宿主半边 lib/index.js：启动时读 .agent-presets/role-*/ 目录，
+# 为每个角色调 ctx.agentPresets.register()。0.2.0-rc.2 的 agent-preset 是注册制，
+# 名册里不会自己长出这些目录，必须由一行代码把它们递进去。
+
+- insert:
+    - id: role-presets
+      name: '@t4r71/dsh-role-presets'
+      # `config: {}` 不是装饰：Cordis 对**没写 config 键**的行传 `undefined` 而不是 `{}`，
+      # 本插件据此炸过一次（真实装载路径实测，见 src/index.ts run() 里的注释）。
+      # 插件已自带兜底，这里显式写出是为了让读配置的人一眼看见有哪些可调项：
+      #   dir    角色目录根，默认 ~/.dsh/.agent-presets
+      #   prefix 目录名前缀，默认 'role-'
+      #   order  注册顺序基准，默认 10
+      config: {}
