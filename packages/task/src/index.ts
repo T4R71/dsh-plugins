@@ -157,16 +157,18 @@ import {
   type WorktreeRecord,
   type WorktreeStore,
 } from './worktree-state.ts'
-// 「把这个孩子关进它自己的副本」两件事（cwd + 档位）都在这一格里。它自带的文档写明
-// 为什么缺一不可，以及 2026-10-02 那一炮的实测读数。
-import { fenceChildSession, type ChildAgentRegistry } from './child-sandbox.ts'
+// 「把这个孩子关进它自己的副本」那一格（cwd + 档位）在 `./child-sandbox.ts` 里。它自带的
+// 文档写明为什么缺一不可，以及 2026-10-02 那一炮的实测读数。**本文件不再调用它**：
+// 唯一那个调用点（`probe` 那一档）已经删掉，围栏本身照旧是可用的一道真边界，
+// 要验它请直接在代码里调 `fenceChildSession`（测试见 tests/child-sandbox.spec.ts）。
 import { randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 
 /**
- * 决策节点的 id 前缀。`ask` 写下的每一个问题都带这个前缀，
- * 于是「哪些节点是决策」是一个可机读的事实，而不是靠标题措辞去猜。
+ * 决策节点的 id 前缀。遮蔽版 `ask_user_question` 写下的每一个问题都带这个前缀
+ * （见 {@link installAskProxy}），于是「哪些节点是决策」是一个可机读的事实，
+ * 而不是靠标题措辞去猜。
  */
 const DECISION_PREFIX = 'ask-'
 
@@ -527,7 +529,7 @@ export interface ResolvedConfig {
    *
    * 上面 `defaultRules` 与这一格、以及下面 worktree 的那几格**都标成可选**，是**实情**
    * 而不是宽容：schema 里每一格都有默认值（文本格是空串，`worktreePrepare` 的默认是
-   * `pnpm install --frozen-lockfile`，`worktreeAuto` 是 true），真实部署经 `Config`
+   * `pnpm install --frozen-lockfile`，`worktreeAuto` 默认**不开**），真实部署经 `Config`
    * 解析之后每一格都是填满的；代码里也各按自己的兜底读 —— 文本格 `?? ''`，
    * `worktreeAuto` 按 `=== true` 判（省略即最保守的那一档）。这样单测与老调用方可以
    * 直接只给真正要考的那几格，不必抄一遍默认值 —— 抄出来的默认值一旦哪天变了，
@@ -574,31 +576,21 @@ export interface ResolvedConfig {
    */
   readonly worktreePrepare?: string
   /**
-   * **改代码的派发默认就走隔离线**（用户 2026-10-02 拍的板）。
+   * 改代码的派发要不要**自己**开一条隔离线。**默认不开**。
    *
-   * true 时，`dispatch` / `run` **不给 `worktree` 参数也会自动开一条线**：
-   * 线名由插件按「会话 + 目标」生成，同一个目标重试/续跑复用同一条。
-   * 只做只读调研、确实不该隔离的派发，显式传 `worktree: "-"` 关掉。
+   * true 时，`run` **不给 `worktree` 参数也会自动开一条线**：线名由插件按
+   * 「会话 + 目标」生成，同一个目标重试/续跑复用同一条。
    *
-   * 关掉这一格就退回「要不要隔离由中枢每次记得说」——那正是这套纪律要消灭的东西，
-   * 所以 **schema 的默认是 true**：真实部署经 `Config` 解析之后这一格永远是 true。
-   * 而**直接**构造配置（单测、老调用方）省略这一格时是**不开**的 —— 代码按 `=== true`
-   * 判，于是「省略」落在最保守的那一档，不会因为类型标了可选反而更激进。
+   * **默认是 false**（2026-10-14 改）：不显式声明就不开隔离线 —— 要隔离由中枢在派发时
+   * 点名 `worktree: <线名>`，只读的活传 `worktree: "-"` 明说。这样「开不开线」这件事
+   * 只由中枢每一次的声明决定，不由一行看不见的默认值决定。
+   *
+   * 代码按 `=== true` 判，于是**直接**构造配置（单测、老调用方）省略这一格与 schema
+   * 的默认值走的是同一档：都不开。
    * 它**不是**可以偷偷降级的开关：开着的这条路上，线起不来（主检出脏、不是 git 仓、
    * 依赖对不上）时派发**当场失败**，绝不改成「那就在主检出上跑吧」。
    */
   readonly worktreeAuto?: boolean
-  /**
-   * `probe` 那一档要不要对中枢暴露。**默认关**。
-   *
-   * 它是「开一个探头子代理、看它被关在哪」的实验入口：跑一句给定的话、把子会话自己的
-   * 读数原样带回来。日常编排用不到它，所以它进 `action.enum` 也只在打开这一格时 ——
-   * 关着的时候模型连合法调用都构造不出来（参数层先一步报 must be one of）。
-   *
-   * 与 `worktreeAuto` 同一档语义：代码按 `=== true` 判，**省略即最保守的那一档**，
-   * 于是直接构造配置的单测与老调用方不会因为类型标了可选就更激进。
-   */
-  readonly probeEnabled?: boolean
 }
 
 /**
@@ -650,7 +642,7 @@ export interface PresetAgentOptionsField {
   maxTokens?: number
 }
 
-export const Config: z<{ provider: string; defaultRules?: string; presets: Dict<PresetSpecField>; runsFile?: string; worktreesFile?: string; worktreeGoal?: string; worktreeVerify?: string; worktreeMergeVerify?: string; worktreePrepare?: string; worktreeAuto?: boolean; probeEnabled?: boolean }> = z.object({
+export const Config: z<{ provider: string; defaultRules?: string; presets: Dict<PresetSpecField>; runsFile?: string; worktreesFile?: string; worktreeGoal?: string; worktreeVerify?: string; worktreeMergeVerify?: string; worktreePrepare?: string; worktreeAuto?: boolean }> = z.object({
   /** `ctx.subagents` 里的 provider 名，必填——`startContinuable` 的第一个参数就是它。 */
   provider: z.string().required(),
   /**
@@ -723,15 +715,13 @@ export const Config: z<{ provider: string; defaultRules?: string; presets: Dict<
   /** 装依赖的命令，默认 `pnpm install --frozen-lockfile`。 */
   worktreePrepare: z.string().default('pnpm install --frozen-lockfile'),
   /**
-   * 改代码的派发**默认自动**进隔离线。默认 true —— 这是常态化的那一档，
-   * 关掉它等于退回「隔离是可选的装饰」。只读调研用 `worktree: "-"` 逐次关。
+   * 改代码的派发要不要**自己**开隔离线。**默认 false** —— 不显式声明就不开。
+   *
+   * 要隔离由中枢点名：`run` 传 `worktree: <线名>`（或 `worktreeAuto: true` 打开这一格
+   * 回到旧的自动档）。默认关的理由是「开不开线」该由中枢每一次的派发决定，
+   * 而不是由一行没人看得见的默认值替它决定。
    */
-  worktreeAuto: z.boolean().default(true),
-  /**
-   * `probe` 那一档开不开。默认 false —— 它是实验入口，不是编排的一部分。
-   * 打开之后 `task` 的 `action.enum` 会多出 `probe` 一项（见工具参数的说明）。
-   */
-  probeEnabled: z.boolean().default(false),
+  worktreeAuto: z.boolean().default(false),
 })
 
 /** 提问服务回答里的一条。 */
@@ -791,7 +781,7 @@ interface PresetFilesPort {
 declare module '@deepseek-ai/cordis' {
   interface Context {
     /**
-     * 可选的提问服务：没有人类应答者的组合里它缺席，`ask` 动作因此**明确报错**，
+     * 可选的提问服务：没有人类应答者的组合里它缺席，遮蔽版 `ask_user_question` 因此**明确报错**，
      * 而不是返回一个模型会读成「已问过」的空答案。
      */
     userQuestions?: UserQuestionsSurface
@@ -1182,8 +1172,9 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
    * 这次派发落在**哪条**隔离线上（`undefined` = 这次不隔离）。三档，顺序就是优先级：
    *   1. `worktree: "-"`（也认 off/none/no/false）⇒ **显式关闸**，只读调研的活用它；
    *   2. `worktree: "<名>"` ⇒ 用中枢点名的那条线（同名 = 同一条线）；
-   *   3. 什么都不给 ⇒ **默认档**：改代码的派发**自动**开一条线（`worktreeAuto` 可关），
-   *      线名由 {@link autoLineName} 按「会话 + 目标」生成 —— 重试与续跑复用的正是它。
+   *   3. 什么都不给 ⇒ **不开**（`worktreeAuto` 默认 false；把那一格显式打开才回到
+   *      「不给也自动开」的旧档，那时线名由 {@link autoLineName} 按「会话 + 目标」生成 ——
+   *      重试与续跑复用的正是它）。
    *
    * 第 3 档起线失败时**当场抛**，并在报错里附上关闸的写法：「默认就在主检出上跑」
    * 是这套纪律唯一不能有的出口。
@@ -1224,7 +1215,8 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
       return await start(name)
     } catch (error) {
       throw new Error((error instanceof Error ? error.message : String(error))
-        + '\n（这条隔离线是**默认**开出来的，线名 `' + name + '`；只做只读调研、确实不该隔离的派发，显式传 `worktree: "-"` 关掉。）')
+        + '\n（这条隔离线是 `worktreeAuto` 替你自动开出来的，线名 `' + name + '`；要它别自动开就关掉那一格，'
+        + '只做只读调研、确实不该隔离的派发则显式传 `worktree: "-"` 关掉。）')
     }
   }
 
@@ -1579,14 +1571,15 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
    *
    * ## 怎么绕开，又不改宿主
    *
-   * 在子代理**自己的作用域**里遮蔽 `ask_user_question`，执行时改以**根代理**为作用域发起
+   * 在**提问者自己的作用域**里遮蔽 `ask_user_question`，执行时改以**根代理**为作用域发起
    * 同一次 `ask`：`assertLiveRoot(root)` 通过（root 正是 `agents.roots()` 的成员），
    * waterfall 落在根会话的客户端上（卡片就地弹在人的界面上，与中枢自己提问同一条路），
    * 答案原路 resolve 后作为工具结果回到**子代理**手里。
    *
    * ## 记录去哪
    *
-   * 与 `task` 的 `ask` 动作同构：问题先落进**子代理自己的树**（`ask-N` 节点），回答回来后
+   * 与已删的 `task` 的 `ask` 动作同构（那条路已并入本工具）：问题先落进**子代理自己的树**
+   * （`ask-N` 节点），回答回来后
    * 把 `答：…` 写进同一节点的 detail。节点标题带 `[<label>] ` 前缀 —— 去掉「搬进父会话树」
    * 那条路之后，全树只剩这一份，认人的信息就必须长在它自己身上。
    *
@@ -1740,8 +1733,8 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
           readonly multi_select?: boolean
         }[]
         const title = asked.map(item => item.header ?? item.question).join(' / ')
-        // 先写树、再问：顺序与 `task` 的 `ask` 动作一致 —— 先问后写的话，一旦写失败，
-        // 用户已经答过的话就只剩对话里那一份，压缩之后就没了。
+        // 先写树、再问：先问后写的话，一旦写失败，用户已经答过的话就只剩对话里那一份，
+        // 压缩之后就没了 —— 那正是这套机制要防的事。
         let nodeId: string | undefined
         try {
           const existing = tree().read(childSid)
@@ -1751,7 +1744,7 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
           await tree().write(childSid, [{ id: nodeId, title: '[' + label + '] ' + title }], false)
         } catch (error) {
           nodeId = undefined
-          ctx.logger?.warn?.('task: sub-agent ' + childSid + ' could not record its question in its own tree: ' + String(error))
+          ctx.logger?.warn?.('task: agent ' + childSid + ' could not record its question in its own tree: ' + String(error))
         }
         const questions = ctx.get('userQuestions')
         if (questions === undefined) {
@@ -1805,7 +1798,7 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
           try {
             await tree().step(childSid, nodeId, { status: 'completed', detail: ANSWER_PREFIX + answerText })
           } catch (error) {
-            ctx.logger?.warn?.('task: sub-agent ' + childSid + ' could not write the answer back into its tree: ' + String(error))
+            ctx.logger?.warn?.('task: agent ' + childSid + ' could not write the answer back into its tree: ' + String(error))
           }
         }
         return {
@@ -1815,6 +1808,48 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
       },
     }))
   }
+
+  /**
+   * 已经装过遮蔽版提问工具的**根代理**。
+   *
+   * 与孩子那张 `childRoots` 链分开：孩子由 `pendingAskRoots` 在派发那一刻登记，
+   * 而根代理没有那一刻（插件起来时它可能已经在跑了），只能按「第一次见到就装一次」记账。
+   * 记的是 Agent 本身，所以这个表随对象回收，不会只增不减。
+   */
+  const rootAskInstalled = new WeakSet<Agent>()
+
+  /**
+   * 给**根代理**（人类应答者所在的那一支）装同一份遮蔽版 `ask_user_question`。
+   *
+   * 与孩子那条路的唯一差别是**时机**：孩子有 `agent/created` 那一刻，根代理未必有 ——
+   * `apply()` 跑起来时它可能已经在跑了（那时事件早就发过了），也可能一个根都还没有
+   * （真实部署里 profile 先装载、主会话后建立）。所以这一份**两处都试**、且幂等：
+   *   ① 插件启动路径里按 `ctx.agents?.roots?.()` 试一次（下面紧跟的那个循环）；
+   *   ② 每一条 `agent/created` 上再试一次 —— 根代理自己也是经 `agents.enter()` 发出
+   *      这条事件的（`dsh-agent/lib/index.js:579`），而本监听器是 global 的，
+   *      所以「插件先起来、主会话后建立」那种次序在这里兑现。
+   *
+   * `root` 传它自己：它就是人类应答者所在的那一支（与 {@link rootAgentOf} 对孩子做的事
+   * 是同一件）。label 取 {@link DEFAULT_PRESET} 的中文名（`lead` → 「中枢」），
+   * 与树节点前缀同一个来源。
+   *
+   * **装成功才记进 WeakSet**：抛过的那一次不算装过，后面还有机会重试。
+   * 记早了会让一次瞬时的失败变成永久缺一份提问工具。
+   * @param agent - 候选根代理。
+   */
+  const installRootAskProxy = (agent: Agent): void => {
+    if (rootAskInstalled.has(agent)) return
+    try {
+      installAskProxy(agent, agent, roleLabel(DEFAULT_PRESET))
+      rootAskInstalled.add(agent)
+    } catch (error) {
+      ctx.logger?.warn?.('task: root agent ' + String(agent.id) + ' kept the host question tool; the decision-recording proxy was not installed: ' + String(error))
+    }
+  }
+
+  // 根代理那一份：此刻 `ctx.agents.roots()` 可能已经有它（那时 `agent/created` 早发过了），
+  // 也可能一个都没有 —— 两处都试，见 {@link installRootAskProxy}。
+  for (const root of ctx.agents?.roots?.() ?? []) installRootAskProxy(root)
 
   installDenyGuard(ctx)
 
@@ -1837,6 +1872,12 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
         ctx.logger?.warn?.('task: sub-agent ' + String(agent.id) + ' started without its direct-to-user question tool: ' + String(error))
       }
     }
+    // 根代理那一份：根自己也是经 `agents.enter()` 发这条事件的（`dsh-agent/lib/index.js:579`），
+    // 而上面 `childRoots` 那条链只覆盖孩子。于是「插件先起来、主会话后建立」这种次序在这里
+    // 兑现 —— 判据用当刻的 `roots()`，与 {@link rootAgentOf} 同一个来源。
+    // 每一次 `agent/created` 都**重扫一遍**，而不是只认手上这一个：插件启动那一刻若根代理的
+    // 作用域还没装配好（`installRootAskProxy` 抛过一次、没记进表），这里就是它的下一次机会。
+    for (const root of ctx.agents?.roots?.() ?? []) installRootAskProxy(root)
     // ── 角色预设换面（B 路）────────────────────────────────────────────────────
     // 宿主在 `applyChildComposition` 里硬编码 `composeFrom(childCtx, parent.ctx)`：
     // 孩子**无条件** join 父的挂载，而 `SubagentStartRequest` 上根本没有 preset 字段。
@@ -2797,7 +2838,7 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
    * 该用：用户明确要你解释某件事（「这是怎么工作的」「为什么要这么设计」）；
    *       用户提出一个**独立的新方向**（区别于对当前活的补充说明）。
    * 不该用：填空、确认、二选一这类一句话就能定的小事 —— 那些直接调
-   *       `ask_user_question`（或 `task` 的 `ask`），开一条线程只为问一句是浪费；
+   *       `ask_user_question`（所有代理都装了遮蔽版，含中枢自己），开一条线程只为问一句是浪费；
    *       也不该拿它当「帮我查一下」的通用后端，它**只干问答、不改文件、不派活**。
    *
    * ## 事实自己查：调用方只交想法
@@ -2905,13 +2946,11 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
       action: {
         type: 'string',
         required: true,
-        // `probe` 只在 `probeEnabled` 打开时出现。理由：它是「开一个探头子代理」的实验入口，
-        // 日常编排用不到它；常驻在工具面上等于每次都替所有调用方多付一段说明的字符，
-        // 而这类「只有排障时用一次」的动作不值得那笔开销。
-        enum: config.probeEnabled === true
-          ? ['plan', 'step', 'ask', 'commit', 'run', 'send', 'interrupt', 'list', 'result', 'worktree', 'probe']
-          : ['plan', 'step', 'ask', 'commit', 'run', 'send', 'interrupt', 'list', 'result', 'worktree'],
-        description: 'plan 写节点；step 推进一个节点；ask 问用户；commit 在隔离检出里按功能提交一批工作单元（line 点名哪条线、记录这次是怎么验证的）；run 声明一条依赖流水线并派出子代理——起点立刻派出，后继在前置全部完成时由插件自动派出，它不会给你发消息；run 的两个补充入口：retry=true 只重评估既有 run 的待办节点（还没派出去的那些），resume=<节点 id> 把已派出但没干成的节点交回它原来那个孩子接着干（不新派）；send 继续它；interrupt 停它；list 读树或子代理；result 读某个子代理的结果；worktree 管并行修改的隔离检出（起线 / 列出在飞的线 / 合回并统一提交 / 收线）。',
+        // 一组常量，且**只有这些**：`probe` 那一档整个删掉了（它是实验入口，不是编排的一部分），
+        // `ask` 也删掉了 —— 提问改由遮蔽版 `ask_user_question` 承担（见 {@link installAskProxy}），
+        // 那个工具比 `ask` 动作严格更强，而且中枢自己也用同一份。
+        enum: ['plan', 'step', 'commit', 'run', 'send', 'interrupt', 'list', 'result', 'worktree'],
+        description: 'plan 写节点；step 推进一个节点；commit 在隔离检出里按功能提交一批工作单元（line 点名哪条线、记录这次是怎么验证的）；run 声明一条依赖流水线并派出子代理——起点立刻派出，后继在前置全部完成时由插件自动派出，它不会给你发消息；run 的两个补充入口：retry=true 只重评估既有 run 的待办节点（还没派出去的那些），resume=<节点 id> 把已派出但没干成的节点交回它原来那个孩子接着干（不新派）；send 继续它；interrupt 停它；list 读树或子代理；result 读某个子代理的结果；worktree 管并行修改的隔离检出（起线 / 列出在飞的线 / 合回并统一提交 / 收线）。',
       },
       nodes: {
         type: 'array',
@@ -2937,8 +2976,6 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
       node: { type: 'string', description: 'step：要推进的节点 id。' },
       status: { type: 'string', enum: ['pending', 'in_progress', 'completed', 'failed'], description: 'step：新状态。子代理结算时由插件自己算——判据是**宿主投进父会话那句固定的结束模板**（`settlementSummary(childId, stopReason)`，见 `readStopReason`）：认得「正常结束」→ completed，但那只说明它**最后一轮正常结束了，未判定对错**；认得「被强停／上下文用尽／拒绝执行／出错／异常结束」→ failed 并记真实原因；**认不出 → 一个状态都不置**，节点保持原状、账本也不推进。子代理在结语里写状态行**不作数**（派发简报明令禁止它写），插件不看它的散文。' },
       detail: { type: 'string', description: 'step：替换节点的 detail。' },
-      question: { type: 'string', description: 'ask：问用户的问题。' },
-      options: { type: 'array', items: { type: 'string' }, description: 'ask：建议答案。' },
       prompt: { type: 'string', description: 'run 的每个节点一项（该节点自己要干的活，原样交给子代理）/ send：子代理收到的简报。' },
       preset: { type: 'string', description: 'run（顶层默认给全条流水线，节点项给该节点，节点项优先）：身份名，决定子代理的 persona 与工具过滤。省略则拿 lead 身份——绝不继承你的 persona；未知名字直接报错，不回落。这个名字同时是**内核预设名**（`presets.<角色>.preset` 那格可覆盖它）：名字在预设名册里就把身份整个交给预设树装配，问不到就退回 persona + 工具过滤并在返回值里留痕。' },
       label: { type: 'string', description: 'run：短标签，显示在面板上的活名。' },
@@ -2952,7 +2989,7 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
       merge: { type: 'number', description: 'list(scope=tree)：往下拼几层子代理自己写的树，拼在各自 bind 的节点下。0 或省略只读本会话自己的树。子代理始终写自己的树，拼接靠 bind 已记下的 assignedTo。' },
       worktree: {
         type: 'string',
-        description: 'dispatch/run：给这条活指定**隔离检出**（git worktree）+ 分支 wt/<名>（字母数字点线）。**默认不用给**：改代码的派发会自动开一条线（线名由插件按「会话 + 节点」生成，重试与续跑复用的正是同一条）；简报开头由插件拼上隔离前言（线名、检出绝对路径、分支、禁止碰主检出、收工前不要自己合并）。只做只读调研、确实不该隔离的派发，显式传 "-" 关掉。worktree 动作也用它点名要操作哪条线。',
+        description: 'dispatch/run：给这条活指定**隔离检出**（git worktree）+ 分支 wt/<名>（字母数字点线）。**默认不开隔离线**：不传就一律在主检出上跑 —— 要隔离就在这里点名一条线（同名 = 同一条线，重试与续跑复用的正是它）；简报开头由插件拼上隔离前言（线名、检出绝对路径、分支、禁止碰主检出、收工前不要自己合并）。只做只读调研、或确实不该隔离的派发，也可以显式传 "-" 明说。worktree 动作也用它点名要操作哪条线。',
       },
       worktreeVerify: { type: 'string', description: 'dispatch/run：这条线的**机械验证命令**（一整行 shell）。中枢声明、插件按线存下，`commit` 跑的是存下来的那条——子代理可以追加检查但省略不了它。省略则回落 task 行配置的 worktreeVerify。' },
       worktreeMergeVerify: { type: 'string', description: 'dispatch/run：合回之后要跑的**整套检查**（一整行 shell，例如全套测试 + typecheck）。省略则回落配置。一条线没有它就不能合回（fail-closed）。' },
@@ -2970,11 +3007,6 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
       mode: { type: 'string', enum: ['list', 'merge', 'drop'], description: 'worktree：list（默认）列出在飞的线（含在哪条检出、哪个分支、有几个提交、多少未提交改动）；merge 合回并统一提交到主线；drop 收线（删掉检出与分支，只在已合回或明确放弃时做）。' },
       force: { type: 'boolean', description: 'worktree mode=drop：线还有未合回的提交或未提交的改动时仍要收线（不可挽回，明确放弃才用）。' },
       title: { type: 'string', description: 'worktree mode=merge：落进整合提交信息里的一句话。' },
-      // 下面四格只服务 `probe`，且那一档只在 probeEnabled 打开时进 enum。
-      probe_cwd: { type: 'string', description: 'probe：这个探头子代理的**工作目录＝它的隔离副本**（绝对路径）。它的工具层写轴与命令行可写范围都以这一格为界。省略则报错——没有副本就没有可验的边界。' },
-      probe_prompt: { type: 'string', description: 'probe：交给这个探头子代理的任务原文。它跑在自己的副本里，跑完即止（不续跑、不进任务树）。' },
-      probe_marker: { type: 'string', description: 'probe：跑完之后用**本进程**去 stat 的一个路径（绝对路径）。用来核对「这个孩子到底有没有在界外落下东西」——存在即围栏失效。省略则不查。' },
-      probe_wait: { type: 'boolean', description: 'probe：是否等它这一轮结束再返回。默认 true；false 时立刻返回 child_id，读数由下一次 result 取。' },
     },
     output: {
       schema: {
@@ -2997,7 +3029,6 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
           verification: { type: 'string', description: 'commit：这次提交是怎么被验证的——machine（机械验证跑过）/ judgement（判断档）/ both / none。' },
           merged: { type: 'boolean', description: 'worktree mode=merge：这条线是否已合回并统一提交到主线。' },
           worktrees: { type: 'array', items: { type: 'string' }, description: 'worktree mode=list：在飞的线，每条一行（名字 / 分支 / 检出路径 / 提交数 / 未提交改动数）。' },
-          probe: { type: 'string', description: 'probe：这一炮的原始读数（子会话 id、cwd、跑过的命令、每条结果的沙箱自报档位、标记文件在不在）。**原文照抄**，不改写成结论。' },
           output: { type: 'string', description: 'commit / worktree merge：机械验证命令的真实回显。只在「跑过但没过」时带回，用来判断为什么没过；命令没跑起来时报文写在 result 里。' },
           presetFallback: { type: 'string', description: 'run：这一次派发**降级**了才有的留痕（`preset` 这条身份通道没走成）。rosterless 部署里是常态：`presets.<角色>.preset` 那个名字没名册可问，孩子改用 persona + toolFilter 的减法装面 —— 留痕就是为了让「装的是另一张面」这件事不被当成装成了。一个 run 里多个原因时按 ` ｜ ` 连接；没降级则整个键缺席。' },
           // **必须在这一份里报备**：宿主拿它做回执校验，出现未声明的属性时整份回执被判非法，
@@ -3025,7 +3056,6 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
         ['merged', 'merged'],
         ['worktrees', 'worktrees'],
         ['dispatched', 'dispatched'],
-        ['probe', 'probe'],
         ['output', 'output'],
         ['presetFallback', 'presetFallback'],
         ['evidence', 'evidence'],
@@ -3391,71 +3421,6 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
           ctx.subagents.interrupt(args.task_id as SessionId, authority)
           return { task_id: args.task_id, status: 'running' }
         }
-        case 'ask': {
-          if (args.question === undefined) throw new Error('task ask requires `question`')
-          const questions = ctx.get('userQuestions')
-          if (questions === undefined) {
-            throw new Error('task ask: the `userQuestions` service is unavailable — this composition has no human answerer, so the question was never shown')
-          }
-          // 树是决策的**唯一**落点，所以它缺席时这里必须报错，而不是问完就把答案丢在对话里。
-          // 对话会被压缩掉，答案不会自己留下；静默降级等于这条机制不存在。
-          const sid = sessionId(exec)
-          // 先把问题写进树，再问。顺序不能反：先问后写的话，一旦写失败，用户已经
-          // 答过的话就只剩下对话里那一份，压缩之后就没了 —— 那正是这套机制要防的事。
-          const nodeId = `${DECISION_PREFIX}${tree().read(sid).filter(node => node.id.startsWith(DECISION_PREFIX)).length + 1}`
-          // `replace: false` —— 决策节点是**追加**到现有树上的，绝不能把树换掉。
-          await tree().write(sid, [{ id: nodeId, title: args.question }], false)
-          // 服务身份与调用形状对齐内置的提问工具（dsh-tool-ask-user/lib/index.js:96-111）：
-          // 参数在服务侧是 camelCase 的 multiSelect，在工具侧是 snake_case 的 multi_select。
-          const asked = await questions.ask({
-            questions: [{
-              id: 'task-ask',
-              question: args.question,
-              ...args.options !== undefined ? { options: args.options.map(label => ({ label })) } : {},
-            }],
-            ...exec.agent !== undefined ? { agent: exec.agent } : {},
-            signal: exec.signal,
-          })
-          const answer = asked.answers[0]
-          const decision = answer === undefined
-            ? '(no answer)'
-            : [...answer.selected, ...answer.custom === undefined ? [] : [answer.custom]].join(', ')
-          // 把答案钉回节点。这条 detail 就是之后每次装配都会重读的决策本体。
-          await tree().step(sid, nodeId, { status: 'completed', detail: ANSWER_PREFIX + decision })
-          return { node: nodeId, status: 'completed', result: decision }
-        }
-        case 'probe': {
-          if (config.probeEnabled !== true) {
-            throw new Error('task probe: 这一档只在 probeEnabled 打开时存在（默认关）。它是「开一个探头子代理、看它被关在哪」的实验入口，不是日常编排的一部分。')
-          }
-          if (ctx.agents === undefined) throw new Error('task probe: the `agents` service is unavailable — nothing can create a child session')
-          const wanted = (args.probe_cwd ?? '').trim()
-          if (wanted === '') {
-            throw new Error('task probe: probe_cwd 是必填的 —— 这一档的全部意义就是「子会话的工作目录＝这一格」，'
-              + '省略它等于开一个没有可验边界的探头。')
-          }
-          const parent = requireAgent(exec)
-          const childId = 'session-' + randomUUID()
-          const fenced = await fenceChildSession({
-            registry: ctx.agents as unknown as ChildAgentRegistry,
-            parent,
-            sessionId: childId,
-            cwd: wanted,
-          })
-          const kid = fenced.agent as unknown as ProbeChild
-          const prompt = (args.probe_prompt ?? '').trim()
-          if (prompt !== '') {
-            kid.followup({ role: 'user', content: [{ type: 'text', text: prompt }], source: { kind: 'user' } })
-          }
-          const waited = args.probe_wait !== false
-          if (waited) await kid.whenIdle()
-          return {
-            task_id: childId,
-            status: waited ? 'completed' : 'running',
-            result: waited ? '这个探头子代理这一轮已经结束（结语看它自己的会话）。' : '已开出、没等。',
-            probe: probeReading(fenced.sessionId, fenced.cwd, waited, kid, args.probe_marker),
-          }
-        }
         // `dispatch` **不再对中枢暴露**：`action.enum` 里没有它，模型连合法调用都构造不出来
         // （参数层先一步报 `"action" must be one of [...]`，有测试钉住）。这个分支只留一个
         // 清楚的解释，防的是「靠 SDK / 旧缓存 / 别处拼出来的调用」静默落空 —— 它**不派任何活**，
@@ -3713,130 +3678,6 @@ function sessionId(exec: { agent?: { session?: { id: string } } }): SessionId {
   if (id === undefined) throw new Error('task requires a calling session (exec.agent.session was undefined)')
   return id as SessionId
 }
-
-/**
- * 一条 tool/result 上有没有**报错**。
- *
- * 两个落点都要看：宿主把失败写成 message.isError，内层错误则挂在 error 上 ——
- * 只看一个会把另一半未失败的读数记成失败（或反过来）。
- * @param data - 事件载荷。
- * @returns 是否失败。
- */
-function resultFailed(data: { readonly message?: { readonly isError?: boolean }; readonly error?: unknown }): boolean {
-  return data.message?.isError === true || data.error !== undefined
-}
-
-/**
- * 一条 tool/result 里那份**原文**。
- * @param data - 事件载荷。
- * @returns 原文的 JSON 形式。
- */
-function resultText(data: { readonly message?: { readonly content?: unknown }; readonly error?: unknown }): string {
-  return JSON.stringify(data.message?.content ?? data.error ?? '')
-}
-
-/**
- * 一条工具结果宣称自己在哪一档跑。
- *
- * **2026-10-02 实测：一条 `tool/result` 里根本没有这一格。** 那个孩子的整段日志里
- * 每条结果的 `data` 都只有 `turn/step/message`（外加写文件那条的 `meta.operation/diffs`），
- * 沙箱档位不在里面。所以这一格在真机上通常返回 undefined —— 保留它是为了「万一哪天
- * 宿主把它写进来」，而**绝不**拿会话头的档位替它填一个：那正是「读数被结论顶掉」的典型。
- * 真正的档位读数是它自己日志里那条 `sandbox/mode` 事件（下面照抄的那一段）。
- * @param data - 事件载荷。
- * @returns 那一档；结果里没写就是 undefined。
- */
-function reportedSandboxMode(data: unknown): string | undefined {
-  const sandbox = (data as { readonly meta?: { readonly sandbox?: { readonly mode?: unknown } } } | null)?.meta?.sandbox
-  return typeof sandbox?.mode === 'string' ? sandbox.mode : undefined
-}
-
-/**
- * 一个探头子代理身上本格会碰的那一小片**活孩子**接口。
- *
- * 与 ChildAgentRegistry 同一条纪律：只声明真的会用到的几格，不 import 宿主那侧完整的
- * Agent 形状（跨包具体类型够不到，见 ./child-sandbox 的说明）。
- */
-interface ProbeChild {
-  /** 这个孩子自己的会话。读它自己的日志是**唯一**的读数来源。 */
-  readonly session: {
-    /** 它自己的日志偏移。 */
-    readonly seq: number
-    /**
-     * 从某个偏移起读它自己的事件。
-     * @param from - 起始偏移。
-     * @returns 事件列表。
-     */
-    snapshotEvents(from: number): readonly { readonly type: string; readonly data: unknown }[]
-  }
-  /**
-   * 交一轮给它，并唤醒驱动。
-   * @param message - 一条用户消息。
-   */
-  followup(message: unknown): void
-  /**
-   * 等它这一整轮收敛到静止。
-   * @returns 静止之后 fulfillment。
-   */
-  whenIdle(): Promise<void>
-}
-
-/**
- * 这一炮的原始读数。**只抄事实**，不写结论 —— 「关住了没有」由调用的中枢照着
- * 这份读数自己判，插件不替它下判断。
- *
- * 三条读数对应三件不同的事：
- *   - child_cwd 是**命令行层的边界**（沙箱就是这么解析 workspace root 的）；
- *   - tool results 里每一条都带上「这条结果自己宣称的档位」与原文首行 ——
- *     **报错与报平安都照抄**，不筛选、不改写；
- *   - marker_exists 是**本进程**独立去 stat 的落盘事实，任何一层的自报都改不动它。
- * @param childId - 子会话 id。
- * @param cwd - 子会话的工作目录。
- * @param waited - 有没有等它跑完。
- * @param agent - 那个孩子的 agent。
- * @param marker - 要 stat 的标记路径（省略即不查）。
- * @returns 一份多行文本。
- */
-function probeReading(childId: string, cwd: string, waited: boolean, agent: ProbeChild, marker?: string): string {
-  const events = agent.session.snapshotEvents(0)
-  const calls = new Map<string, string>()
-  const rows: string[] = []
-  for (const event of events) {
-    const data = event.data as { readonly callId?: string; readonly name?: string }
-    if (event.type === 'tool/call' && typeof data.callId === 'string') {
-      calls.set(data.callId, String(data.name ?? ''))
-      continue
-    }
-    if (event.type !== 'tool/result') continue
-    const payload = event.data as {
-      readonly callId?: string
-      readonly message?: { readonly isError?: boolean; readonly content?: unknown; readonly toolCallId?: string }
-      readonly error?: unknown
-    }
-    // 调用 id 只出现在**消息**那一层（实测 `tool/result` 的 data 是 `{turn, step, message}`，
-    // 没有自己的 `callId`）—— 只认顶层那一格会把每条结果都记成 "(unknown tool)"。
-    const callId = payload.message?.toolCallId ?? payload.callId
-    const name = calls.get(String(callId)) ?? '(unknown tool)'
-    const mode = reportedSandboxMode(event.data)
-    const raw = resultText(payload).replace(/\\[rn]/g, ' ').replace(/\\"/g, '"')
-    rows.push('  ' + name + ' | isError=' + String(resultFailed(payload))
-      + (mode === undefined ? '' : ' | sandbox: ' + mode)
-      + ' :: ' + (raw.length > 300 ? raw.slice(0, 300) + '...' : raw))
-  }
-  return [
-    'child_id: ' + childId,
-    'child_cwd: ' + cwd,
-    'waited: ' + String(waited) + ' | events: ' + String(agent.session.seq),
-    'durable policy of this child (read back from its own log):',
-    ...events
-      .filter(event => event.type === 'sandbox/mode' || event.type === 'approval/policy')
-      .map(event => '  ' + event.type + ': ' + JSON.stringify(event.data)),
-    'tool results the child actually got (tool | isError | raw text, first 300 chars):',
-    ...rows.length === 0 ? ['  (none)'] : rows,
-    'marker_exists: ' + (marker === undefined ? '(no marker asked for)' : String(existsSync(marker)) + ' [' + marker + ']'),
-  ].join('\n')
-}
-
 
 /**
  * 一个 Agent 的委派深度（主代理是 0）。
@@ -4256,19 +4097,19 @@ const PROCESS_NUDGE = '【过程记录（必须）】多步的活：**开工第�
  * 常驻的**隔离纪律**那一句：与 {@link PROCESS_NUDGE} 同段、同一个装配点。
  *
  * 为什么要有它：并行改动互相踩是**每轮都会发生**的事，而它只在「这一轮有人想起要隔离」时
- * 才不发生。把它钉在每轮的提示词里，是让「改代码就隔离」这件事不再依赖谁记得。
+ * 才不发生。把它钉在每轮的提示词里，是让「要隔离就点名」这件事不再依赖谁记得。
  *
  * 长度是**成本**：这一段每轮都进装配，所以目标 80 字符上下 —— 只留三件事：
- * 什么时候隔离、提交走哪条路、合回由谁定。**不加解释、不举例。**
+ * 隔离要点名、提交走哪条路、合回由谁定。**不加解释、不举例。**
  */
-const ISOLATION_NUDGE = '改代码的派发**默认自动**开隔离检出（重试复用同一条线；只读的活传 worktree: "-" 关掉）：提交走 task commit 并如实记录验证方式，合回后跑整套检查、过了才统一提交主线。'
+const ISOLATION_NUDGE = '改代码的派发**默认不开**隔离检出：要隔离就在派发时点名 worktree: <线名>（同名 = 同一条线，重试复用同一条；只读的活传 worktree: "-" 明说）：提交走 task commit 并如实记录验证方式，合回后跑整套检查、过了才统一提交主线。'
 
 /**
  * `worktree:` 上表示「这次别隔离」的那几个写法。
  *
- * 为什么要有这一档：默认档开着之后，**只读的活**（调研、审查、读代码回答问题）也被卷进
- * 一条检出里是不划算的 —— 起线要一次全量装依赖，而它一个字节都不会改。
- * 于是给一个**显式**的关闸：写出来才关，写不出来就隔离。
+ * 为什么留着这一档：**只读的活**（调研、审查、读代码回答问题）被卷进一条检出里是不划算的
+ * —— 起线要一次全量装依赖，而它一个字节都不会改。默认不隔离之后它多半用不上，
+ * 但打开 `worktreeAuto` 那种部署里它就是**显式**的关闸：写出来才关。
  */
 const WORKTREE_OFF: readonly string[] = ['-', 'off', 'none', 'no', 'false']
 

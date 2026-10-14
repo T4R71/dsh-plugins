@@ -549,7 +549,7 @@ it('task 回显覆盖的键都在 output.schema 里声明过——多一个未�
   const rendered = String(h.tool('task').output!.render({}, {
     status: 'x', node: 'n', task_id: 't', run: 'r', result: 'z', tree: 'T',
     branch: 'b', path: 'p', hash: 'h', files: 1, uncommitted: 2, verification: 'v',
-    merged: true, worktrees: ['w'], dispatched: ['d'], probe: 'P', output: 'O',
+    merged: true, worktrees: ['w'], dispatched: ['d'], output: 'O',
     presetFallback: 'F', evidence: 'E',
   })[0]!.text)
   for (const key of declared) {

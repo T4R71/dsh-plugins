@@ -222,6 +222,8 @@ function harness(options: { tree?: boolean; children?: readonly (string | { read
   messages: FakeMessage[]
   /** `ctx.logger.warn` 收到过的每一行（假件现在带 logger，留痕这类断言靠它）。 */
   logs: string[]
+  /** 每次 `userQuestions.ask()` 收到的请求（根代理那份遮蔽版提问的落点）。 */
+  askRequests: Record<string, any>[]
   treeNodes: Record<string, unknown>[]
   nodesOf: (sid: string) => Record<string, unknown>[]
   treeCalls: string[]
@@ -280,6 +282,11 @@ function harness(options: { tree?: boolean; children?: readonly (string | { read
   // `ctx.logger.warn` 收到过的每一行。假 ctx 现在**带** logger（真机也带），
   // 所以「丢掉的名字必须留下可读的一行」这件事测得出来。
   const logs: string[] = []
+  /**
+   * 每次 `userQuestions.ask(...)` 收到的请求。**根代理那一份遮蔽版提问**（`installAskProxy`
+   * 装在根自己作用域上）就是打这儿出去的，所以要能读到它才能钉住「agent 是根、header 带前缀」。
+   */
+  const askRequests: Record<string, any>[] = []
   // 每次 startContinuable 的入参：自动派发的简报要从这里看。
   const starts: unknown[] = []
   // 每次 `agentPresets.select()` 的调用。换面**只能**在这一刻发生（见 src/index.ts 的
@@ -338,7 +345,12 @@ function harness(options: { tree?: boolean; children?: readonly (string | { read
       // 它此前只作为 ctx 的属性存在，于是**成功的 ask 路径从来没有被覆盖过** ——
       // 每次跑到 ask 都在第一道服务检查上就抛了。
       if (key === 'userQuestions') {
-        return { ask: async () => ({ answers: options.answers ?? [{ id: 'task-ask', selected: ['yes'] }] }) }
+        return {
+          ask: async (request: Record<string, any>) => {
+            askRequests.push(request)
+            return { answers: options.answers ?? [{ id: 'task-ask', selected: ['yes'] }] }
+          },
+        }
       }
       // `sessions` 是诊断行那一格判活要用的：目录行**不带** activity 时（`mode:'unknown'` 的
       // 僵尸、或这个孩子自己的目录读不动），`childPresence` 自己问一次会话存储
@@ -473,14 +485,14 @@ function harness(options: { tree?: boolean; children?: readonly (string | { read
     worktreeVerify: options.worktreeVerify ?? '',
     worktreeMergeVerify: options.worktreeMergeVerify ?? '',
     worktreePrepare: options.worktreePrepare ?? '',
-    // **默认关**：这些用例测的是别的功能，而「默认自动起隔离线」会把它们全部卷进
-    // 「要有一个干净的 git 仓」这件与它们无关的前提里。要测隔离的用例显式打开它。
-    // 默认值本身由「注册期的参数 DSL」那一带的配置断言钉住（zod 的 default 是 true）。
+    // **默认关**（与 schema 的默认值同一档）：这些用例测的是别的功能，而「自动起隔离线」
+    // 会把它们全部卷进「要有一个干净的 git 仓」这件与它们无关的前提里。要测隔离的用例显式打开它。
+    // 默认值本身由「注册期的参数 DSL」那一带的配置断言钉住（zod 的 default 是 false）。
     worktreeAuto: options.worktreeAuto ?? false,
   }
   apply(ctx as never, config)
   assert.ok(captured !== undefined, 'apply must register exactly one tool')
-  return { tool: captured, calls, listed, messages, treeNodes, nodesOf, treeCalls, sections, listeners, notified, starts, selects, sent, runsFile, worktreesFile, logs }
+  return { tool: captured, calls, listed, messages, treeNodes, nodesOf, treeCalls, sections, listeners, notified, starts, selects, sent, runsFile, worktreesFile, logs, askRequests }
 }
 
 /**
@@ -509,7 +521,7 @@ function makeCaller(
 /** 一个带 session 的假调用者。 */
 const caller = makeCaller()
 
-it('注册期的参数 DSL 能编译，且编出来的动作全集就是那十个——dispatch 已收口掉', () => {
+it('注册期的参数 DSL 能编译，且编出来的动作全集就是那九个——dispatch 已收口掉、ask 与 probe 已删', () => {
   const { tool } = harness()
   assert.strictEqual(tool.name, 'task')
   // `defineTool` 在注册时把参数 DSL 编成 JSON Schema 写进定义（实测：`defineTool` 返回的
@@ -517,7 +529,7 @@ it('注册期的参数 DSL 能编译，且编出来的动作全集就是那十�
   const properties = tool.parameters.properties as { action?: { enum?: readonly string[] } }
   assert.deepStrictEqual(
     properties.action?.enum,
-    ['plan', 'step', 'ask', 'commit', 'run', 'send', 'interrupt', 'list', 'result', 'worktree'],
+    ['plan', 'step', 'commit', 'run', 'send', 'interrupt', 'list', 'result', 'worktree'],
   )
 })
 
@@ -559,7 +571,6 @@ it('缺必填参数一律抛错，不许静默继续', async () => {
     [{ action: 'send', task_id: 'c' }, /requires `prompt`/],
     [{ action: 'send', prompt: 'x' }, /requires `task_id`/],
     [{ action: 'interrupt' }, /requires `task_id`/],
-    [{ action: 'ask' }, /requires `question`/],
   ]
   for (const [args, pattern] of cases) {
     await assert.rejects(() => run(tool, args, caller), pattern, JSON.stringify(args))
@@ -572,12 +583,12 @@ it('未知动作在参数层就被拒，报错把合法动作全集列出来', a
   // 报错里带合法集合；`execute` 的 `default` 分支对模型不可达。
   await assert.rejects(
     () => run(tool, { action: 'nope' }, caller),
-    /invalid arguments: "action" must be one of \["plan","step","ask","commit","run","send","interrupt","list","result","worktree"\]/,
+    /invalid arguments: "action" must be one of \["plan","step","commit","run","send","interrupt","list","result","worktree"\]/,
   )
   // `dispatch` 现在是**未知动作**：它连参数层都过不去，报错里也不该再出现它。
   await assert.rejects(
     () => run(tool, { action: 'dispatch', prompt: 'go' }, caller),
-    /invalid arguments: "action" must be one of \["plan","step","ask","commit","run","send","interrupt","list","result","worktree"\]/,
+    /invalid arguments: "action" must be one of \["plan","step","commit","run","send","interrupt","list","result","worktree"\]/,
   )
 })
 
@@ -1470,27 +1481,53 @@ it('list scope=descendants 的返回一字未改（仍是一段裸数组）', as
 })
 
 /**
- * `ask` 的记账语义：问题进树、答案钉成决策。
+ * 一个带**自己作用域**的假根代理：它的 `ctx.tools.register` 收下装到它面上的每一个定义。
  *
- * 这一条钉的是"决策不靠对话活着"。对话会被压缩掉，写在对话里的答案会随之消失；
- * 写在树里的 `detail` 不会。所以顺序也不许反——先写节点再发问，写失败就整个失败，
- * 而不是把用户已经答过的话丢在对话里。
+ * 根代理在真机上就是 `ctx.agents.roots()` 里的那个（人类应答者所在的那一支），
+ * 而遮蔽版提问工具是装进**它自己的作用域**的 —— 所以要断言「装上了」，就得有这么一份 ctx。
+ * @returns 假根代理与它面上收到的定义。
  */
-it('ask 先把问题写进树，再把答案钉成决策', async () => {
-  const { tool, treeNodes, treeCalls } = harness({ tree: true })
-  const result = await run(tool, { action: 'ask', question: '折叠要哪种？', options: ['A', 'B'] }, caller)
-  assert.deepStrictEqual(result, { node: 'ask-1', status: 'completed', result: 'yes' })
-  assert.deepStrictEqual(treeNodes, [{ id: 'ask-1', title: '折叠要哪种？', status: 'completed', detail: '答：yes' }],
-    'detail 必须带 `答：` 前缀 —— 面板靠它画 `?`，裸答案既没图标也识别不出回答')
-  // 必须是追加，不是整树替换 —— 决策节点写进别人的树里会把树毁掉。
-  assert.deepStrictEqual(treeCalls, ['write:sess-1:false', 'step:ask-1'])
+function rootWithTools(): { root: Record<string, any>; tools: Captured[] } {
+  const tools: Captured[] = []
+  const root: Record<string, any> = {
+    id: SESSION,
+    session: { id: SESSION },
+    ctx: { tools: { register: (definition: Captured) => { tools.push(definition); return () => {} } } },
+  }
+  return { root, tools }
+}
+
+/**
+ * 根代理（中枢）自己那一份提问 —— 与孩子**同一份遮蔽版**，不是宿主那个原版工具。
+ *
+ * 为什么必须有：中枢是唯一直接对人说话的代理，而它此前拿到的是宿主原版
+ * `ask_user_question` —— 原版不写决策节点，中枢问过的事在压缩之后就没了。
+ * 装法见 `installRootAskProxy`：根没有「`agent/created` 那一刻」，所以它在插件启动
+ * 路径里按当刻的 `ctx.agents.roots()` 装一次（这一条钉的就是那一次）。
+ */
+it('根代理的面：插件启动那一刻，遮蔽版 ask_user_question 就装进它自己的作用域', () => {
+  const { root, tools } = rootWithTools()
+  harness({ tree: true, parentAgent: root })
+  assert.ok(tools.some(entry => entry.name === 'ask_user_question'),
+    '根代理作用域里必须有遮蔽版 ask_user_question，实得：' + tools.map(entry => entry.name).join(', '))
 })
 
-it('决策节点按 ask- 前缀累加编号，不会互相覆盖', async () => {
-  const { tool, treeNodes } = harness({ tree: true })
-  await run(tool, { action: 'ask', question: '第一问' }, caller)
-  await run(tool, { action: 'ask', question: '第二问' }, caller)
-  assert.deepStrictEqual(treeNodes.map(node => node.id), ['ask-1', 'ask-2'])
+it('根代理提问的落点与前缀：agent 指向根自己，header 与树标题都带 [中枢]', async () => {
+  const { root, tools } = rootWithTools()
+  const h = harness({ tree: true, parentAgent: root })
+  const ask = tools.find(entry => entry.name === 'ask_user_question')
+  assert.ok(ask !== undefined, '根代理面上没有遮蔽版提问工具，后面的断言无从谈起')
+  const result = await ask.execute(
+    { questions: [{ id: 'q1', question: '折叠要哪种？' }] } as unknown as TaskArgs,
+    { agent: root, callId: 'root-call' },
+  )
+  assert.equal(h.askRequests.length, 1)
+  assert.equal(h.askRequests[0]?.agent, root, '必须以根自己为作用域 —— root 传的就是它自己')
+  assert.equal(h.askRequests[0]?.questions?.[0]?.header, '[中枢]', '卡片前缀取自 lead 的中文名')
+  assert.deepStrictEqual(h.nodesOf(SESSION), [
+    { id: 'ask-1', title: '[中枢] 折叠要哪种？', status: 'completed', detail: '答：yes' },
+  ], '问题先进中枢自己的树，答案再钉成决策')
+  assert.match(String(result.note), /折叠要哪种？/)
 })
 
 /**
@@ -1575,11 +1612,6 @@ it('会话被回收时快照一并丢掉，表不会无限增长', async () => {
   assert.match(render(context), /折叠要哪种？/, '丢了快照就得重新算，于是能看见新决策')
 })
 
-it('树缺席时 ask 直接报错，绝不问完再把答案丢在对话里', async () => {
-  const { tool } = harness({ tree: false })
-  await assert.rejects(() => run(tool, { action: 'ask', question: 'x' }, caller), /taskTree` service is unavailable/)
-})
-
 /**
  * 决策只存在一份 —— 这是去掉「搬运」之后**唯一**的守卫。
  *
@@ -1626,12 +1658,6 @@ it('结算不再往父会话的树搬 ask- 节点：那条搬运监听器整个�
   }
   assert.equal(JSON.stringify(treeNodes), before, '结算不许往父会话树里新增任何节点')
   assert.equal(treeNodes.filter(node => String(node.id).startsWith('ask-')).length, 0)
-})
-
-it('ask 动作是提问者自己问的：它写下的节点标题不带角色前缀', async () => {
-  const { tool, treeNodes } = harness({ tree: true })
-  await run(tool, { action: 'ask', question: '折叠要哪种？' }, caller)
-  assert.equal(treeNodes[0]?.title, '折叠要哪种？', '本会话自己问的不加 [<label>] 前缀')
 })
 
 /**
@@ -2405,8 +2431,8 @@ it('账本路径不是 volatile：它只用来挪文件，绝不进设置页的�
   //      读得到的 logger，账本于是**静默地记不住**。
   // 现在账本是一个文件，task 行上只留一个可选的文件位置，而且**不是** volatile。
   assert.deepStrictEqual(Object.keys(TaskRowConfig.dict ?? {}).sort(),
-    ['defaultRules', 'presets', 'probeEnabled', 'provider', 'runsFile', 'worktreeAuto', 'worktreeGoal', 'worktreeMergeVerify', 'worktreePrepare', 'worktreeVerify', 'worktreesFile'],
-    'task 行就这几格：账本本体不在配置里，只有位置开关与几个默认值（隔离那一半 + 探头那一档）')
+    ['defaultRules', 'presets', 'provider', 'runsFile', 'worktreeAuto', 'worktreeGoal', 'worktreeMergeVerify', 'worktreePrepare', 'worktreeVerify', 'worktreesFile'],
+    'task 行就这几格：账本本体不在配置里，只有位置开关与几个默认值（隔离那一半；探头那一档已整个删掉）')
   assert.notStrictEqual(TaskRowConfig.dict?.runsFile?.meta.volatile, true,
     'runsFile 绝不能是 volatile：那会让它出现在设置页的可热改字段里')
   assert.strictEqual(TASK_RUNS_FILE_NAME, 'task-runs.json', '默认文件名固定，便于排障时找得到')
@@ -3263,7 +3289,9 @@ it('过程记录提醒（2026-10-01 冻结 v3）：只进「本插件派出的�
   // **逐字**：中枢 2026-10-01 冻结的那一段仍在最前，后面**原样追加**一句常驻的隔离纪律。
   // 追加而不是改写：那一段是按「每轮常驻成本」量过的，改它等于把量过的账作废。
   assert.equal(text, '【过程记录（必须）】多步的活：**开工第一步必须**用 `task plan` 在**你自己的任务树**里写下阶段计划（分几段、每段做什么由你自己定）；**每完成一段必须**用 `task step` 推进到 completed，并在 detail 里写下这一段的结论。阶段之间**可以并行**，不要求先后顺序。'
-    + '改代码的派发**默认自动**开隔离检出（重试复用同一条线；只读的活传 worktree: "-" 关掉）：提交走 task commit 并如实记录验证方式，合回后跑整套检查、过了才统一提交主线。')
+    // 隔离那一句 2026-10-14 改准过一次（`worktreeAuto` 默认由 true 改成 false）：
+    // 从「默认自动开」改成「默认不开、要点名」。前半段（过程记录）一个字没动。
+    + '改代码的派发**默认不开**隔离检出：要隔离就在派发时点名 worktree: <线名>（同名 = 同一条线，重试复用同一条；只读的活传 worktree: "-" 明说）：提交走 task commit 并如实记录验证方式，合回后跑整套检查、过了才统一提交主线。')
   // 要点逐条点名（文案冻结之后只能用**子串**断言，但每一条都是用户点名要的）。
   assert.ok(text.includes('必须'), '要点：语气是强制的：' + text)
   assert.ok(text.startsWith('【过程记录（必须）】'), '锚点必须逐字在：' + text)
@@ -3412,7 +3440,7 @@ function callerIn(repo: string): unknown {
   return { agent: { session: { id: SESSION, header: { cwd: repo } } }, signal: AbortSignal.timeout(2000) }
 }
 
-it('默认自动：改代码的派发**不给** worktree 也会自己开一条线，简报里带线名与检出路径', async () => {
+it('worktreeAuto=true 的部署：改代码的派发**不给** worktree 也会自己开一条线，简报里带线名与检出路径', async () => {
   const repo = await repoForLines()
   const h = harness({ tree: true, runsFile: freshLedgerFile(), worktreeAuto: true, worktreePrepare: '' })
   // `dispatch` 已收口到 `run`：这条纪律的入口就是 run（声明即建树，起点立刻派出）。
@@ -3439,18 +3467,27 @@ it('显式关闸：worktree: "-" 的派发不建线，一个字节都不写', as
   assert.ok(!briefOf(h.starts[0]).includes('【隔离检出'), briefOf(h.starts[0]))
 })
 
-it('worktreeAuto=false：退回老行为（这一格是显式关掉的，默认是开的）', async () => {
+it('不声明隔离就是不隔离：默认档既不建线，也不动账本（要隔离得点名）', async () => {
   const repo = await repoForLines()
   const h = harness({ tree: true, runsFile: freshLedgerFile(), worktreePrepare: '' })
   await run(h.tool, { action: 'run', run: 'a', nodes: [{ id: 'A', prompt: 'go' }] }, callerIn(repo))
   assert.deepStrictEqual(lineNames(h.worktreesFile), [])
+  assert.equal(ledgerFileAbsent(h.worktreesFile), true, '不隔离连账本文件都不该创建')
   assert.ok(!briefOf(h.starts[0]).includes('【隔离检出'), briefOf(h.starts[0]))
 })
 
-it('schema 默认值：worktreeAuto 默认 true —— 纪律是默认开的，关掉要显式写', async () => {
+it('worktreeAuto=true：把这一格显式打开，退回「不给 worktree 也自动开线」的旧档', async () => {
+  const repo = await repoForLines()
+  const h = harness({ tree: true, runsFile: freshLedgerFile(), worktreeAuto: true, worktreePrepare: '' })
+  await run(h.tool, { action: 'run', run: 'a', nodes: [{ id: 'A', prompt: 'go' }] }, callerIn(repo))
+  assert.equal(lineNames(h.worktreesFile).length, 1)
+  assert.ok(briefOf(h.starts[0]).includes('【隔离检出'), briefOf(h.starts[0]))
+})
+
+it('schema 默认值：worktreeAuto 默认 false —— 不显式声明就不开隔离线', async () => {
   const dict = TaskRowConfig.dict ?? {}
-  assert.equal((dict.worktreeAuto as { meta?: { default?: unknown } } | undefined)?.meta?.default, true,
-    'worktreeAuto 的默认值必须是 true，否则「默认就走隔离线」只是句口号')
+  assert.equal((dict.worktreeAuto as { meta?: { default?: unknown } } | undefined)?.meta?.default, false,
+    'worktreeAuto 的默认值必须是 false，否则「默认不隔离」只是句口号')
 })
 
 it('同名 = 同一条线：第二次同名的派发接着用那条线，不重建、也不撞「分支已存在」', async () => {
@@ -3464,7 +3501,7 @@ it('同名 = 同一条线：第二次同名的派发接着用那条线，不重�
   assert.ok(briefOf(h.starts[1]).includes('线名：`line-1`'), briefOf(h.starts[1]))
 })
 
-it('起线失败就拒派：脏主检出时默认档当场抛，并在报错里给出关闸写法', async () => {
+it('起线失败就拒派：脏主检出时自动档当场抛，并在报错里给出关闸写法', async () => {
   const repo = await repoForLines()
   writeFileSyncNode(join(repo, 'README.md'), '# dirty\n', 'utf8')
   const h = harness({ tree: true, runsFile: freshLedgerFile(), worktreeAuto: true, worktreePrepare: '' })
